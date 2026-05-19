@@ -1,3 +1,6 @@
+# Release packaging folder and its output (local build tooling, not part of the project)
+.dist/
+
 # Runtime directories (created automatically at first run; not part of the project)
 Config/
 Logs/
