@@ -123,6 +123,9 @@ param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8080,
 
+    [ValidateRange(1024, 65535)]
+    [int]$FallbackPort = 8443,
+
     [ValidateRange(30, 86400)]
     [int]$RefreshInterval = 300,
 
@@ -143,11 +146,66 @@ param(
     # --- Options ---
     [switch]$AddFirewallRule,
     [switch]$StartImmediately,
-    [switch]$Force
+    [switch]$Force,
+
+    [string]$ConfigPath
 )
 
 $ScriptVersion = '0.0.6'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+# ===================================================================
+# Configuration File
+# ===================================================================
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+
+function Read-ConfigFile {
+    param([string]$Path)
+    $cfg = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path $Path -ErrorAction SilentlyContinue)) { return $cfg }
+    foreach ($line in Get-Content $Path) {
+        $t = $line.Trim()
+        if (-not $t -or $t -match '^\s*[#\[]') { continue }
+        if ($t -match '^([^=]+?)\s*=\s*(.+)$') { $cfg[$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    return $cfg
+}
+
+$cfg = Read-ConfigFile $ConfigPath
+if (-not $PSBoundParameters.ContainsKey('SourceSharePath') -and $cfg['SourceSharePath']) { $SourceSharePath = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('Port')            -and $cfg['Port'])            { try { $Port            = [int]$cfg['Port']            } catch {} }
+if (-not $PSBoundParameters.ContainsKey('FallbackPort')    -and $cfg['FallbackPort'])    { try { $FallbackPort    = [int]$cfg['FallbackPort']    } catch {} }
+if (-not $PSBoundParameters.ContainsKey('RefreshInterval') -and $cfg['RefreshInterval']) { try { $RefreshInterval = [int]$cfg['RefreshInterval'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('LogPath')         -and $cfg['DashboardLogPath']) { $LogPath           = $cfg['DashboardLogPath'] }
+if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelThreads']) { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
+if (-not $PSBoundParameters.ContainsKey('TaskName')        -and $cfg['TaskName'])        { $TaskName   = $cfg['TaskName'] }
+if (-not $PSBoundParameters.ContainsKey('TaskFolder')      -and $cfg['TaskFolder'])      { $TaskFolder = $cfg['TaskFolder'] }
+
+# ===================================================================
+# Port Availability Functions
+# ===================================================================
+function Test-PortFree ([int]$TestPort) {
+    try {
+        $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $TestPort)
+        $tcp.Start(); $tcp.Stop(); return $true
+    } catch { return $false }
+}
+
+function Find-AvailablePort {
+    param([int]$Primary, [int]$Fallback)
+    if (Test-PortFree $Primary) {
+        return [pscustomobject]@{ Port = $Primary; IsFallback = $false; PrimaryPort = $Primary }
+    }
+    $candidate = $Fallback
+    for ($i = 0; $i -lt 10; $i++) {
+        if (Test-PortFree $candidate) {
+            return [pscustomobject]@{ Port = $candidate; IsFallback = $true; PrimaryPort = $Primary }
+        }
+        $candidate++
+    }
+    throw "No available port found. Primary $Primary was in use; tried fallback range $Fallback–$($candidate - 1)."
+}
 
 # ===================================================================
 # Console output helpers
@@ -294,6 +352,17 @@ Grant-FolderAccess -Path $LogPath      -Identity $identityLabel -Rights 'Modify'
 # ===================================================================
 # STEP 3 – Build the scheduled task action arguments
 # ===================================================================
+Write-Step "Checking port availability…"
+
+$portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
+if ($portResult.IsFallback) {
+    Write-Warn "Port $($portResult.PrimaryPort) is already in use on this host."
+    Write-Ok   "Using fallback port $($portResult.Port) instead."
+    $Port = $portResult.Port
+} else {
+    Write-Ok "Port $Port is available"
+}
+
 Write-Step "Building scheduled task…"
 
 $argParts = @(
@@ -461,6 +530,12 @@ Write-Host "  ============================================================" -For
 Write-Host ""
 Write-Host "  Task name    : $TaskFolder$TaskName" -ForegroundColor White
 Write-Host "  Identity     : $identityLabel" -ForegroundColor White
+if ($portResult.IsFallback) {
+    Write-Host "  Port         : $Port  " -NoNewline -ForegroundColor Yellow
+    Write-Host "(fallback — primary port $($portResult.PrimaryPort) was in use)" -ForegroundColor DarkYellow
+} else {
+    Write-Host "  Port         : $Port" -ForegroundColor White
+}
 Write-Host "  Dashboard    : http://<this-host>:$Port/defender" -ForegroundColor White
 Write-Host "  JSON status  : http://<this-host>:$Port/status" -ForegroundColor White
 Write-Host "  Health probe : http://<this-host>:$Port/health" -ForegroundColor White

@@ -57,12 +57,36 @@ param(
     [int]$ParallelThreads = 16,
 
     [ValidateRange(5, 300)]
-    [int]$TimeoutSeconds = 30
+    [int]$TimeoutSeconds = 30,
+
+    [string]$ConfigPath
 )
 
 $ScriptVersion = '0.0.6'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# ===================================================================
+# Configuration File
+# ===================================================================
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+
+function Read-ConfigFile {
+    param([string]$Path)
+    $cfg = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path $Path -ErrorAction SilentlyContinue)) { return $cfg }
+    foreach ($line in Get-Content $Path) {
+        $t = $line.Trim()
+        if (-not $t -or $t -match '^\s*[#\[]') { continue }
+        if ($t -match '^([^=]+?)\s*=\s*(.+)$') { $cfg[$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    return $cfg
+}
+
+$cfg = Read-ConfigFile $ConfigPath
+if (-not $PSBoundParameters.ContainsKey('SourceSharePath')  -and $cfg['SourceSharePath'])  { $SourceSharePath  = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ParallelThreads')  -and $cfg['ParallelThreads'])  { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')   -and $cfg['TimeoutSeconds'])   { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 
 # ===================================================================
 # Target Resolution

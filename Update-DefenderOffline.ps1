@@ -106,8 +106,7 @@
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [Parameter(Mandatory, Position = 0)]
-    [ValidateScript({ Test-Path $_ -PathType Container })]
+    [Parameter(Position = 0)]
     [string]$SourceSharePath,
 
     [Parameter(ValueFromPipeline)]
@@ -138,7 +137,10 @@ param(
     [pscredential]$SmtpCredential,
 
     # Credential helper
-    [switch]$SaveSmtpCredential
+    [switch]$SaveSmtpCredential,
+
+    # Path to configuration file. Defaults to .\conf\config.conf relative to the script.
+    [string]$ConfigPath
 )
 
 # ===================================================================
@@ -185,6 +187,42 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     throw 'This script requires administrative privileges. Run PowerShell as Administrator.'
+}
+
+# ===================================================================
+# Configuration File
+# ===================================================================
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+
+function Read-ConfigFile {
+    param([string]$Path)
+    $cfg = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path $Path -ErrorAction SilentlyContinue)) { return $cfg }
+    foreach ($line in Get-Content $Path) {
+        $t = $line.Trim()
+        if (-not $t -or $t -match '^\s*[#\[]') { continue }
+        if ($t -match '^([^=]+?)\s*=\s*(.+)$') { $cfg[$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    return $cfg
+}
+
+$cfg = Read-ConfigFile $ConfigPath
+
+# Apply config values for parameters not explicitly passed on the command line.
+# Command-line parameters always win; config fills in what was omitted.
+if (-not $PSBoundParameters.ContainsKey('SourceSharePath')    -and $cfg['SourceSharePath'])    { $SourceSharePath    = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('LogPath')            -and $cfg['LogPath'])            { $LogPath            = $cfg['LogPath'] }
+if (-not $PSBoundParameters.ContainsKey('ReportPath')         -and $cfg['ReportPath'])         { $ReportPath         = $cfg['ReportPath'] }
+if (-not $PSBoundParameters.ContainsKey('TempFolderOnTarget') -and $cfg['TempFolderOnTarget']) { $TempFolderOnTarget = $cfg['TempFolderOnTarget'] }
+if (-not $PSBoundParameters.ContainsKey('LogSharePath')       -and $cfg['LogSharePath'])       { $LogSharePath       = $cfg['LogSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ParallelThreads')    -and $cfg['ParallelThreads'])    { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('SendEmail')          -and $cfg['SendEmail'] -eq 'true')  { $SendEmail   = $true }
+if (-not $PSBoundParameters.ContainsKey('SmtpServer')         -and $cfg['SmtpServer'])         { $SmtpServer         = $cfg['SmtpServer'] }
+if (-not $PSBoundParameters.ContainsKey('SmtpPort')           -and $cfg['SmtpPort'])           { try { $SmtpPort = [int]$cfg['SmtpPort'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('SmtpUseSsl')         -and $cfg['SmtpUseSsl'] -eq 'true') { $SmtpUseSsl = $true }
+if (-not $PSBoundParameters.ContainsKey('From')               -and $cfg['EmailFrom'])          { $From               = $cfg['EmailFrom'] }
+if (-not $PSBoundParameters.ContainsKey('To')                 -and $cfg['EmailTo'])            {
+    $To = $cfg['EmailTo'] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 }
 
 # ===================================================================
@@ -501,6 +539,13 @@ if (-not $TargetComputers -or $TargetComputers.Count -eq 0) {
     return
 }
 Write-Log "Will process $($TargetComputers.Count) computers" 'HEADER'
+
+if (-not $SourceSharePath) {
+    throw '-SourceSharePath is required. Pass it as a parameter or set SourceSharePath in conf\config.conf.'
+}
+if (-not (Test-Path $SourceSharePath -PathType Container)) {
+    throw "SourceSharePath not found or inaccessible: $SourceSharePath"
+}
 
 $latest = Get-LatestMpamFile -Root $SourceSharePath
 $SourceFile          = $latest.File

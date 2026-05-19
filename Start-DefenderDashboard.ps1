@@ -66,6 +66,9 @@ param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8080,
 
+    [ValidateRange(1024, 65535)]
+    [int]$FallbackPort = 8443,
+
     [ValidateRange(30, 86400)]
     [int]$RefreshInterval = 300,
 
@@ -79,12 +82,65 @@ param(
     [int]$ParallelThreads = 16,
 
     [ValidateRange(5, 300)]
-    [int]$TimeoutSeconds = 30
+    [int]$TimeoutSeconds = 30,
+
+    [string]$ConfigPath
 )
 
 $ScriptVersion = '0.0.6'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# ===================================================================
+# Configuration File
+# ===================================================================
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+
+function Read-ConfigFile {
+    param([string]$Path)
+    $cfg = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path $Path -ErrorAction SilentlyContinue)) { return $cfg }
+    foreach ($line in Get-Content $Path) {
+        $t = $line.Trim()
+        if (-not $t -or $t -match '^\s*[#\[]') { continue }
+        if ($t -match '^([^=]+?)\s*=\s*(.+)$') { $cfg[$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    return $cfg
+}
+
+$cfg = Read-ConfigFile $ConfigPath
+if (-not $PSBoundParameters.ContainsKey('SourceSharePath') -and $cfg['SourceSharePath']) { $SourceSharePath = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('Port')            -and $cfg['Port'])            { try { $Port            = [int]$cfg['Port']            } catch {} }
+if (-not $PSBoundParameters.ContainsKey('FallbackPort')    -and $cfg['FallbackPort'])    { try { $FallbackPort    = [int]$cfg['FallbackPort']    } catch {} }
+if (-not $PSBoundParameters.ContainsKey('RefreshInterval') -and $cfg['RefreshInterval']) { try { $RefreshInterval = [int]$cfg['RefreshInterval'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('LogPath')         -and $cfg['DashboardLogPath']) { $LogPath           = $cfg['DashboardLogPath'] }
+if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelThreads']) { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
+
+# ===================================================================
+# Port Availability
+# ===================================================================
+function Test-PortFree ([int]$TestPort) {
+    try {
+        $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $TestPort)
+        $tcp.Start(); $tcp.Stop(); return $true
+    } catch { return $false }
+}
+
+function Find-AvailablePort {
+    param([int]$Primary, [int]$Fallback)
+    if (Test-PortFree $Primary) {
+        return [pscustomobject]@{ Port = $Primary; IsFallback = $false; PrimaryPort = $Primary }
+    }
+    $candidate = $Fallback
+    for ($i = 0; $i -lt 10; $i++) {
+        if (Test-PortFree $candidate) {
+            return [pscustomobject]@{ Port = $candidate; IsFallback = $true; PrimaryPort = $Primary }
+        }
+        $candidate++
+    }
+    throw "No available port found. Primary $Primary was in use; tried fallback range $Fallback–$($candidate - 1)."
+}
 
 # ===================================================================
 # Logging  (file-only; no console assumed when running as a task)
@@ -585,6 +641,13 @@ if ($AvailableVersionStr) {
     Write-DashLog 'No SourceSharePath provided; version currency check disabled.' 'WARN'
 }
 
+# Resolve port (check availability, fall back if needed)
+$portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
+if ($portResult.IsFallback) {
+    Write-DashLog "Port $($portResult.PrimaryPort) is in use. Binding to fallback port $($portResult.Port) instead." 'WARN'
+}
+$Port = $portResult.Port
+
 # Start HTTP listener
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add("http://+:$Port/")
@@ -592,7 +655,7 @@ try {
     $listener.Start()
 } catch {
     Write-DashLog "Failed to bind to port $Port : $($_.Exception.Message)" 'ERROR'
-    Write-DashLog 'Try a different port or run as Administrator.' 'ERROR'
+    Write-DashLog 'Ensure no other process owns this port and that the account has permission to register HTTP prefixes.' 'ERROR'
     exit 1
 }
 Write-DashLog "HTTP listener started on http://+:$Port/" 'SUCCESS'
