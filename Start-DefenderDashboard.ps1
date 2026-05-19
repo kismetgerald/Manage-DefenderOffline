@@ -661,6 +661,51 @@ try {
 Write-DashLog "HTTP listener started on http://+:$Port/" 'SUCCESS'
 Write-DashLog "Browse to: http://localhost:$Port/defender" 'INFO'
 
+# Write runtime status file so the installer and administrators can
+# discover the actual bound port without reading through the log.
+$statusFile = Join-Path $ScriptDir 'conf\dashboard.status'
+$statusLines = @(
+    "# Manage-DefenderOffline Dashboard – Runtime Status"
+    "# Written by Start-DefenderDashboard.ps1 at each startup."
+    "# Read this file to discover the port the service is currently using."
+    "Port=$Port"
+    "PrimaryPort=$($portResult.PrimaryPort)"
+    "IsFallback=$($portResult.IsFallback)"
+    "StartTime=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    "ProcessId=$PID"
+    "Hostname=$env:COMPUTERNAME"
+)
+try {
+    $statusLines | Out-File -FilePath $statusFile -Encoding UTF8 -Force
+    Write-DashLog "Status file written: $statusFile" 'INFO'
+} catch {
+    Write-DashLog "Could not write status file ($statusFile): $($_.Exception.Message)" 'WARN'
+}
+
+# Write to Windows Event Log if the source has been registered by the installer.
+# EventId 100 = normal start on primary port
+# EventId 101 = started on fallback port  (Warning — admin action may be needed)
+# EventId 102 = service stopped
+$evtSource = 'Manage-DefenderOffline'
+try {
+    if ([System.Diagnostics.EventLog]::SourceExists($evtSource)) {
+        if ($portResult.IsFallback) {
+            $evtMsg = "Defender Dashboard started on FALLBACK port $Port. " +
+                      "Primary port $($portResult.PrimaryPort) was already in use. " +
+                      "Update firewall rules, bookmarks, and monitoring tools to use port $Port."
+            Write-EventLog -LogName Application -Source $evtSource -EventId 101 `
+                -EntryType Warning -Message $evtMsg
+            Write-DashLog "Warning written to Windows Event Log (EventId 101)." 'WARN'
+        } else {
+            Write-EventLog -LogName Application -Source $evtSource -EventId 100 `
+                -EntryType Information `
+                -Message "Defender Dashboard started on port $Port."
+        }
+    }
+} catch {
+    Write-DashLog "Could not write to Windows Event Log: $($_.Exception.Message)" 'WARN'
+}
+
 # ===================================================================
 # State
 # ===================================================================
@@ -793,4 +838,16 @@ try {
         Remove-Job $script:RefreshJob -Force -ErrorAction SilentlyContinue
     }
     Write-DashLog 'Dashboard stopped.' 'WARN'
+    try {
+        if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
+            Write-EventLog -LogName Application -Source 'Manage-DefenderOffline' -EventId 102 `
+                -EntryType Information -Message "Defender Dashboard stopped (port $Port)."
+        }
+    } catch {}
+
+    # Clear the status file so stale port info is not left behind
+    try {
+        $statusFile = Join-Path $ScriptDir 'conf\dashboard.status'
+        if (Test-Path $statusFile) { Remove-Item $statusFile -Force -ErrorAction SilentlyContinue }
+    } catch {}
 }

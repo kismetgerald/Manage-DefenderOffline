@@ -255,6 +255,22 @@ if (-not (Test-Path $DashboardScriptPath)) {
 $DashboardScriptPath = (Resolve-Path $DashboardScriptPath).Path
 Write-Ok "Dashboard script: $DashboardScriptPath"
 
+# Register Windows Event Log source (one-time; allows the dashboard to write
+# warning events when it starts on a fallback port)
+$evtSource = 'Manage-DefenderOffline'
+if (-not [System.Diagnostics.EventLog]::SourceExists($evtSource)) {
+    try {
+        New-EventLog -LogName Application -Source $evtSource -ErrorAction Stop
+        Write-Ok "Event log source registered: '$evtSource' → Application log"
+        Write-Info "EventId 100 = started normally  |  101 = started on fallback port  |  102 = stopped"
+    } catch {
+        Write-Warn "Could not register event log source: $($_.Exception.Message)"
+        Write-Info "Dashboard will still write conf\dashboard.status for port discovery."
+    }
+} else {
+    Write-Ok "Event log source '$evtSource' already registered"
+}
+
 # Task Scheduler service
 $svc = Get-Service -Name 'Schedule' -ErrorAction SilentlyContinue
 if ($svc.Status -ne 'Running') {
@@ -316,7 +332,10 @@ if ($isGmsa) {
 # ===================================================================
 Write-Step "Creating directories and granting filesystem access…"
 
-$pathsToCreate = @($LogPath, (Split-Path $DashboardScriptPath -Parent))
+$scriptFolder = Split-Path $DashboardScriptPath -Parent
+$confFolder   = Join-Path $scriptFolder 'conf'
+
+$pathsToCreate = @($LogPath, $scriptFolder, $confFolder)
 foreach ($p in $pathsToCreate | Select-Object -Unique) {
     if (-not (Test-Path $p)) {
         New-Item -Path $p -ItemType Directory -Force | Out-Null
@@ -345,8 +364,8 @@ function Grant-FolderAccess {
     }
 }
 
-$scriptFolder = Split-Path $DashboardScriptPath -Parent
 Grant-FolderAccess -Path $scriptFolder -Identity $identityLabel -Rights 'ReadAndExecute'
+Grant-FolderAccess -Path $confFolder   -Identity $identityLabel -Rights 'Modify'        # needs to write dashboard.status
 Grant-FolderAccess -Path $LogPath      -Identity $identityLabel -Rights 'Modify'
 
 # ===================================================================
@@ -494,29 +513,54 @@ if ($StartImmediately) {
         Write-Fail "Could not start task: $($_.Exception.Message)"
     }
 
-    Write-Step "Testing HTTP endpoint (waiting up to 45s for listener to bind)…"
-    $url       = "http://localhost:$Port/health"
-    $deadline  = [datetime]::Now.AddSeconds(45)
-    $connected = $false
+    Write-Step "Waiting for dashboard to start (up to 45s)…"
 
-    while ([datetime]::Now -lt $deadline) {
+    $statusFile   = Join-Path $confFolder 'dashboard.status'
+    $deadline     = [datetime]::Now.AddSeconds(45)
+    $statusLoaded = $false
+
+    # Primary signal: status file written by the dashboard at startup
+    while ([datetime]::Now -lt $deadline -and -not $statusLoaded) {
         Start-Sleep -Seconds 3
-        try {
-            $response = Invoke-WebRequest -Uri $url -TimeoutSec 5 -ErrorAction Stop -UseBasicParsing
-            if ($response.StatusCode -eq 200) {
-                $connected = $true
-                break
-            }
-        } catch {}
-        Write-Info "  …waiting ($([int]($deadline - [datetime]::Now).TotalSeconds)s remaining)"
+        if (Test-Path $statusFile) { $statusLoaded = $true; break }
+        Write-Info "  …waiting for status file ($([int]($deadline - [datetime]::Now).TotalSeconds)s remaining)"
     }
 
-    if ($connected) {
-        Write-Ok "Dashboard is responding at http://localhost:$Port/defender"
+    if ($statusLoaded) {
+        # Parse the status file using the same Read-ConfigFile function
+        $runtimeStatus = Read-ConfigFile $statusFile
+        $actualPort    = if ($runtimeStatus['Port']) { [int]$runtimeStatus['Port'] } else { $Port }
+
+        if ($runtimeStatus['IsFallback'] -eq 'True') {
+            # Fallback was used at runtime — update $Port for the summary block
+            $Port = $actualPort
+            $portResult = [pscustomobject]@{
+                IsFallback  = $true
+                Port        = $actualPort
+                PrimaryPort = if ($runtimeStatus['PrimaryPort']) { [int]$runtimeStatus['PrimaryPort'] } else { $portResult.PrimaryPort }
+            }
+            Write-Warn "Dashboard started on FALLBACK port $actualPort."
+            Write-Info "Primary port $($portResult.PrimaryPort) was in use at service startup time."
+            Write-Info "ACTION REQUIRED: Update firewall rules, bookmarks, and monitoring tools to port $actualPort."
+        } else {
+            Write-Ok "Dashboard started on port $actualPort"
+        }
+
+        # Secondary confirmation: HTTP health probe
+        try {
+            $resp = Invoke-WebRequest -Uri "http://localhost:$actualPort/health" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+            if ($resp.StatusCode -eq 200) {
+                Write-Ok "HTTP health probe passed: http://localhost:$actualPort/health → 200 OK"
+            }
+        } catch {
+            Write-Warn "Status file present but /health probe failed: $($_.Exception.Message)"
+            Write-Info "The listener may still be initialising; try again in a few seconds."
+        }
     } else {
-        Write-Warn "Dashboard did not respond within 45 seconds."
-        Write-Info "Check the log: $LogPath"
-        Write-Info "Check task status: Get-ScheduledTask -TaskName '$TaskName' | Select-Object State"
+        Write-Warn "Dashboard did not write a status file within 45 seconds."
+        Write-Info "Check the dashboard log: $LogPath"
+        Write-Info "Check task state  : Get-ScheduledTask -TaskName '$TaskName' | Select-Object State,LastTaskResult"
+        Write-Info "Check event log   : Get-EventLog -LogName Application -Source 'Manage-DefenderOffline' -Newest 5"
     }
 }
 
