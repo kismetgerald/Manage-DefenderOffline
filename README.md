@@ -1030,7 +1030,7 @@ This project is licensed under the MIT License - see the [LICENSE.txt](LICENSE.t
 
 **Documentation:**
 - [Quick Reference](README.md) - This file
-- [Detailed Technical Documentation](claude.md) - Deep dive into architecture and internals
+- [Detailed Technical Documentation](CLAUDE.md) - Deep dive into architecture and internals
 
 **Getting Help:**
 - [GitHub Issues](https://github.com/kismetgerald/Manage-DefenderOffline/issues) - Bug reports and feature requests
