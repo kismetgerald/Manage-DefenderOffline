@@ -1,10 +1,11 @@
-# Claude Code documentation (project-specific)
-claude.md
-
-# Runtime directories
+# Runtime directories (created automatically at first run; not part of the project)
 Config/
 Logs/
 Reports/
+
+# Runtime files (written by the scripts during execution)
+hosts.conf
+conf/dashboard.status
 
 # IDE settings
 .vscode/
@@ -22,9 +23,8 @@ $RECYCLE.BIN/
 # PowerShell
 *.ps1xml
 
-# Credentials and secrets
+# Credentials and secrets (never commit encrypted credential files)
 *.xml
-!Config/.gitkeep
 
 # Log files
 *.log
