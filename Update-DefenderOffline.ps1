@@ -429,7 +429,8 @@ function Invoke-DefenderUpdate {
         try {
             # --- Pre-update health check ---
             $svcStatus = Invoke-Command -Session $session -ScriptBlock {
-                (Get-Service -Name WinDefend -ErrorAction SilentlyContinue).Status
+                $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+                if ($svc) { $svc.Status.ToString() } else { 'NotFound' }
             }
             if ($svcStatus -ne 'Running') {
                 throw "Windows Defender service is not running (Status: $svcStatus)"
@@ -662,7 +663,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
                 # Classify failure: hard (no retry) vs soft (retryable)
                 $det = ($r.Details ?? '').ToLower()
-                $isHardFail = $det -match 'winrm|not reachable|offline|unreachable|access.?denied|authentication|cannot.?find|dns' `
+                $isHardFail = $det -match 'winrm|not reachable|offline|unreachable|access.{0,10}denied|authentication|cannot.?find|dns' `
                     -or $r.Timeout
 
                 if ($r.Status -eq 'Failed' -and -not $isHardFail -and $meta.Attempt -lt $RetryLimit) {

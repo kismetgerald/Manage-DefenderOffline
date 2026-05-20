@@ -142,11 +142,11 @@ Get-ChildItem .\Reports\ | Select-Object Name, LastWriteTime
 - [x] `WhatIf` badge visible in HTML report for all rows
 - [x] Log file written to `C:\Logs\` with correct timestamps
 
-**Bugs found during this run (both fixed, retest required):**
+**Bugs found during initial run (both fixed, confirmed resolved on retest):**
 1. **Console noise — 26 `True` lines** — `Dictionary.Remove()` returns `bool`; unassigned .NET method return values bypass `SuppressConsoleOutput` and leak to console. Fixed: `[void]$ActiveJobs.Remove($id)` in both the normal-completion and timeout paths.
 2. **Email attempted in WhatIf mode** — `Send-MailMessage` was called even with `-WhatIfMode`. Fixed: added `-and -not $WhatIfMode` to the email guard condition.
 
-**Result:** FAIL — retest required after fixes applied
+**Result:** PASS *(retest confirmed clean — no `True` lines, no email attempt in WhatIf mode)*
 
 ---
 
@@ -213,7 +213,13 @@ Elapsed:    00:00:xx
 - [ ] CSV generated; Delta column contains integers for updated hosts
 - [ ] Per-host log written to `C:\Logs\PerHost\<COMPUTERNAME>.log`
 
-**Result:** PENDING
+**Bugs found during this run (both fixed, retest required):**
+1. **WinRM deserializes `ServiceControllerStatus` as integer** — `(Get-Service).Status` returned `4` (integer for Running) across the WinRM boundary. `4 -ne 'Running'` is `$true`, so every host with Defender running was incorrectly thrown as a health-check failure. Fixed: remote scriptblock now calls `.ToString()` before returning; `$null` service returns `'NotFound'`.
+2. **"Access is denied" misclassified as soft failure** — PowerShell WinRM error reads "Access **is** denied"; the hard-fail regex `access.?denied` (0–1 chars) didn't match the 3-char " is " gap. Fixed: pattern widened to `access.{0,10}denied`. Affected hosts retried 3× unnecessarily.
+
+**Note:** Test environment did not have a properly accessible endpoint for v0.0.6b (all hosts either offline, access-denied, or the false Defender service failure). Retest requires at least one host where the running account has WinRM admin rights and Defender is active.
+
+**Result:** FAIL — retest required after fixes applied
 
 ---
 
@@ -666,8 +672,8 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 
 ## Release Checklist
 
-- [ ] v0.0.6a PASS (config loading; WhatIf mode; AD auto-discovery; hosts.conf generation; HTML + CSV report) *(retest after console-noise + WhatIf email fixes)*
-- [ ] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct)
+- [x] v0.0.6a PASS (config loading; WhatIf mode; AD auto-discovery; hosts.conf generation; HTML + CSV report)
+- [ ] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct) *(retest after service-status deserialization + access-denied hard-fail fixes)*
 - [ ] v0.0.6c PASS (offline hard fail; WinDefend-stopped fail; retry behaviour; correct error messages in report)
 - [ ] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export)
 - [ ] v0.0.6e PASS (port fallback; status file written/deleted; Event Log 101/100/102; all HTTP endpoints respond)
