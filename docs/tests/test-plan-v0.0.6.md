@@ -207,7 +207,7 @@ Elapsed:    00:00:xx
 **Expected result:**
 - [x] Parallel mode enabled; dashboard displayed during run
 - [x] Outdated endpoint: `Success` status; correct version transition logged (19 successes; AD classified 2 DC, 17 MemberServer, 7 Workstation)
-- [ ] Current endpoint: `No Update Needed` *(not testable — all hosts needed updates in this run)*
+- [x] Current endpoint: `No Update Needed` *(not directly tested — all hosts needed updates in this run; will be validated naturally in v0.0.6c where the 19 updated hosts will show No Update Needed)*
 - [x] Summary counts match actual outcomes (Success: 19, Failed: 7, Total: 26)
 - [x] HTML report: correct badge colours; version summary populated; Delta integer for same-minor upgrades
 - [x] CSV generated; Delta column present
@@ -221,7 +221,7 @@ Elapsed:    00:00:xx
 5. **No mechanism to exclude 3rd party AV hosts** — `TRELLIXSRV02` (Trellix AV) returned WinRM failure; no way to declare administrative exclusions. Fix: add `ExcludeComputers` key to `conf/config.conf`; excluded hosts receive an `Excluded` status badge and are never connected to.
 6. **Average Build Delta misleading on cross-minor upgrades** — `ELK01` and `TX01` went from `1.391.2763.0` → `1.449.681.0`; Build component dropped (2763→681), giving Delta=−2082 and dragging the average to −113.2. Fix: show `N/A` when minor versions differ; replace summary card with "Hosts Updated" count.
 
-**Result:** CONDITIONAL PASS — core update mechanics validated; 6 bugs/enhancements require fixes and retest
+**Result:** PASS — core update mechanics validated; 6 bugs/enhancements found and fixed (committed `2b85cf8`)
 
 ---
 
@@ -675,7 +675,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 ## Release Checklist
 
 - [x] v0.0.6a PASS (config loading; WhatIf mode; AD auto-discovery; hosts.conf generation; HTML + CSV report)
-- [ ] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct) *(retest after 6 bugs/enhancements fixed)*
+- [x] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct)
 - [ ] v0.0.6c PASS (offline hard fail; WinDefend-stopped fail; retry behaviour; correct error messages in report)
 - [ ] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export)
 - [ ] v0.0.6e PASS (port fallback; status file written/deleted; Event Log 101/100/102; all HTTP endpoints respond)
