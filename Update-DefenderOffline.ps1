@@ -212,7 +212,7 @@ $script:SuppressConsoleOutput = $false
 # ===================================================================
 if ($SaveSmtpCredential) {
     Write-Host "`n=== SMTP Credential Setup ===" -ForegroundColor Cyan
-    $configDir = Join-Path $ScriptDir 'Config'
+    $configDir = Join-Path $ScriptDir 'conf'
     $credPath  = Join-Path $configDir 'SmtpCredential.xml'
     if (-not (Test-Path $configDir)) {
         New-Item -Path $configDir -ItemType Directory -Force | Out-Null
@@ -268,7 +268,7 @@ if ($SaveCredential) {
         default { Write-Host "  Invalid choice '$choice'. Exiting." -ForegroundColor Red; exit 1 }
     }
 
-    $cfgDir = Join-Path $ScriptDir 'Config'
+    $cfgDir = Join-Path $ScriptDir 'conf'
     if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
 
     foreach ($slot in $slots) {
@@ -336,6 +336,10 @@ if (-not $PSBoundParameters.ContainsKey('To')                 -and $cfg['EmailTo
     $To = $cfg['EmailTo'] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 }
 if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['ClassificationMethod'])    { $ClassificationMethod    = $cfg['ClassificationMethod'] }
+$ExcludeList = @()
+if ($cfg['ExcludeComputers']) {
+    $ExcludeList = $cfg['ExcludeComputers'] -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
+}
 if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
 if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
 
@@ -343,7 +347,7 @@ if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['Do
 # WinRM Credential Auto-Load
 # Loads DPAPI-encrypted XMLs from Config\ if not passed on the CLI.
 # ===================================================================
-$configDir = Join-Path $ScriptDir 'Config'
+$configDir = Join-Path $ScriptDir 'conf'
 
 function Import-SavedCredential ([string]$FileName) {
     $p = Join-Path $configDir $FileName
@@ -358,6 +362,7 @@ if (-not $PSBoundParameters.ContainsKey('Credential'))                 { $Creden
 if (-not $PSBoundParameters.ContainsKey('WorkstationCredential'))      { $WorkstationCredential     = Import-SavedCredential 'WorkstationCredential.xml' }
 if (-not $PSBoundParameters.ContainsKey('ServerCredential'))           { $ServerCredential          = Import-SavedCredential 'ServerCredential.xml' }
 if (-not $PSBoundParameters.ContainsKey('DomainControllerCredential')) { $DomainControllerCredential = Import-SavedCredential 'DomainControllerCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('SmtpCredential'))             { $SmtpCredential            = Import-SavedCredential 'SmtpCredential.xml' }
 
 # ===================================================================
 # Classification Method Resolution
@@ -641,9 +646,12 @@ function Invoke-DefenderUpdate {
         }
 
         # --- Connectivity ---
+        $pingOk = Test-Connection -ComputerName $Computer -Count 1 -Quiet `
+            -TimeoutSeconds 2 -ErrorAction SilentlyContinue
         if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 `
                 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-            throw 'WinRM (5985) not reachable'
+            throw $(if ($pingOk) { 'Online but WinRM (5985) not reachable — may be blocked or disabled' }
+                    else          { 'Host offline (no ping response; WinRM 5985 not reachable)' })
         }
 
         $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
@@ -770,6 +778,31 @@ if (-not $TargetComputers -or $TargetComputers.Count -eq 0) {
 Write-Log "Will process $($TargetComputers.Count) computers" 'HEADER'
 
 # ===================================================================
+# Apply administrative exclusions
+# ===================================================================
+if ($ExcludeList.Count -gt 0) {
+    foreach ($ex in $ExcludeList) {
+        if ($TargetComputers -contains $ex) {
+            Write-Log "EXCLUDED (administrative): $ex — listed in ExcludeComputers in config.conf" 'WARN'
+            $Results.Add([pscustomobject]@{
+                ComputerName = $ex
+                Status       = 'Excluded'
+                OldVersion   = ''
+                NewVersion   = ''
+                DurationSec  = 0
+                Details      = 'Administrative exclusion (ExcludeComputers in config.conf)'
+                Attempt      = 0
+                Timeout      = $false
+            })
+        }
+    }
+    $TargetComputers = $TargetComputers | Where-Object { $ExcludeList -notcontains $_ }
+    if ($ExcludeList.Count -gt 0) {
+        Write-Log "After exclusions: $($TargetComputers.Count) computers to process" 'INFO'
+    }
+}
+
+# ===================================================================
 # Classify endpoints and pre-compute per-host credentials
 # ===================================================================
 Write-Log "Classifying endpoints (method: $ClassificationMethod)..." 'INFO'
@@ -835,6 +868,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     Write-Log "Executing in PARALLEL mode ($MaxConcurrent concurrent threads)" 'HEADER'
 
     $script:SuppressConsoleOutput = $true
+    $savedWarningPref = $WarningPreference
+    $WarningPreference = 'SilentlyContinue'
     $DashTimer  = [System.Diagnostics.Stopwatch]::StartNew()
     $DashAnchor = $null
 
@@ -889,7 +924,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
             $job  = $meta.Job
 
             if ($job.State -notin 'Running','NotStarted') {
-                $r = Receive-Job $job -ErrorAction SilentlyContinue
+                $r = Receive-Job $job -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 
                 if (-not $r) {
                     $r = [pscustomobject]@{
@@ -907,7 +942,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
                 # Classify failure: hard (no retry) vs soft (retryable)
                 $det = ($r.Details ?? '').ToLower()
-                $isHardFail = $det -match 'winrm|not reachable|offline|unreachable|access.{0,10}denied|authentication|cannot.?find|dns' `
+                $isHardFail = $det -match 'winrm|not reachable|offline|unreachable|no ping|access.{0,10}denied|authentication|cannot.?find|dns' `
                     -or $r.Timeout
 
                 if ($r.Status -eq 'Failed' -and -not $isHardFail -and $meta.Attempt -lt $RetryLimit) {
@@ -949,6 +984,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     }
 
     $script:SuppressConsoleOutput = $false
+    $WarningPreference = $savedWarningPref
     Write-Host ''
     Write-Host '=== Final Results ===' -ForegroundColor Magenta
     $Results | Sort-Object ComputerName |
@@ -991,23 +1027,28 @@ foreach ($r in $Results) {
     $delta = 'Unknown'
     if ($r.OldVersion -and $r.NewVersion) {
         try {
-            $delta = ([version]$r.NewVersion).Build - ([version]$r.OldVersion).Build
+            $vOld = [version]$r.OldVersion
+            $vNew = [version]$r.NewVersion
+            # Build delta is only meaningful when the minor version did not change;
+            # a minor-version advance resets the build number, making the difference negative and misleading.
+            if ($vOld.Minor -eq $vNew.Minor) {
+                $delta = $vNew.Build - $vOld.Build
+            } else {
+                $delta = 'N/A'
+            }
         } catch {}
     }
     $r | Add-Member -NotePropertyName Delta -NotePropertyValue $delta -Force
     Write-Log "VersionHistory: $($r.ComputerName) | Old=$($r.OldVersion) | New=$($r.NewVersion) | Delta=$delta" 'INFO'
 }
 
-$validDeltas   = @($Results | Where-Object { $_.Delta -is [int] })
 $OldestVersion = ($Results | Where-Object OldVersion |
     Sort-Object { try { [version]$_.OldVersion } catch { [version]'0.0.0.0' } } |
     Select-Object -First 1).OldVersion
 $NewestVersion = ($Results | Where-Object NewVersion |
     Sort-Object { try { [version]$_.NewVersion } catch { [version]'0.0.0.0' } } -Descending |
     Select-Object -First 1).NewVersion
-$AverageDelta  = if ($validDeltas.Count -gt 0) {
-    [math]::Round(($validDeltas | Measure-Object -Property Delta -Average).Average, 1)
-} else { 'N/A' }
+$HostsUpdated  = @($Results | Where-Object Status -eq 'Success').Count
 
 # ===================================================================
 # HTML Report Generation
@@ -1018,10 +1059,11 @@ function New-HtmlReport {
         [timespan]$RunTime
     )
 
-    $successCount = @($Data | Where-Object Status -eq 'Success').Count
-    $failCount    = @($Data | Where-Object Status -eq 'Failed').Count
-    $skipCount    = @($Data | Where-Object Status -eq 'No Update Needed').Count
-    $whatifCount  = @($Data | Where-Object Status -eq 'WhatIf').Count
+    $successCount  = @($Data | Where-Object Status -eq 'Success').Count
+    $failCount     = @($Data | Where-Object Status -eq 'Failed').Count
+    $skipCount     = @($Data | Where-Object Status -eq 'No Update Needed').Count
+    $whatifCount   = @($Data | Where-Object Status -eq 'WhatIf').Count
+    $excludedCount = @($Data | Where-Object Status -eq 'Excluded').Count
 
     $css = @'
 <style>
@@ -1042,6 +1084,7 @@ function New-HtmlReport {
   .failed        { background: #d13438; }
   .skipped       { background: #9c5100; }
   .whatif        { background: #0078d4; }
+  .excluded      { background: #6b7280; }
   .stat-card     { display: inline-block; padding: 14px 28px; border-radius: 10px; margin: 6px 8px 6px 0;
                    font-size: 1.1em; font-weight: 700; color: #fff; min-width: 120px; text-align: center; }
   .sc-ok         { background: #107c10; }
@@ -1069,6 +1112,7 @@ function New-HtmlReport {
             -replace '<td>Failed</td>',           '<td><span class="tag failed">Failed</span></td>' `
             -replace '<td>No Update Needed</td>', '<td><span class="tag skipped">No Update Needed</span></td>' `
             -replace '<td>WhatIf</td>',           '<td><span class="tag whatif">WhatIf</span></td>' `
+            -replace '<td>Excluded</td>',         '<td><span class="tag excluded">Excluded</span></td>' `
             -replace '<td>True</td>',             '<td><strong style="color:#d13438">Yes</strong></td>' `
             -replace '<td>False</td>',            '<td>No</td>'
     }
@@ -1093,14 +1137,14 @@ function New-HtmlReport {
   <div>
     <span class="stat-card sc-ok">&#x2714; Success<br>$successCount</span>
     <span class="stat-card sc-fail">&#x2718; Failed<br>$failCount</span>
-    <span class="stat-card sc-skip">&#x25CB; Skipped<br>$skipCount</span>$(if ($whatifCount -gt 0) { "`n    <span class='stat-card sc-info'>&#x25C6; WhatIf<br>$whatifCount</span>" })
+    <span class="stat-card sc-skip">&#x25CB; Skipped<br>$skipCount</span>$(if ($whatifCount   -gt 0) { "`n    <span class='stat-card sc-info'>&#x25C6; WhatIf<br>$whatifCount</span>" })$(if ($excludedCount -gt 0) { "`n    <span class='stat-card' style='background:#6b7280'>&#x2205; Excluded<br>$excludedCount</span>" })
   </div>
 
   <h2>Fleet Version Summary</h2>
   <div class="version-grid">
     <div class="vcard"><div class="label">Oldest Version Found</div><div class="value">$OldestVersion</div></div>
     <div class="vcard"><div class="label">Newest Version Applied</div><div class="value">$NewestVersion</div></div>
-    <div class="vcard"><div class="label">Average Build Delta</div><div class="value">$AverageDelta</div></div>
+    <div class="vcard"><div class="label">Hosts Updated</div><div class="value">$HostsUpdated</div></div>
   </div>
 
   <h2>Detailed Results ($($Data.Count) computers)</h2>
@@ -1132,17 +1176,18 @@ Write-Log "CSV export    : $CsvFile"    'SUCCESS'
 # ===================================================================
 # Final Summary
 # ===================================================================
-$successCount = @($Results | Where-Object Status -eq 'Success').Count
-$failCount    = @($Results | Where-Object Status -eq 'Failed').Count
-$skipCount    = @($Results | Where-Object Status -eq 'No Update Needed').Count
+$successCount  = @($Results | Where-Object Status -eq 'Success').Count
+$failCount     = @($Results | Where-Object Status -eq 'Failed').Count
+$skipCount     = @($Results | Where-Object Status -eq 'No Update Needed').Count
+$excludedCount = @($Results | Where-Object Status -eq 'Excluded').Count
 
 Write-Log "UPDATE COMPLETE in $($TotalDuration.ToString('hh\:mm\:ss'))" 'HEADER'
-Write-Log "Success: $successCount  |  Failed: $failCount  |  Skipped: $skipCount  |  Total: $($Results.Count)" 'HEADER'
+Write-Log "Success: $successCount  |  Failed: $failCount  |  Skipped: $skipCount  |  Excluded: $excludedCount  |  Total: $($Results.Count)" 'HEADER'
 
 if ($successCount -gt 0) {
     Write-Log "Oldest version found   : $OldestVersion" 'INFO'
     Write-Log "Newest version applied : $NewestVersion" 'INFO'
-    Write-Log "Average build delta    : $AverageDelta"  'INFO'
+    Write-Log "Hosts updated          : $HostsUpdated"  'INFO'
 }
 
 # ===================================================================

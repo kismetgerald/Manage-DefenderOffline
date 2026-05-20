@@ -169,7 +169,7 @@ if ($SaveCredential) {
     Write-Host '  For a gMSA, create a one-time scheduled task that runs this script' -ForegroundColor Gray
     Write-Host '  with -SaveCredential under the gMSA identity.' -ForegroundColor Gray
     Write-Host ''
-    $cfgDir = Join-Path $ScriptDir 'Config'
+    $cfgDir = Join-Path $ScriptDir 'conf'
     if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
     try {
         $cred = Get-Credential -Message 'Enter WinRM credentials for the management/service account'
@@ -364,7 +364,7 @@ Write-Step "Creating directories and granting filesystem access…"
 
 $scriptFolder  = Split-Path $DashboardScriptPath -Parent
 $confFolder    = Join-Path $scriptFolder 'conf'
-$configFolder  = Join-Path $scriptFolder 'Config'
+$configFolder  = Join-Path $scriptFolder 'conf'
 
 $pathsToCreate = @($LogPath, $scriptFolder, $confFolder, $configFolder)
 foreach ($p in $pathsToCreate | Select-Object -Unique) {

@@ -132,7 +132,7 @@ if ($SaveCredential) {
               ) }
         default { Write-Host "  Invalid choice '$choice'. Exiting." -ForegroundColor Red; exit 1 }
     }
-    $cfgDir = Join-Path $ScriptDir 'Config'
+    $cfgDir = Join-Path $ScriptDir 'conf'
     if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
     foreach ($slot in $slots) {
         Write-Host ''
@@ -178,7 +178,7 @@ if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['Do
 # ===================================================================
 # WinRM Credential Auto-Load
 # ===================================================================
-$configDir = Join-Path $ScriptDir 'Config'
+$configDir = Join-Path $ScriptDir 'conf'
 
 function Import-SavedCredential ([string]$FileName) {
     $p = Join-Path $configDir $FileName

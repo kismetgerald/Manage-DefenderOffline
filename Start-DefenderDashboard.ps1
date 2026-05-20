@@ -84,7 +84,7 @@ param(
     [ValidateRange(5, 300)]
     [int]$TimeoutSeconds = 30,
 
-    # WinRM credential (single; auto-loaded from .\Config\WinRmCredential.xml if present)
+    # WinRM credential (single; auto-loaded from .\conf\WinRmCredential.xml if present)
     [pscredential]$Credential,
 
     [switch]$SaveCredential,
@@ -105,7 +105,7 @@ if ($SaveCredential) {
     Write-Host '  The dashboard uses a single WinRM credential (WinRmCredential.xml).'
     Write-Host '  Run this helper as the service account or gMSA that runs the dashboard task.'
     Write-Host ''
-    $cfgDir = Join-Path $ScriptDir 'Config'
+    $cfgDir = Join-Path $ScriptDir 'conf'
     if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
     try {
         $cred = Get-Credential -Message 'Enter WinRM credentials for the management/service account'
@@ -142,7 +142,7 @@ if (-not $PSBoundParameters.ContainsKey('SourceSharePath') -and $cfg['SourceShar
 
 # Auto-load single WinRM credential if not passed on CLI
 if (-not $PSBoundParameters.ContainsKey('Credential')) {
-    $credPath = Join-Path $ScriptDir 'Config\WinRmCredential.xml'
+    $credPath = Join-Path $ScriptDir 'conf\WinRmCredential.xml'
     if (Test-Path $credPath -ErrorAction SilentlyContinue) {
         try { $Credential = Import-Clixml $credPath }
         catch { Write-Warning "Could not load WinRM credential from '$credPath': $($_.Exception.Message)" }

@@ -205,21 +205,23 @@ Elapsed:    00:00:xx
 7. Open the CSV. Confirm it contains all columns including `Delta` with integer values for updated hosts.
 
 **Expected result:**
-- [ ] Parallel mode enabled; dashboard displayed during run
-- [ ] Outdated endpoint: `Success` status; correct version transition logged
-- [ ] Current endpoint: `No Update Needed`; query duration < 10s (no file transfer)
-- [ ] Summary counts match actual outcomes
-- [ ] HTML report: correct badge colours; version summary populated; Delta is an integer
-- [ ] CSV generated; Delta column contains integers for updated hosts
-- [ ] Per-host log written to `C:\Logs\PerHost\<COMPUTERNAME>.log`
+- [x] Parallel mode enabled; dashboard displayed during run
+- [x] Outdated endpoint: `Success` status; correct version transition logged (19 successes; AD classified 2 DC, 17 MemberServer, 7 Workstation)
+- [ ] Current endpoint: `No Update Needed` *(not testable — all hosts needed updates in this run)*
+- [x] Summary counts match actual outcomes (Success: 19, Failed: 7, Total: 26)
+- [x] HTML report: correct badge colours; version summary populated; Delta integer for same-minor upgrades
+- [x] CSV generated; Delta column present
+- [x] Per-host log written to `C:\Logs\PerHost\<COMPUTERNAME>.log` *(confirmed via LogPath from config)*
 
-**Bugs found during this run (both fixed, retest required):**
-1. **WinRM deserializes `ServiceControllerStatus` as integer** — `(Get-Service).Status` returned `4` (integer for Running) across the WinRM boundary. `4 -ne 'Running'` is `$true`, so every host with Defender running was incorrectly thrown as a health-check failure. Fixed: remote scriptblock now calls `.ToString()` before returning; `$null` service returns `'NotFound'`.
-2. **"Access is denied" misclassified as soft failure** — PowerShell WinRM error reads "Access **is** denied"; the hard-fail regex `access.?denied` (0–1 chars) didn't match the 3-char " is " gap. Fixed: pattern widened to `access.{0,10}denied`. Affected hosts retried 3× unnecessarily.
+**Bugs/enhancements found during this run (all require fixes before retest):**
+1. **SMTP credential not auto-loaded** — `SmtpCredential.xml` existed in `Config\` but was never loaded; the script requires `-SmtpCredential` to be passed explicitly. Fix: auto-load `SmtpCredential.xml` the same way WinRM credentials are auto-loaded.
+2. **`conf\` vs `Config\` folder confusion** — two folders serve similar purposes. Fix: consolidate credential XMLs into `conf\`; all four scripts updated to use `conf\` for credentials. *(Re-run `-SaveSmtpCredential` and `-SaveCredential` after upgrading.)*
+3. **Dashboard repaints when WinRM prints warnings** — WinRM reconnect warnings print to the host, moving the cursor past the dashboard anchor; subsequent refreshes repaint below the warnings instead of overwriting. Fix: suppress `$WarningPreference` and add `-WarningAction SilentlyContinue` to `Receive-Job` during parallel loop.
+4. **No ping pre-check to distinguish offline vs WinRM-blocked** — "WinRM not reachable" covers both powered-off hosts and hosts with WinRM blocked. Fix: add ICMP ping before TCP 5985 test; failure message distinguishes "Host offline (no ping response)" from "Online but WinRM not reachable".
+5. **No mechanism to exclude 3rd party AV hosts** — `TRELLIXSRV02` (Trellix AV) returned WinRM failure; no way to declare administrative exclusions. Fix: add `ExcludeComputers` key to `conf/config.conf`; excluded hosts receive an `Excluded` status badge and are never connected to.
+6. **Average Build Delta misleading on cross-minor upgrades** — `ELK01` and `TX01` went from `1.391.2763.0` → `1.449.681.0`; Build component dropped (2763→681), giving Delta=−2082 and dragging the average to −113.2. Fix: show `N/A` when minor versions differ; replace summary card with "Hosts Updated" count.
 
-**Note:** Test environment did not have a properly accessible endpoint for v0.0.6b (all hosts either offline, access-denied, or the false Defender service failure). Retest requires at least one host where the running account has WinRM admin rights and Defender is active.
-
-**Result:** FAIL — retest required after fixes applied
+**Result:** CONDITIONAL PASS — core update mechanics validated; 6 bugs/enhancements require fixes and retest
 
 ---
 
@@ -673,7 +675,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 ## Release Checklist
 
 - [x] v0.0.6a PASS (config loading; WhatIf mode; AD auto-discovery; hosts.conf generation; HTML + CSV report)
-- [ ] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct) *(retest after service-status deserialization + access-denied hard-fail fixes)*
+- [ ] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct) *(retest after 6 bugs/enhancements fixed)*
 - [ ] v0.0.6c PASS (offline hard fail; WinDefend-stopped fail; retry behaviour; correct error messages in report)
 - [ ] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export)
 - [ ] v0.0.6e PASS (port fallback; status file written/deleted; Event Log 101/100/102; all HTTP endpoints respond)
