@@ -139,7 +139,7 @@ Get-ChildItem .\Reports\ | Select-Object Name, LastWriteTime
 - [x] `hosts.conf` auto-generated from AD; count logged (26 computers)
 - [x] All endpoints reported as `WhatIf`; no file transfers
 - [x] HTML report and CSV generated; HTML opens cleanly in browser
-- [ ] `WhatIf` badge visible in HTML report for all rows *(not yet verified by tester)*
+- [x] `WhatIf` badge visible in HTML report for all rows
 - [x] Log file written to `C:\Logs\` with correct timestamps
 
 **Bugs found during this run (both fixed, retest required):**
