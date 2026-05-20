@@ -148,11 +148,38 @@ param(
     [switch]$StartImmediately,
     [switch]$Force,
 
+    # Save WinRM credential for the dashboard service account (DPAPI-encrypted)
+    [switch]$SaveCredential,
+
     [string]$ConfigPath
 )
 
 $ScriptVersion = '0.0.6'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+# ===================================================================
+# Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveCredential) {
+    Write-Host "`n=== WinRM Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  The dashboard uses a single WinRM credential (WinRmCredential.xml).' -ForegroundColor Gray
+    Write-Host '  IMPORTANT: Run this helper as the service account or gMSA that will run' -ForegroundColor Yellow
+    Write-Host '  the scheduled task — DPAPI encryption is per-user per-machine.' -ForegroundColor Yellow
+    Write-Host '  For a gMSA, create a one-time scheduled task that runs this script' -ForegroundColor Gray
+    Write-Host '  with -SaveCredential under the gMSA identity.' -ForegroundColor Gray
+    Write-Host ''
+    $cfgDir = Join-Path $ScriptDir 'Config'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+    try {
+        $cred = Get-Credential -Message 'Enter WinRM credentials for the management/service account'
+        if ($cred) {
+            $cred | Export-Clixml -Path (Join-Path $cfgDir 'WinRmCredential.xml') -Force
+            Write-Host "  Saved: $(Join-Path $cfgDir 'WinRmCredential.xml')" -ForegroundColor Green
+        } else { Write-Host '  Cancelled.' -ForegroundColor Yellow }
+    } catch { Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
+    exit 0
+}
 
 # ===================================================================
 # Configuration File
@@ -335,10 +362,11 @@ if ($isGmsa) {
 # ===================================================================
 Write-Step "Creating directories and granting filesystem access…"
 
-$scriptFolder = Split-Path $DashboardScriptPath -Parent
-$confFolder   = Join-Path $scriptFolder 'conf'
+$scriptFolder  = Split-Path $DashboardScriptPath -Parent
+$confFolder    = Join-Path $scriptFolder 'conf'
+$configFolder  = Join-Path $scriptFolder 'Config'
 
-$pathsToCreate = @($LogPath, $scriptFolder, $confFolder)
+$pathsToCreate = @($LogPath, $scriptFolder, $confFolder, $configFolder)
 foreach ($p in $pathsToCreate | Select-Object -Unique) {
     if (-not (Test-Path $p)) {
         New-Item -Path $p -ItemType Directory -Force | Out-Null
@@ -367,8 +395,9 @@ function Grant-FolderAccess {
     }
 }
 
-Grant-FolderAccess -Path $scriptFolder -Identity $identityLabel -Rights 'ReadAndExecute'
-Grant-FolderAccess -Path $confFolder   -Identity $identityLabel -Rights 'Modify'        # needs to write dashboard.status
+Grant-FolderAccess -Path $scriptFolder  -Identity $identityLabel -Rights 'ReadAndExecute'
+Grant-FolderAccess -Path $confFolder   -Identity $identityLabel -Rights 'Modify'         # writes dashboard.status
+Grant-FolderAccess -Path $configFolder -Identity $identityLabel -Rights 'Modify'         # reads/writes WinRmCredential.xml
 Grant-FolderAccess -Path $LogPath      -Identity $identityLabel -Rights 'Modify'
 
 # ===================================================================
@@ -598,6 +627,16 @@ Write-Host ""
 # ===================================================================
 # Prerequisites Reminder
 # ===================================================================
+$credFile = Join-Path $configFolder 'WinRmCredential.xml'
+if (-not (Test-Path $credFile)) {
+    Write-Host "  WinRM CREDENTIAL NOT CONFIGURED" -ForegroundColor Yellow
+    Write-Host "  The dashboard needs a WinRM credential to query endpoints." -ForegroundColor Yellow
+    Write-Host "  Run the following as the service identity ($identityLabel):" -ForegroundColor Yellow
+    Write-Host "    .\Install-DefenderDashboard.ps1 -SaveCredential" -ForegroundColor Gray
+    Write-Host "  For gMSA: create a one-time scheduled task under the gMSA to run -SaveCredential." -ForegroundColor Gray
+    Write-Host ""
+}
+
 Write-Host "  IMPORTANT – Manual steps required on target endpoints:" -ForegroundColor Yellow
 Write-Host "    The service account/gMSA must be a LOCAL ADMINISTRATOR on every" -ForegroundColor Yellow
 Write-Host "    target computer it queries, and WinRM (TCP 5985) must be enabled." -ForegroundColor Yellow

@@ -39,6 +39,33 @@
     # Open GUI for specific computers only
     .\Show-DefenderStatus.ps1 -ComputerName "WS01","WS02","SRV01"
 
+.PARAMETER Credential
+    Single PSCredential used for all WinRM connections. Fallback when no tier-specific
+    credential is supplied. Auto-loaded from .\Config\WinRmCredential.xml if present.
+
+.PARAMETER WorkstationCredential
+    PSCredential for workstation-tier endpoints. Auto-loaded from .\Config\WorkstationCredential.xml.
+
+.PARAMETER ServerCredential
+    PSCredential for member-server-tier endpoints. Auto-loaded from .\Config\ServerCredential.xml.
+
+.PARAMETER DomainControllerCredential
+    PSCredential for domain controller endpoints. Auto-loaded from .\Config\DomainControllerCredential.xml.
+
+.PARAMETER SaveCredential
+    Interactive helper that saves WinRM credentials (DPAPI-encrypted) to .\Config\. Exits after saving.
+
+.PARAMETER ClassificationMethod
+    AD | Pattern | Single. Auto-detected if omitted (AD when domain-joined, Single otherwise).
+
+.PARAMETER WorkstationPattern
+    Regex for workstation name matching when ClassificationMethod = Pattern.
+    IMPORTANT: Example only — customise for your environment.
+
+.PARAMETER DomainControllerPattern
+    Regex for DC name matching when ClassificationMethod = Pattern.
+    IMPORTANT: Example only — customise for your environment.
+
 .NOTES
     Author         : Kismet Agbasi (GitHub: kismetgerald | Email: KismetG17@gmail.com)
     AI Contributors: Claude AI, Grok
@@ -59,12 +86,66 @@ param(
     [ValidateRange(5, 300)]
     [int]$TimeoutSeconds = 30,
 
+    # WinRM credentials
+    [pscredential]$Credential,
+    [pscredential]$WorkstationCredential,
+    [pscredential]$ServerCredential,
+    [pscredential]$DomainControllerCredential,
+
+    [switch]$SaveCredential,
+
+    [ValidateSet('AD','Pattern','Single')]
+    [string]$ClassificationMethod,
+    [string]$WorkstationPattern,
+    [string]$DomainControllerPattern,
+
     [string]$ConfigPath
 )
 
 $ScriptVersion = '0.0.6'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# ===================================================================
+# Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveCredential) {
+    Write-Host "`n=== WinRM Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  [1] Single / management account  (WinRmCredential.xml)'
+    Write-Host '  [2] Workstation admin             (WorkstationCredential.xml)'
+    Write-Host '  [3] Server / member server admin  (ServerCredential.xml)'
+    Write-Host '  [4] Domain admin / DC credential  (DomainControllerCredential.xml)'
+    Write-Host '  [A] All of the above'
+    Write-Host ''
+    $choice = (Read-Host '  Enter choice [1/2/3/4/A]').ToUpper().Trim()
+    $slots = switch ($choice) {
+        '1' { @(@{ File = 'WinRmCredential.xml';           Label = 'Single / management account' }) }
+        '2' { @(@{ File = 'WorkstationCredential.xml';     Label = 'Workstation admin' }) }
+        '3' { @(@{ File = 'ServerCredential.xml';          Label = 'Server / member server admin' }) }
+        '4' { @(@{ File = 'DomainControllerCredential.xml'; Label = 'Domain admin / DC credential' }) }
+        'A' { @(
+                @{ File = 'WinRmCredential.xml';           Label = 'Single / management account' }
+                @{ File = 'WorkstationCredential.xml';     Label = 'Workstation admin' }
+                @{ File = 'ServerCredential.xml';          Label = 'Server / member server admin' }
+                @{ File = 'DomainControllerCredential.xml'; Label = 'Domain admin / DC credential' }
+              ) }
+        default { Write-Host "  Invalid choice '$choice'. Exiting." -ForegroundColor Red; exit 1 }
+    }
+    $cfgDir = Join-Path $ScriptDir 'Config'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+    foreach ($slot in $slots) {
+        Write-Host ''
+        try {
+            $cred = Get-Credential -Message "Enter credentials for: $($slot.Label)"
+            if ($cred) {
+                $cred | Export-Clixml -Path (Join-Path $cfgDir $slot.File) -Force
+                Write-Host "  Saved: $(Join-Path $cfgDir $slot.File)" -ForegroundColor Green
+            } else { Write-Host "  Cancelled: $($slot.Label)" -ForegroundColor Yellow }
+        } catch { Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red }
+    }
+    exit 0
+}
 
 # ===================================================================
 # Configuration File
@@ -87,9 +168,35 @@ function Read-ConfigFile {
 }
 
 $cfg = Read-ConfigFile $ConfigPath
-if (-not $PSBoundParameters.ContainsKey('SourceSharePath')  -and $cfg['SourceSharePath'])  { $SourceSharePath  = $cfg['SourceSharePath'] }
-if (-not $PSBoundParameters.ContainsKey('ParallelThreads')  -and $cfg['ParallelThreads'])  { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
-if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')   -and $cfg['TimeoutSeconds'])   { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
+if (-not $PSBoundParameters.ContainsKey('SourceSharePath')         -and $cfg['SourceSharePath'])         { $SourceSharePath         = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ParallelThreads')         -and $cfg['ParallelThreads'])         { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')          -and $cfg['TimeoutSeconds'])          { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
+if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['ClassificationMethod'])    { $ClassificationMethod    = $cfg['ClassificationMethod'] }
+if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
+if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
+
+# ===================================================================
+# WinRM Credential Auto-Load
+# ===================================================================
+$configDir = Join-Path $ScriptDir 'Config'
+
+function Import-SavedCredential ([string]$FileName) {
+    $p = Join-Path $configDir $FileName
+    if (Test-Path $p -ErrorAction SilentlyContinue) {
+        try { return Import-Clixml $p } catch { Write-Warning "Could not load credential from '$p': $($_.Exception.Message)" }
+    }
+    return $null
+}
+
+if (-not $PSBoundParameters.ContainsKey('Credential'))                 { $Credential                = Import-SavedCredential 'WinRmCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('WorkstationCredential'))      { $WorkstationCredential     = Import-SavedCredential 'WorkstationCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('ServerCredential'))           { $ServerCredential          = Import-SavedCredential 'ServerCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('DomainControllerCredential')) { $DomainControllerCredential = Import-SavedCredential 'DomainControllerCredential.xml' }
+
+if (-not $ClassificationMethod) {
+    $partOfDomain = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).PartOfDomain
+    $ClassificationMethod = if ($partOfDomain) { 'AD' } else { 'Single' }
+}
 
 # ===================================================================
 # Target Resolution
@@ -135,13 +242,64 @@ function Get-LatestAvailableVersion {
 }
 
 # ===================================================================
+# Endpoint Classification
+# ===================================================================
+function Get-EndpointClassification {
+    param([string[]]$Computers, [string]$Method, [string]$WsPattern, [string]$DcPattern)
+    $tiers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($c in $Computers) { $tiers[$c] = 'MemberServer' }
+    if ($Method -eq 'Single') { return $tiers }
+    if ($Method -eq 'AD') {
+        try {
+            $adMap = [System.Collections.Generic.Dictionary[string,pscustomobject]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            if (Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue) {
+                Import-Module ActiveDirectory -ErrorAction Stop
+                Get-ADComputer -Filter 'Enabled -eq $true' -Properties Name,OperatingSystem,userAccountControl -ErrorAction SilentlyContinue |
+                    ForEach-Object { $adMap[$_.Name] = [pscustomobject]@{ OS = $_.OperatingSystem; IsDC = ($_.userAccountControl -band 0x2000) -ne 0 } }
+            } else {
+                $searcher = [adsisearcher]'(objectCategory=computer)'
+                $searcher.SearchRoot = "LDAP://$((Get-CimInstance Win32_ComputerSystem).Domain)"
+                $searcher.PropertiesToLoad.AddRange(@('name','operatingsystem','useraccountcontrol'))
+                $searcher.PageSize = 1000
+                $searcher.FindAll() | ForEach-Object {
+                    $n = $_.Properties['name'][0]
+                    if ($n) { $adMap[$n] = [pscustomobject]@{ OS = $_.Properties['operatingsystem'][0]; IsDC = ([int]$_.Properties['useraccountcontrol'][0] -band 0x2000) -ne 0 } }
+                }
+            }
+            foreach ($c in $Computers) {
+                if ($adMap.ContainsKey($c)) {
+                    if ($adMap[$c].IsDC) { $tiers[$c] = 'DomainController' }
+                    elseif ($adMap[$c].OS -match 'Windows (10|11|7|8|Vista|XP)') { $tiers[$c] = 'Workstation' }
+                }
+            }
+        } catch { Write-Warning "AD classification failed: $($_.Exception.Message)" }
+        return $tiers
+    }
+    foreach ($c in $Computers) {
+        if ($DcPattern -and $c -imatch $DcPattern)     { $tiers[$c] = 'DomainController' }
+        elseif ($WsPattern -and $c -imatch $WsPattern) { $tiers[$c] = 'Workstation' }
+    }
+    return $tiers
+}
+
+function Resolve-WinRmCredential ([string]$Tier) {
+    switch ($Tier) {
+        'Workstation'      { if ($WorkstationCredential)       { return $WorkstationCredential }       }
+        'DomainController' { if ($DomainControllerCredential)  { return $DomainControllerCredential }  }
+    }
+    if ($ServerCredential) { return $ServerCredential }
+    return $Credential
+}
+
+# ===================================================================
 # Per-Host Defender Query
 # ===================================================================
 function Get-DefenderStatus {
     param(
         [string]$Computer,
         [int]$TimeoutSeconds,
-        [string]$AvailableVersionStr
+        [string]$AvailableVersionStr,
+        [System.Management.Automation.PSCredential]$WinRmCredential
     )
 
     $result = [pscustomobject]@{
@@ -168,7 +326,9 @@ function Get-DefenderStatus {
             return $result
         }
 
-        $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
+        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
+        $session = New-PSSession @sessionParams
         try {
             $data = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
@@ -319,6 +479,17 @@ $($rows -join "`n")
 # ===================================================================
 $TargetComputers = @(Resolve-TargetComputers)
 if ($TargetComputers.Count -eq 0) { throw 'No target computers found.' }
+
+$EndpointTiers = Get-EndpointClassification `
+    -Computers  $TargetComputers `
+    -Method     $ClassificationMethod `
+    -WsPattern  $WorkstationPattern `
+    -DcPattern  $DomainControllerPattern
+
+$HostCredentials = [System.Collections.Generic.Dictionary[string,System.Management.Automation.PSCredential]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($c in $TargetComputers) {
+    $HostCredentials[$c] = Resolve-WinRmCredential -Tier ($EndpointTiers.ContainsKey($c) ? $EndpointTiers[$c] : 'MemberServer')
+}
 
 $AvailableVersion    = Get-LatestAvailableVersion -Root $SourceSharePath
 $AvailableVersionStr = if ($AvailableVersion) { $AvailableVersion.ToString() } else { '' }
@@ -594,11 +765,12 @@ $worker.WorkerSupportsCancellation  = $true
 
 $worker.add_DoWork({
     param($s, $e)
-    $tc   = $e.Argument[0]
-    $avs  = $e.Argument[1]
-    $pt   = $e.Argument[2]
-    $ts   = $e.Argument[3]
-    $fDef = $e.Argument[4]
+    $tc        = $e.Argument[0]
+    $avs       = $e.Argument[1]
+    $pt        = $e.Argument[2]
+    $ts        = $e.Argument[3]
+    $fDef      = $e.Argument[4]
+    $hostCreds = $e.Argument[5]
 
     . ([scriptblock]::Create($fDef))
 
@@ -612,7 +784,8 @@ $worker.add_DoWork({
         while ($queue.Count -gt 0 -or $active.Count -gt 0) {
             while ($active.Count -lt $pt -and $queue.Count -gt 0) {
                 $comp = $queue.Dequeue()
-                $job  = Start-ThreadJob -ScriptBlock $using:funcSB -ArgumentList @($comp, $ts, $avs)
+                $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
+                $job  = Start-ThreadJob -ScriptBlock $using:funcSB -ArgumentList @($comp, $ts, $avs, $cred)
                 $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
             }
             foreach ($id in @($active.Keys)) {
@@ -623,7 +796,7 @@ $worker.add_DoWork({
                     elseif ($r -is [array]) { $r = $r[-1] }
                     $done.Add($r)
                     Remove-Job $m.Job -Force
-                    $active.Remove($id)
+                    [void]$active.Remove($id)
                     $s.ReportProgress([int]($done.Count * 100 / $total), $r.ComputerName)
                 }
             }
@@ -633,7 +806,7 @@ $worker.add_DoWork({
                     Stop-Job $m.Job -Force
                     $done.Add([pscustomobject]@{ ComputerName='?'; Online=$false; Error='Timeout' })
                     Remove-Job $m.Job -Force
-                    $active.Remove($id)
+                    [void]$active.Remove($id)
                     $s.ReportProgress([int]($done.Count * 100 / $total), 'timeout')
                 }
             }
@@ -642,7 +815,8 @@ $worker.add_DoWork({
     } else {
         $i = 0
         foreach ($comp in $tc) {
-            $r = Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs
+            $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
+            $r = Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
             $done.Add($r)
             $i++
             $s.ReportProgress([int]($i * 100 / $total), $comp)
@@ -683,7 +857,7 @@ $btnRefresh.add_Click({
     if ($worker.IsBusy) { return }
     $btnRefresh.Enabled = $false
     $statusLabel.Text   = 'Querying endpoints…'
-    $worker.RunWorkerAsync(@($TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, ${function:Get-DefenderStatus}.ToString()))
+    $worker.RunWorkerAsync(@($TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, ${function:Get-DefenderStatus}.ToString(), $HostCredentials))
 })
 
 $txtFilter.add_TextChanged({

@@ -84,12 +84,38 @@ param(
     [ValidateRange(5, 300)]
     [int]$TimeoutSeconds = 30,
 
+    # WinRM credential (single; auto-loaded from .\Config\WinRmCredential.xml if present)
+    [pscredential]$Credential,
+
+    [switch]$SaveCredential,
+
     [string]$ConfigPath
 )
 
 $ScriptVersion = '0.0.6'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# ===================================================================
+# Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveCredential) {
+    Write-Host "`n=== WinRM Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  The dashboard uses a single WinRM credential (WinRmCredential.xml).'
+    Write-Host '  Run this helper as the service account or gMSA that runs the dashboard task.'
+    Write-Host ''
+    $cfgDir = Join-Path $ScriptDir 'Config'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+    try {
+        $cred = Get-Credential -Message 'Enter WinRM credentials for the management/service account'
+        if ($cred) {
+            $cred | Export-Clixml -Path (Join-Path $cfgDir 'WinRmCredential.xml') -Force
+            Write-Host "  Saved: $(Join-Path $cfgDir 'WinRmCredential.xml')" -ForegroundColor Green
+        } else { Write-Host '  Cancelled.' -ForegroundColor Yellow }
+    } catch { Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
+    exit 0
+}
 
 # ===================================================================
 # Configuration File
@@ -113,6 +139,15 @@ function Read-ConfigFile {
 
 $cfg = Read-ConfigFile $ConfigPath
 if (-not $PSBoundParameters.ContainsKey('SourceSharePath') -and $cfg['SourceSharePath']) { $SourceSharePath = $cfg['SourceSharePath'] }
+
+# Auto-load single WinRM credential if not passed on CLI
+if (-not $PSBoundParameters.ContainsKey('Credential')) {
+    $credPath = Join-Path $ScriptDir 'Config\WinRmCredential.xml'
+    if (Test-Path $credPath -ErrorAction SilentlyContinue) {
+        try { $Credential = Import-Clixml $credPath }
+        catch { Write-Warning "Could not load WinRM credential from '$credPath': $($_.Exception.Message)" }
+    }
+}
 if (-not $PSBoundParameters.ContainsKey('Port')            -and $cfg['Port'])            { try { $Port            = [int]$cfg['Port']            } catch {} }
 if (-not $PSBoundParameters.ContainsKey('FallbackPort')    -and $cfg['FallbackPort'])    { try { $FallbackPort    = [int]$cfg['FallbackPort']    } catch {} }
 if (-not $PSBoundParameters.ContainsKey('RefreshInterval') -and $cfg['RefreshInterval']) { try { $RefreshInterval = [int]$cfg['RefreshInterval'] } catch {} }
@@ -222,7 +257,8 @@ function Get-DefenderStatus {
     param(
         [string]$Computer,
         [int]$TimeoutSeconds,
-        [string]$AvailableVersionStr
+        [string]$AvailableVersionStr,
+        [System.Management.Automation.PSCredential]$WinRmCredential
     )
 
     $result = [pscustomobject]@{
@@ -249,7 +285,9 @@ function Get-DefenderStatus {
             return $result
         }
 
-        $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
+        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
+        $session = New-PSSession @sessionParams
         try {
             $data = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
@@ -309,7 +347,8 @@ function Invoke-FleetRefresh {
         [string]$AvailableVersionStr,
         [int]$Threads,
         [int]$TSeconds,
-        [string]$FunctionDef     # Get-DefenderStatus serialised as a string
+        [string]$FunctionDef,    # Get-DefenderStatus serialised as a string
+        [System.Management.Automation.PSCredential]$WinRmCredential
     )
 
     . ([scriptblock]::Create($FunctionDef))
@@ -324,10 +363,10 @@ function Invoke-FleetRefresh {
             while ($active.Count -lt $Threads -and $queue.Count -gt 0) {
                 $comp = $queue.Dequeue()
                 $job  = Start-ThreadJob -ScriptBlock {
-                    param($c, $ts, $avs, $fdef)
+                    param($c, $ts, $avs, $fdef, [System.Management.Automation.PSCredential]$cred)
                     . ([scriptblock]::Create($fdef))
-                    Get-DefenderStatus -Computer $c -TimeoutSeconds $ts -AvailableVersionStr $avs
-                } -ArgumentList $comp, $TSeconds, $AvailableVersionStr, $FunctionDef
+                    Get-DefenderStatus -Computer $c -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
+                } -ArgumentList $comp, $TSeconds, $AvailableVersionStr, $FunctionDef, $WinRmCredential
                 $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
             }
 
@@ -339,27 +378,25 @@ function Invoke-FleetRefresh {
                     elseif ($r -is [array]) { $r = $r[-1] }
                     $results.Add($r)
                     Remove-Job $m.Job -Force
-                    $active.Remove($id)
+                    [void]$active.Remove($id)
                 }
             }
 
-            # Per-job timeout guard
             foreach ($id in @($active.Keys)) {
                 $m = $active[$id]
                 if (([datetime]::UtcNow - $m.Start).TotalSeconds -gt $TSeconds + 10) {
                     Stop-Job $m.Job -Force
                     $results.Add([pscustomobject]@{ ComputerName = '?'; Online = $false; Error = 'Timeout' })
                     Remove-Job $m.Job -Force
-                    $active.Remove($id)
+                    [void]$active.Remove($id)
                 }
             }
 
             Start-Sleep -Milliseconds 200
         }
     } else {
-        # PS 5.1 serial fallback
         foreach ($comp in $Computers) {
-            $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr))
+            $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $WinRmCredential))
         }
     }
 
@@ -628,6 +665,7 @@ Write-DashLog "Port            : $Port"
 Write-DashLog "Refresh interval: ${RefreshInterval}s"
 Write-DashLog "Parallel threads: $ParallelThreads"
 Write-DashLog "Log file        : $LogFile"
+Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 
 $TargetComputers = @(Resolve-TargetComputers)
 if ($TargetComputers.Count -eq 0) {
@@ -728,7 +766,8 @@ function Start-BackgroundRefresh {
         $AvailableVersionStr,
         $ParallelThreads,
         $TimeoutSeconds,
-        $FunctionDef
+        $FunctionDef,
+        $Credential
     )
 }
 
@@ -759,7 +798,8 @@ $initResults = Invoke-FleetRefresh `
     -AvailableVersionStr $AvailableVersionStr `
     -Threads             $ParallelThreads `
     -TSeconds            $TimeoutSeconds `
-    -FunctionDef         $FunctionDef
+    -FunctionDef         $FunctionDef `
+    -WinRmCredential     $Credential
 
 $script:CachedResults = $initResults
 $script:CachedAt      = Get-Date

@@ -67,6 +67,46 @@
     Interactive helper that saves encrypted SMTP credentials to .\Config\SmtpCredential.xml.
     The file is encrypted per-user and per-machine via DPAPI (safe for scheduled tasks / gMSA).
 
+.PARAMETER Credential
+    Single PSCredential used for all WinRM connections. Acts as a fallback when no
+    tier-specific credential is supplied. Auto-loaded from .\Config\WinRmCredential.xml
+    if the file exists and -Credential is not passed explicitly.
+
+.PARAMETER WorkstationCredential
+    PSCredential for workstation-tier endpoints. Takes precedence over -Credential for
+    hosts classified as Workstation. Auto-loaded from .\Config\WorkstationCredential.xml.
+
+.PARAMETER ServerCredential
+    PSCredential for member-server-tier endpoints. Takes precedence over -Credential for
+    hosts classified as MemberServer. Auto-loaded from .\Config\ServerCredential.xml.
+
+.PARAMETER DomainControllerCredential
+    PSCredential for domain controller endpoints. Takes precedence over -Credential for
+    hosts classified as DomainController. Auto-loaded from .\Config\DomainControllerCredential.xml.
+
+.PARAMETER SaveCredential
+    Interactive helper that saves WinRM credentials to .\Config\ (DPAPI-encrypted).
+    Prompts for which tier(s) to save. Exits after saving.
+
+.PARAMETER ClassificationMethod
+    Controls how endpoints are assigned to credential tiers.
+    AD      - Queries Active Directory OperatingSystem attribute and DC flag (default when domain-joined).
+    Pattern - Matches computer names against -WorkstationPattern and -DomainControllerPattern.
+    Single  - All endpoints use one credential; no classification (default when not domain-joined).
+    Auto-detected if omitted.
+
+.PARAMETER WorkstationPattern
+    Regex matched case-insensitively against computer names when ClassificationMethod = Pattern.
+    Hosts that match are classified as Workstation and use -WorkstationCredential.
+    Example: ^(DESKTOP|LAPTOP|WS|WIN10|WIN11)
+    IMPORTANT: This is an example only. Customise it for your naming convention.
+
+.PARAMETER DomainControllerPattern
+    Regex matched case-insensitively against computer names when ClassificationMethod = Pattern.
+    Hosts that match are classified as DomainController and use -DomainControllerCredential.
+    Example: ^DC
+    IMPORTANT: This is an example only. Customise it for your naming convention.
+
 .EXAMPLE
     # First run – auto-discovers domain computers via AD and creates hosts.conf
     .\Update-DefenderOffline.ps1 -SourceSharePath "\\NAS01\Share\_AVDefinitions\Microsoft_Defender"
@@ -139,6 +179,21 @@ param(
     # Credential helper
     [switch]$SaveSmtpCredential,
 
+    # WinRM credentials
+    [pscredential]$Credential,
+    [pscredential]$WorkstationCredential,
+    [pscredential]$ServerCredential,
+    [pscredential]$DomainControllerCredential,
+
+    # WinRM credential helper
+    [switch]$SaveCredential,
+
+    # Endpoint classification
+    [ValidateSet('AD','Pattern','Single')]
+    [string]$ClassificationMethod,
+    [string]$WorkstationPattern,
+    [string]$DomainControllerPattern,
+
     # Path to configuration file. Defaults to .\conf\config.conf relative to the script.
     [string]$ConfigPath
 )
@@ -176,6 +231,59 @@ if ($SaveSmtpCredential) {
     } catch {
         Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
         exit 1
+    }
+    exit 0
+}
+
+# ===================================================================
+# WinRM Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveCredential) {
+    Write-Host "`n=== WinRM Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Credentials are encrypted per-user per-machine (DPAPI) and stored under' -ForegroundColor Gray
+    Write-Host "  Config\ in the script directory. Run this helper as the account that will" -ForegroundColor Gray
+    Write-Host '  actually execute the script (or the service account for scheduled tasks).' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  Which credential(s) to save?' -ForegroundColor White
+    Write-Host '  [1] Single / management account  (WinRmCredential.xml)          – fallback for all tiers'
+    Write-Host '  [2] Workstation admin             (WorkstationCredential.xml)'
+    Write-Host '  [3] Server / member server admin  (ServerCredential.xml)'
+    Write-Host '  [4] Domain admin / DC credential  (DomainControllerCredential.xml)'
+    Write-Host '  [A] All of the above'
+    Write-Host ''
+    $choice = (Read-Host '  Enter choice [1/2/3/4/A]').ToUpper().Trim()
+
+    $slots = switch ($choice) {
+        '1' { @(@{ File = 'WinRmCredential.xml';           Label = 'Single / management account' }) }
+        '2' { @(@{ File = 'WorkstationCredential.xml';     Label = 'Workstation admin' }) }
+        '3' { @(@{ File = 'ServerCredential.xml';          Label = 'Server / member server admin' }) }
+        '4' { @(@{ File = 'DomainControllerCredential.xml'; Label = 'Domain admin / DC credential' }) }
+        'A' { @(
+                @{ File = 'WinRmCredential.xml';           Label = 'Single / management account' }
+                @{ File = 'WorkstationCredential.xml';     Label = 'Workstation admin' }
+                @{ File = 'ServerCredential.xml';          Label = 'Server / member server admin' }
+                @{ File = 'DomainControllerCredential.xml'; Label = 'Domain admin / DC credential' }
+              ) }
+        default { Write-Host "  Invalid choice '$choice'. Exiting." -ForegroundColor Red; exit 1 }
+    }
+
+    $cfgDir = Join-Path $ScriptDir 'Config'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+
+    foreach ($slot in $slots) {
+        Write-Host ''
+        try {
+            $cred = Get-Credential -Message "Enter credentials for: $($slot.Label)"
+            if ($cred) {
+                $cred | Export-Clixml -Path (Join-Path $cfgDir $slot.File) -Force
+                Write-Host "  Saved: $(Join-Path $cfgDir $slot.File)" -ForegroundColor Green
+            } else {
+                Write-Host "  Cancelled: $($slot.Label)" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  ERROR saving $($slot.File): $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
     exit 0
 }
@@ -226,6 +334,37 @@ if (-not $PSBoundParameters.ContainsKey('SmtpUseSsl')         -and $cfg['SmtpUse
 if (-not $PSBoundParameters.ContainsKey('From')               -and $cfg['EmailFrom'])          { $From               = $cfg['EmailFrom'] }
 if (-not $PSBoundParameters.ContainsKey('To')                 -and $cfg['EmailTo'])            {
     $To = $cfg['EmailTo'] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['ClassificationMethod'])    { $ClassificationMethod    = $cfg['ClassificationMethod'] }
+if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
+if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
+
+# ===================================================================
+# WinRM Credential Auto-Load
+# Loads DPAPI-encrypted XMLs from Config\ if not passed on the CLI.
+# ===================================================================
+$configDir = Join-Path $ScriptDir 'Config'
+
+function Import-SavedCredential ([string]$FileName) {
+    $p = Join-Path $configDir $FileName
+    if (Test-Path $p -ErrorAction SilentlyContinue) {
+        try { return Import-Clixml $p }
+        catch { Write-Warning "Could not load credential from '$p': $($_.Exception.Message)" }
+    }
+    return $null
+}
+
+if (-not $PSBoundParameters.ContainsKey('Credential'))                 { $Credential                = Import-SavedCredential 'WinRmCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('WorkstationCredential'))      { $WorkstationCredential     = Import-SavedCredential 'WorkstationCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('ServerCredential'))           { $ServerCredential          = Import-SavedCredential 'ServerCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('DomainControllerCredential')) { $DomainControllerCredential = Import-SavedCredential 'DomainControllerCredential.xml' }
+
+# ===================================================================
+# Classification Method Resolution
+# ===================================================================
+if (-not $ClassificationMethod) {
+    $partOfDomain = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).PartOfDomain
+    $ClassificationMethod = if ($partOfDomain) { 'AD' } else { 'Single' }
 }
 
 # ===================================================================
@@ -285,6 +424,13 @@ Write-Log "Log File      : $LogFile"
 Write-Log "Report Folder : $ReportPath"
 Write-Log "WhatIf Mode   : $WhatIfMode"
 if ($SendEmail) { Write-Log "Email         : $SmtpServer → $($To -join ', ')" }
+$credParts = @()
+if ($DomainControllerCredential) { $credParts += "DC=$($DomainControllerCredential.UserName)" }
+if ($ServerCredential)           { $credParts += "Server=$($ServerCredential.UserName)" }
+if ($WorkstationCredential)      { $credParts += "WS=$($WorkstationCredential.UserName)" }
+if ($Credential)                 { $credParts += "Single=$($Credential.UserName)" }
+Write-Log "WinRM Auth    : $(if ($credParts) { $credParts -join ' | ' } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+Write-Log "Classification: $ClassificationMethod"
 
 # ===================================================================
 # Target Computer Resolution
@@ -383,6 +529,81 @@ function Get-LatestMpamFile {
 }
 
 # ===================================================================
+# Endpoint Classification
+# ===================================================================
+function Get-EndpointClassification {
+    param(
+        [string[]]$Computers,
+        [string]$Method,
+        [string]$WsPattern,
+        [string]$DcPattern
+    )
+
+    $tiers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($c in $Computers) { $tiers[$c] = 'MemberServer' }
+
+    if ($Method -eq 'Single') { return $tiers }
+
+    if ($Method -eq 'AD') {
+        try {
+            $adMap = [System.Collections.Generic.Dictionary[string,pscustomobject]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            if (Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue) {
+                Import-Module ActiveDirectory -ErrorAction Stop
+                Get-ADComputer -Filter 'Enabled -eq $true' `
+                    -Properties Name, OperatingSystem, userAccountControl `
+                    -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $adMap[$_.Name] = [pscustomobject]@{
+                        OS   = $_.OperatingSystem
+                        IsDC = ($_.userAccountControl -band 0x2000) -ne 0
+                    }
+                }
+            } else {
+                $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
+                $searcher = [adsisearcher]'(objectCategory=computer)'
+                $searcher.SearchRoot = "LDAP://$domain"
+                $searcher.PropertiesToLoad.AddRange(@('name','operatingsystem','useraccountcontrol'))
+                $searcher.PageSize = 1000
+                $searcher.FindAll() | ForEach-Object {
+                    $n   = $_.Properties['name'][0]
+                    $os  = $_.Properties['operatingsystem'][0]
+                    $uac = [int]($_.Properties['useraccountcontrol'][0])
+                    if ($n) {
+                        $adMap[$n] = [pscustomobject]@{ OS = $os; IsDC = ($uac -band 0x2000) -ne 0 }
+                    }
+                }
+            }
+            foreach ($c in $Computers) {
+                if ($adMap.ContainsKey($c)) {
+                    $info = $adMap[$c]
+                    if ($info.IsDC) { $tiers[$c] = 'DomainController' }
+                    elseif ($info.OS -match 'Windows (10|11|7|8|Vista|XP)') { $tiers[$c] = 'Workstation' }
+                }
+            }
+        } catch {
+            Write-Log "AD classification failed: $($_.Exception.Message). All hosts treated as MemberServer." 'WARN'
+        }
+        return $tiers
+    }
+
+    # Pattern method
+    foreach ($c in $Computers) {
+        if ($DcPattern -and $c -imatch $DcPattern)     { $tiers[$c] = 'DomainController' }
+        elseif ($WsPattern -and $c -imatch $WsPattern) { $tiers[$c] = 'Workstation' }
+    }
+    return $tiers
+}
+
+function Resolve-WinRmCredential ([string]$Tier) {
+    switch ($Tier) {
+        'Workstation'      { if ($WorkstationCredential)       { return $WorkstationCredential }       }
+        'DomainController' { if ($DomainControllerCredential)  { return $DomainControllerCredential }  }
+    }
+    if ($ServerCredential) { return $ServerCredential }
+    return $Credential   # $null = run as calling user
+}
+
+# ===================================================================
 # Core Update Function  (single implementation used by both modes)
 # ===================================================================
 function Invoke-DefenderUpdate {
@@ -392,7 +613,8 @@ function Invoke-DefenderUpdate {
         [string]$TempFolderOnTarget,
         [string]$AvailableVersionStr,
         [bool]$WhatIfMode,
-        [string]$LogSharePath
+        [string]$LogSharePath,
+        [System.Management.Automation.PSCredential]$WinRmCredential
     )
 
     $WarningPreference = 'SilentlyContinue'
@@ -424,7 +646,9 @@ function Invoke-DefenderUpdate {
             throw 'WinRM (5985) not reachable'
         }
 
-        $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
+        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
+        $session = New-PSSession @sessionParams
 
         try {
             # --- Pre-update health check ---
@@ -545,6 +769,24 @@ if (-not $TargetComputers -or $TargetComputers.Count -eq 0) {
 }
 Write-Log "Will process $($TargetComputers.Count) computers" 'HEADER'
 
+# ===================================================================
+# Classify endpoints and pre-compute per-host credentials
+# ===================================================================
+Write-Log "Classifying endpoints (method: $ClassificationMethod)..." 'INFO'
+$EndpointTiers = Get-EndpointClassification `
+    -Computers  $TargetComputers `
+    -Method     $ClassificationMethod `
+    -WsPattern  $WorkstationPattern `
+    -DcPattern  $DomainControllerPattern
+
+$tierGroups = $EndpointTiers.Values | Group-Object | ForEach-Object { "$($_.Count) $($_.Name)" }
+Write-Log "Tier breakdown : $($tierGroups -join ' | ')" 'INFO'
+
+$HostCredentials = [System.Collections.Generic.Dictionary[string,System.Management.Automation.PSCredential]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($c in $TargetComputers) {
+    $HostCredentials[$c] = Resolve-WinRmCredential -Tier ($EndpointTiers.ContainsKey($c) ? $EndpointTiers[$c] : 'MemberServer')
+}
+
 if (-not $SourceSharePath) {
     throw '-SourceSharePath is required. Pass it as a parameter or set SourceSharePath in conf\config.conf.'
 }
@@ -584,7 +826,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     # Queue as a generic Queue for O(1) Dequeue
     $Queue = [System.Collections.Generic.Queue[pscustomobject]]::new()
     foreach ($comp in $TargetComputers) {
-        $Queue.Enqueue([pscustomobject]@{ Computer = $comp; Attempt = 1 })
+        $Queue.Enqueue([pscustomobject]@{ Computer = $comp; Attempt = 1; Credential = $HostCredentials[$comp] })
     }
 
     # Active jobs: keyed by Job.Id
@@ -629,13 +871,15 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 $TempFolderOnTarget,
                 $AvailableVersionStr,
                 [bool]$WhatIfMode,
-                $LogSharePath
+                $LogSharePath,
+                $item.Credential
             )
             $ActiveJobs[$job.Id] = @{
-                Job       = $job
-                Computer  = $item.Computer
-                Attempt   = $item.Attempt
-                StartTime = [datetime]::UtcNow
+                Job        = $job
+                Computer   = $item.Computer
+                Attempt    = $item.Attempt
+                Credential = $item.Credential
+                StartTime  = [datetime]::UtcNow
             }
         }
 
@@ -669,8 +913,9 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 if ($r.Status -eq 'Failed' -and -not $isHardFail -and $meta.Attempt -lt $RetryLimit) {
                     Write-Log "Retry scheduled: $($meta.Computer) (attempt $($meta.Attempt) → $($meta.Attempt + 1))" 'WARN'
                     $Queue.Enqueue([pscustomobject]@{
-                        Computer = $meta.Computer
-                        Attempt  = $meta.Attempt + 1
+                        Computer   = $meta.Computer
+                        Attempt    = $meta.Attempt + 1
+                        Credential = $meta.Credential
                     })
                 } else {
                     $Results.Add($r)
@@ -732,7 +977,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
             -TempFolderOnTarget  $TempFolderOnTarget `
             -AvailableVersionStr $AvailableVersionStr `
             -WhatIfMode          ([bool]$WhatIfMode) `
-            -LogSharePath        $LogSharePath
+            -LogSharePath        $LogSharePath `
+            -WinRmCredential     $HostCredentials[$comp]
         $Results.Add($r)
     }
     Write-Progress -Activity 'Done' -Completed
