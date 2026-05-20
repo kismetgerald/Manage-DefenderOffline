@@ -216,7 +216,7 @@ Elapsed:    00:00:xx
 **Setup:** `hosts.conf` contains at least three endpoints:
 - One that is reachable and outdated (will succeed)
 - One that is **powered off or has WinRM disabled** (hard fail — no retry)
-- One that is reachable but whose Defender service is **stopped** (soft-fail candidate; stop `WinDefend` with `Stop-Service WinDefend` before running)
+- One that is reachable but whose Defender service is **stopped** (soft-fail — will retry 3 times before marking Failed; stop `WinDefend` with `Stop-Service WinDefend` before running)
 
 ```powershell
 cd "D:\Dropbox\IT Docs\Scripts\Manage-DefenderOffline"
@@ -238,11 +238,11 @@ Get-Content "C:\Logs\PerHost\OFFLINE-ENDPOINT.log"
 # Expect: single line, Attempt 1: Failed – WinRM (5985) not reachable
 ```
 
-2. Confirm the endpoint with `WinDefend` stopped is logged with the correct failure reason:
+2. Confirm the endpoint with `WinDefend` stopped is logged with the correct failure reason. Because the error message does not match the hard-fail patterns, it retries up to 3 times — the per-host log should show 3 attempts, all Failed:
 
 ```powershell
 Get-Content "C:\Logs\PerHost\NODEFENDER-ENDPOINT.log"
-# Expect: Failed – Windows Defender service is not running (Status: Stopped)
+# Expect: three lines, each: Attempt N: Failed – Windows Defender service is not running (Status: Stopped)
 ```
 
 3. Confirm the HTML report shows `Failed` badges (red) for both failed endpoints with descriptive details in the `Error / Detail` column.
@@ -251,7 +251,7 @@ Get-Content "C:\Logs\PerHost\NODEFENDER-ENDPOINT.log"
 
 **Expected result:**
 - [ ] WinRM-unreachable endpoint: hard fail, no retry; `Attempt 1` only in per-host log
-- [ ] Defender-service-stopped endpoint: `Failed`; correct error message in detail column
+- [ ] Defender-service-stopped endpoint: `Failed`; correct error message in detail column; 3 attempts visible in per-host log
 - [ ] Successful endpoint unaffected by the other failures
 - [ ] HTML report: `Failed` badges red; error details populated for failed rows
 - [ ] Summary counts accurate
@@ -502,7 +502,7 @@ Get-NetFirewallRule -DisplayName 'DefenderDashboard-TCP-8080' |
 7. Confirm the installer waited for `conf/dashboard.status` and reported the actual port:
 
 ```
-  Testing HTTP endpoint (waiting up to 45s for listener to bind)…
+  Waiting for dashboard to start (up to 45s)…
   [OK]  Dashboard started on port 8080
   [OK]  HTTP health probe passed: http://localhost:8080/health → 200 OK
 ```
@@ -608,7 +608,7 @@ Import-Csv (Get-ChildItem .\Reports\*.csv | Sort-Object LastWriteTime -Desc | Se
 ```powershell
 Get-ChildItem "\\NAS01\DefenderLogs\ENDPOINT01\" | Select-Object Name
 # Expect: install_20260519_103045.log  and  install_20260519_103045.log.err
-# NOT:    mpam-feX64.exe.log
+# NOT:    mpam-fe.exe.log  or  mpam-fe.exe.err
 ```
 
 4. **No update needed for current endpoint — no file transfer.** Confirm the `No Update Needed` endpoint has a short duration (< 10s) confirming no ~200 MB transfer occurred. Cross-check with the per-host log:
