@@ -128,6 +128,7 @@ function Get-LatestAvailableVersion {
     param([string]$Root)
     if (-not $Root -or -not (Test-Path $Root -ErrorAction SilentlyContinue)) { return $null }
     $versioned = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
         Where-Object { $_.Directory.Name -match '^v(\d+\.\d+\.\d+\.\d+)$' } |
         ForEach-Object { [version]$_.Directory.Name.TrimStart('v') }
     return $versioned | Sort-Object -Descending | Select-Object -First 1

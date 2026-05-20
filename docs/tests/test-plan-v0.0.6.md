@@ -34,7 +34,7 @@ Deliverables validated by this test plan:
 
 ### Key behaviors
 
-1. **Version folder parsing.** Script scans `<SourceSharePath>\**\v#.###.###.#\mpam-fe.exe` and selects the highest version. A file not under a versioned folder is ignored.
+1. **Version folder parsing.** Script scans `<SourceSharePath>\**\v#.###.###.#\mpam-fe.exe` and selects the highest version. A file not under a versioned folder is ignored. Any `mpam-fe.exe` whose path contains an `Archive` or `_Archive` folder segment (case-insensitive) is excluded.
 2. **Skip if current.** If `[version]$endpointVersion >= [version]$availableVersion`, the host receives `No Update Needed` and no file is transferred.
 3. **Defender service health check.** If `WinDefend` is not `Running` on a target, the update is aborted for that host before any file transfer.
 4. **Soft vs hard failure.** Network glitches retry up to 3 times. WinRM-unreachable, access-denied, DNS failures, and timeouts are hard-fail with no retry.
@@ -68,13 +68,15 @@ Select-String -Path Start-DefenderDashboard.ps1 -Pattern "ScriptVersion\s*="
 # Expect: $ScriptVersion = '0.0.6'
 ```
 
-Confirm source share has at least one versioned package:
+Confirm source share has at least one versioned package outside any Archive folder:
 
 ```powershell
 # Substitute your actual base path
 Get-ChildItem "\\NAS01\DataShare\...\Microsoft_Defender" -Recurse -Filter mpam-fe.exe |
+    Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
     Select-Object FullName, @{n='VersionFolder'; e={ $_.Directory.Name }}
 # Expect: at least one result where VersionFolder matches v#.###.###.#
+# Any results under Archive\ or _Archive\ folders should NOT appear
 ```
 
 Confirm WinRM is reachable on at least two test endpoints:
@@ -622,6 +624,23 @@ Get-Content "C:\Logs\PerHost\CURRENT-ENDPOINT.log"
 
 6. **`$ScriptVersion` is `0.0.6`.** Confirm the startup log header and the HTML report footer both show `v0.0.6`, not `v0.0.1`.
 
+7. **Archive folders are excluded from version discovery.** If an `Archive` or `_Archive` subfolder exists under the source share (a common housekeeping pattern), confirm the script does not select a version from inside it. Verify by checking the reported `Source file` path in the startup log does not contain `Archive`:
+
+```powershell
+# Create a decoy to simulate an archived higher-version package
+# (use a version number higher than the real latest so the bug would be obvious if present)
+$archivePath = "\\NAS01\DataShare\...\Microsoft_Defender\_Archive\20250101\v9.999.999.9"
+New-Item -ItemType Directory -Path $archivePath -Force
+Copy-Item "\\NAS01\...\mpam-fe.exe" $archivePath
+
+.\Update-DefenderOffline.ps1 -WhatIfMode
+# Expect: Source file does NOT reference _Archive in the log line:
+#   [INFO] Source file : \\...\Microsoft_Defender\20260519\v1.449.681.0\mpam-fe.exe
+
+# Cleanup
+Remove-Item "\\NAS01\DataShare\...\Microsoft_Defender\_Archive" -Recurse -Force
+```
+
 ```powershell
 Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-Object LastWriteTime -Desc | Select-Object -First 1) `
     -Pattern "ScriptVersion|v0\.0\."
@@ -635,6 +654,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 - [ ] `No Update Needed` endpoint has short duration; per-host log confirms no transfer
 - [ ] HTML report `Attempt` and `Timeout` columns are populated
 - [ ] Version shown as `v0.0.6` in log header and HTML report footer
+- [ ] Archive/\_Archive folder contents excluded from version discovery; decoy higher version not selected
 
 **Result:** PENDING
 
@@ -649,7 +669,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 - [ ] v0.0.6e PASS (port fallback; status file written/deleted; Event Log 101/100/102; all HTTP endpoints respond)
 - [ ] v0.0.6f PASS (installer prereqs; service identity; scheduled task; ACLs; firewall rule; status file read; reboot persistence)
 - [ ] v0.0.6g PASS *(or marked SKIP — SMTP not available in test environment)*
-- [ ] v0.0.6h PASS (all regression checks: delta integer; version sort; log filenames; no transfer for current; columns populated; version string)
+- [ ] v0.0.6h PASS (all regression checks: delta integer; version sort; log filenames; no transfer for current; columns populated; version string; archive folder excluded)
 - [ ] `CLAUDE.md` reflects current architecture
 - [ ] `README.md` project name updated to Manage-DefenderOffline; repo renamed on GitHub ✓
 - [ ] `conf/config.conf` complete and documented

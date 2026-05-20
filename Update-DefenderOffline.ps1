@@ -357,7 +357,8 @@ function Resolve-TargetComputers {
 function Get-LatestMpamFile {
     param([string]$Root)
 
-    $files = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue
+    $files = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' }
 
     if (-not $files) {
         throw "No mpam-fe.exe files found under '$Root'. " +
