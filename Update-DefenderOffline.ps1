@@ -676,7 +676,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 }
 
                 Remove-Job $job -Force -ErrorAction SilentlyContinue
-                $ActiveJobs.Remove($id)
+                [void]$ActiveJobs.Remove($id)
             }
         }
 
@@ -695,7 +695,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                     Details = 'Timeout'; Attempt = $meta.Attempt; Timeout = $true
                 })
                 Remove-Job $meta.Job -Force -ErrorAction SilentlyContinue
-                $ActiveJobs.Remove($id)
+                [void]$ActiveJobs.Remove($id)
             }
         }
 
@@ -901,7 +901,7 @@ if ($successCount -gt 0) {
 # ===================================================================
 # Optional Email Notification
 # ===================================================================
-if ($SendEmail -and $To -and $SmtpServer) {
+if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
     $subject = "Defender Update $(Get-Date -f 'yyyy-MM-dd') – $successCount/$($Results.Count) OK | v$AvailableVersionStr"
     $mailParams = @{
         From        = $From

@@ -135,14 +135,18 @@ Get-ChildItem .\Reports\ | Select-Object Name, LastWriteTime
 6. Confirm WhatIf Mode shown as True in the banner and that `conf/config.conf` is referenced in the log (not an error about missing `-SourceSharePath`).
 
 **Expected result:**
-- [ ] `SourceSharePath` loaded from `conf/config.conf` without passing it on the CLI
-- [ ] `hosts.conf` auto-generated from AD; count logged
-- [ ] All endpoints reported as `WhatIf`; no file transfers
-- [ ] HTML report and CSV generated; HTML opens cleanly in browser
-- [ ] `WhatIf` badge visible in HTML report for all rows
-- [ ] Log file written to `C:\Logs\` with correct timestamps
+- [x] `SourceSharePath` loaded from `conf/config.conf` without passing it on the CLI
+- [x] `hosts.conf` auto-generated from AD; count logged (26 computers)
+- [x] All endpoints reported as `WhatIf`; no file transfers
+- [x] HTML report and CSV generated; HTML opens cleanly in browser
+- [ ] `WhatIf` badge visible in HTML report for all rows *(not yet verified by tester)*
+- [x] Log file written to `C:\Logs\` with correct timestamps
 
-**Result:** PENDING
+**Bugs found during this run (both fixed, retest required):**
+1. **Console noise — 26 `True` lines** — `Dictionary.Remove()` returns `bool`; unassigned .NET method return values bypass `SuppressConsoleOutput` and leak to console. Fixed: `[void]$ActiveJobs.Remove($id)` in both the normal-completion and timeout paths.
+2. **Email attempted in WhatIf mode** — `Send-MailMessage` was called even with `-WhatIfMode`. Fixed: added `-and -not $WhatIfMode` to the email guard condition.
+
+**Result:** FAIL — retest required after fixes applied
 
 ---
 
@@ -662,7 +666,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 
 ## Release Checklist
 
-- [ ] v0.0.6a PASS (config loading; WhatIf mode; AD auto-discovery; hosts.conf generation; HTML + CSV report)
+- [ ] v0.0.6a PASS (config loading; WhatIf mode; AD auto-discovery; hosts.conf generation; HTML + CSV report) *(retest after console-noise + WhatIf email fixes)*
 - [ ] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct)
 - [ ] v0.0.6c PASS (offline hard fail; WinDefend-stopped fail; retry behaviour; correct error messages in report)
 - [ ] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export)
