@@ -103,7 +103,10 @@ function Read-ConfigFile {
     foreach ($line in Get-Content $Path) {
         $t = $line.Trim()
         if (-not $t -or $t -match '^\s*[#\[]') { continue }
-        if ($t -match '^([^=]+?)\s*=\s*(.+)$') { $cfg[$Matches[1].Trim()] = $Matches[2].Trim() }
+        if ($t -match '^([^=]+?)\s*=\s*(.+)$') {
+            $v = $Matches[2].Trim() -replace '^([''"])(.*)\1$', '$2'
+            $cfg[$Matches[1].Trim()] = $v
+        }
     }
     return $cfg
 }
@@ -311,7 +314,6 @@ function Invoke-FleetRefresh {
     . ([scriptblock]::Create($FunctionDef))
 
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
-    $total   = $Computers.Count
 
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $queue  = [System.Collections.Generic.Queue[string]]::new($Computers)

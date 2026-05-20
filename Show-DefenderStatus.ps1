@@ -78,7 +78,10 @@ function Read-ConfigFile {
     foreach ($line in Get-Content $Path) {
         $t = $line.Trim()
         if (-not $t -or $t -match '^\s*[#\[]') { continue }
-        if ($t -match '^([^=]+?)\s*=\s*(.+)$') { $cfg[$Matches[1].Trim()] = $Matches[2].Trim() }
+        if ($t -match '^([^=]+?)\s*=\s*(.+)$') {
+            $v = $Matches[2].Trim() -replace '^([''"])(.*)\1$', '$2'
+            $cfg[$Matches[1].Trim()] = $v
+        }
     }
     return $cfg
 }
