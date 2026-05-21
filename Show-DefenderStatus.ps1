@@ -475,6 +475,71 @@ $($rows -join "`n")
 }
 
 # ===================================================================
+# Parallel Refresh Engine
+# (defined at script scope so ${function:Invoke-StatusRefresh} can be
+# captured and passed to Start-ThreadJob — same pattern as the dashboard)
+# ===================================================================
+function Invoke-StatusRefresh {
+    param(
+        [string[]]$Computers,
+        [string]$AvailableVersionStr,
+        [int]$Threads,
+        [int]$TSeconds,
+        [string]$FunctionDef,
+        [System.Collections.Generic.Dictionary[string, System.Management.Automation.PSCredential]]$HostCredentials
+    )
+
+    $results = [System.Collections.Generic.List[pscustomobject]]::new()
+
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $queue  = [System.Collections.Generic.Queue[string]]::new($Computers)
+        $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
+
+        while ($queue.Count -gt 0 -or $active.Count -gt 0) {
+            while ($active.Count -lt $Threads -and $queue.Count -gt 0) {
+                $comp = $queue.Dequeue()
+                $cred = if ($HostCredentials -and $HostCredentials.ContainsKey($comp)) { $HostCredentials[$comp] } else { $null }
+                $job  = Start-ThreadJob -ScriptBlock {
+                    param($c, $ts, $avs, $fdef, [System.Management.Automation.PSCredential]$cred)
+                    . ([scriptblock]::Create($fdef))
+                    Get-DefenderStatus -Computer $c -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
+                } -ArgumentList $comp, $TSeconds, $AvailableVersionStr, $FunctionDef, $cred
+                $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
+            }
+            foreach ($id in @($active.Keys)) {
+                $m = $active[$id]
+                if ($m.Job.State -notin 'Running','NotStarted') {
+                    $r = Receive-Job $m.Job -ErrorAction SilentlyContinue
+                    if (-not $r) { $r = [pscustomobject]@{ ComputerName='?'; Online=$false; Error='No output'; QueryDuration=0 } }
+                    elseif ($r -is [array]) { $r = $r[-1] }
+                    $results.Add($r)
+                    Remove-Job $m.Job -Force
+                    [void]$active.Remove($id)
+                }
+            }
+            foreach ($id in @($active.Keys)) {
+                $m = $active[$id]
+                if (([datetime]::UtcNow - $m.Start).TotalSeconds -gt $TSeconds + 5) {
+                    Stop-Job $m.Job -Force
+                    $results.Add([pscustomobject]@{ ComputerName='?'; Online=$false; Error='Timeout'; QueryDuration=0 })
+                    Remove-Job $m.Job -Force
+                    [void]$active.Remove($id)
+                }
+            }
+            Start-Sleep -Milliseconds 150
+        }
+    } else {
+        . ([scriptblock]::Create($FunctionDef))
+        foreach ($comp in $Computers) {
+            $cred = if ($HostCredentials -and $HostCredentials.ContainsKey($comp)) { $HostCredentials[$comp] } else { $null }
+            $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $cred))
+        }
+    }
+
+    return $results
+}
+
+# ===================================================================
 # Setup
 # ===================================================================
 $TargetComputers = @(Resolve-TargetComputers)
@@ -776,23 +841,27 @@ $pollTimer.add_Tick({
     }
 
     $pollTimer.Stop()
-    $raw      = @(Receive-Job $script:QueryJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
     $jobState = $script:QueryJob.State
+    $newData  = Receive-Job $script:QueryJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
     Remove-Job $script:QueryJob -Force -ErrorAction SilentlyContinue
     $script:QueryJob = $null
 
     if ($jobState -eq 'Failed') {
         $statusLabel.Text = 'Query failed — check WinRM connectivity and credentials'
-    } else {
-        $data = $raw | Where-Object { $_ -is [System.Collections.Generic.List[pscustomobject]] } | Select-Object -Last 1
-        if (-not $data -and $raw.Count -gt 0) { $data = $raw[-1] }
-        if ($data) {
-            $script:AllResults = $data
-            Update-Grid
-            $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  $($data.Count) computers"
+    } elseif ($newData) {
+        # Reconstruct as List regardless of whether return value was unrolled
+        $data = if ($newData -is [System.Collections.Generic.List[pscustomobject]]) {
+            $newData
+        } elseif ($newData -is [array]) {
+            [System.Collections.Generic.List[pscustomobject]]$newData
         } else {
-            $statusLabel.Text = 'Query returned no data'
+            [System.Collections.Generic.List[pscustomobject]]@($newData)
         }
+        $script:AllResults = $data
+        Update-Grid
+        $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  $($data.Count) computers"
+    } else {
+        $statusLabel.Text = 'Query returned no data'
     }
     $btnRefresh.Enabled = $true
 })
@@ -812,60 +881,14 @@ $btnRefresh.add_Click({
     $statusLabel.Text      = 'Querying endpoints…'
     $script:QueryStartTime = [datetime]::UtcNow
 
-    $script:QueryJob = Start-ThreadJob -ScriptBlock {
-        param($tc, $avs, $pt, $ts, $fDef,
-              [System.Collections.Generic.Dictionary[string,System.Management.Automation.PSCredential]]$hostCreds)
-
-        $done = [System.Collections.Generic.List[pscustomobject]]::new()
-
-        if ($PSVersionTable.PSVersion.Major -ge 7) {
-            $queue  = [System.Collections.Generic.Queue[string]]::new($tc)
-            $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
-
-            while ($queue.Count -gt 0 -or $active.Count -gt 0) {
-                while ($active.Count -lt $pt -and $queue.Count -gt 0) {
-                    $comp = $queue.Dequeue()
-                    $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
-                    $job  = Start-ThreadJob -ScriptBlock {
-                        param($c, $ts2, $avs2, $fdef2, [System.Management.Automation.PSCredential]$cred2)
-                        . ([scriptblock]::Create($fdef2))
-                        Get-DefenderStatus -Computer $c -TimeoutSeconds $ts2 -AvailableVersionStr $avs2 -WinRmCredential $cred2
-                    } -ArgumentList $comp, $ts, $avs, $fDef, $cred
-                    $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
-                }
-                foreach ($id in @($active.Keys)) {
-                    $m = $active[$id]
-                    if ($m.Job.State -notin 'Running','NotStarted') {
-                        $r = Receive-Job $m.Job -ErrorAction SilentlyContinue
-                        if (-not $r) { $r = [pscustomobject]@{ ComputerName='?'; Online=$false; Error='No output' } }
-                        elseif ($r -is [array]) { $r = $r[-1] }
-                        $done.Add($r)
-                        Remove-Job $m.Job -Force
-                        [void]$active.Remove($id)
-                    }
-                }
-                foreach ($id in @($active.Keys)) {
-                    $m = $active[$id]
-                    if (([datetime]::UtcNow - $m.Start).TotalSeconds -gt $ts + 5) {
-                        Stop-Job $m.Job -Force
-                        $done.Add([pscustomobject]@{ ComputerName='?'; Online=$false; Error='Timeout' })
-                        Remove-Job $m.Job -Force
-                        [void]$active.Remove($id)
-                    }
-                }
-                Start-Sleep -Milliseconds 150
-            }
-        } else {
-            # PS 5.1 serial fallback
-            . ([scriptblock]::Create($fDef))
-            foreach ($comp in $tc) {
-                $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
-                $done.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred))
-            }
-        }
-
-        return $done
-    } -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $script:FuncDef, $HostCredentials
+    $script:QueryJob = Start-ThreadJob -ScriptBlock ${function:Invoke-StatusRefresh} -ArgumentList @(
+        $TargetComputers,
+        $AvailableVersionStr,
+        $ParallelThreads,
+        $TimeoutSeconds,
+        $script:FuncDef,
+        $HostCredentials
+    )
 
     $pollTimer.Start()
 })
