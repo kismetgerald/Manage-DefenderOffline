@@ -765,64 +765,77 @@ $worker.WorkerSupportsCancellation  = $true
 
 $worker.add_DoWork({
     param($s, $e)
-    $tc        = $e.Argument[0]
-    $avs       = $e.Argument[1]
-    $pt        = $e.Argument[2]
-    $ts        = $e.Argument[3]
-    $fDef      = $e.Argument[4]
-    $hostCreds = $e.Argument[5]
 
-    . ([scriptblock]::Create($fDef))
+    # BackgroundWorker fires on a .NET ThreadPool thread with no PowerShell
+    # runspace attached. Create one so PS cmdlets (including Start-ThreadJob)
+    # can execute on this thread.
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rs.Open()
+    [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace = $rs
 
-    $done  = [System.Collections.Generic.List[pscustomobject]]::new()
-    $total = $tc.Count
+    try {
+        $tc        = $e.Argument[0]
+        $avs       = $e.Argument[1]
+        $pt        = $e.Argument[2]
+        $ts        = $e.Argument[3]
+        $fDef      = $e.Argument[4]
+        $hostCreds = $e.Argument[5]
 
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        $queue  = [System.Collections.Generic.Queue[string]]::new($tc)
-        $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
+        . ([scriptblock]::Create($fDef))
 
-        while ($queue.Count -gt 0 -or $active.Count -gt 0) {
-            while ($active.Count -lt $pt -and $queue.Count -gt 0) {
-                $comp = $queue.Dequeue()
+        $done  = [System.Collections.Generic.List[pscustomobject]]::new()
+        $total = $tc.Count
+
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            $queue  = [System.Collections.Generic.Queue[string]]::new($tc)
+            $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
+
+            while ($queue.Count -gt 0 -or $active.Count -gt 0) {
+                while ($active.Count -lt $pt -and $queue.Count -gt 0) {
+                    $comp = $queue.Dequeue()
+                    $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
+                    $job  = Start-ThreadJob -ScriptBlock $using:funcSB -ArgumentList @($comp, $ts, $avs, $cred)
+                    $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
+                }
+                foreach ($id in @($active.Keys)) {
+                    $m = $active[$id]
+                    if ($m.Job.State -notin 'Running','NotStarted') {
+                        $r = Receive-Job $m.Job -ErrorAction SilentlyContinue
+                        if (-not $r) { $r = [pscustomobject]@{ ComputerName='?'; Online=$false; Error='No output' } }
+                        elseif ($r -is [array]) { $r = $r[-1] }
+                        $done.Add($r)
+                        Remove-Job $m.Job -Force
+                        [void]$active.Remove($id)
+                        $s.ReportProgress([int]($done.Count * 100 / $total), $r.ComputerName)
+                    }
+                }
+                foreach ($id in @($active.Keys)) {
+                    $m = $active[$id]
+                    if (([datetime]::UtcNow - $m.Start).TotalSeconds -gt $ts + 5) {
+                        Stop-Job $m.Job -Force
+                        $done.Add([pscustomobject]@{ ComputerName='?'; Online=$false; Error='Timeout' })
+                        Remove-Job $m.Job -Force
+                        [void]$active.Remove($id)
+                        $s.ReportProgress([int]($done.Count * 100 / $total), 'timeout')
+                    }
+                }
+                Start-Sleep -Milliseconds 150
+            }
+        } else {
+            $i = 0
+            foreach ($comp in $tc) {
                 $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
-                $job  = Start-ThreadJob -ScriptBlock $using:funcSB -ArgumentList @($comp, $ts, $avs, $cred)
-                $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
+                $r = Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
+                $done.Add($r)
+                $i++
+                $s.ReportProgress([int]($i * 100 / $total), $comp)
             }
-            foreach ($id in @($active.Keys)) {
-                $m = $active[$id]
-                if ($m.Job.State -notin 'Running','NotStarted') {
-                    $r = Receive-Job $m.Job -ErrorAction SilentlyContinue
-                    if (-not $r) { $r = [pscustomobject]@{ ComputerName='?'; Online=$false; Error='No output' } }
-                    elseif ($r -is [array]) { $r = $r[-1] }
-                    $done.Add($r)
-                    Remove-Job $m.Job -Force
-                    [void]$active.Remove($id)
-                    $s.ReportProgress([int]($done.Count * 100 / $total), $r.ComputerName)
-                }
-            }
-            foreach ($id in @($active.Keys)) {
-                $m = $active[$id]
-                if (([datetime]::UtcNow - $m.Start).TotalSeconds -gt $ts + 5) {
-                    Stop-Job $m.Job -Force
-                    $done.Add([pscustomobject]@{ ComputerName='?'; Online=$false; Error='Timeout' })
-                    Remove-Job $m.Job -Force
-                    [void]$active.Remove($id)
-                    $s.ReportProgress([int]($done.Count * 100 / $total), 'timeout')
-                }
-            }
-            Start-Sleep -Milliseconds 150
         }
-    } else {
-        $i = 0
-        foreach ($comp in $tc) {
-            $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
-            $r = Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
-            $done.Add($r)
-            $i++
-            $s.ReportProgress([int]($i * 100 / $total), $comp)
-        }
+        $e.Result = $done
+    } finally {
+        $rs.Close()
+        $rs.Dispose()
     }
-    $e.Result = $done
 })
 
 $worker.add_ProgressChanged({
