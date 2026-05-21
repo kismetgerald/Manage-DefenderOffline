@@ -492,18 +492,19 @@ function Invoke-StatusRefresh {
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
 
     if ($PSVersionTable.PSVersion.Major -ge 7) {
-        $queue  = [System.Collections.Generic.Queue[string]]::new($Computers)
+        $queue  = [System.Collections.Generic.Queue[string]]::new()
+        foreach ($c in $Computers) { if ($c) { $queue.Enqueue([string]$c) } }
         $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
 
         while ($queue.Count -gt 0 -or $active.Count -gt 0) {
             while ($active.Count -lt $Threads -and $queue.Count -gt 0) {
-                $comp = $queue.Dequeue()
+                $comp = [string]$queue.Dequeue()
                 $cred = if ($HostCredentials -and $HostCredentials.ContainsKey($comp)) { $HostCredentials[$comp] } else { $null }
                 $job  = Start-ThreadJob -ScriptBlock {
                     param($c, $ts, $avs, $fdef, [System.Management.Automation.PSCredential]$cred)
                     . ([scriptblock]::Create($fdef))
                     Get-DefenderStatus -Computer $c -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
-                } -ArgumentList $comp, $TSeconds, $AvailableVersionStr, $FunctionDef, $cred
+                } -ArgumentList ([string]$comp), $TSeconds, $AvailableVersionStr, $FunctionDef, $cred
                 $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
             }
             foreach ($id in @($active.Keys)) {
@@ -881,14 +882,8 @@ $btnRefresh.add_Click({
     $statusLabel.Text      = 'Querying endpoints…'
     $script:QueryStartTime = [datetime]::UtcNow
 
-    $script:QueryJob = Start-ThreadJob -ScriptBlock ${function:Invoke-StatusRefresh} -ArgumentList @(
-        $TargetComputers,
-        $AvailableVersionStr,
-        $ParallelThreads,
-        $TimeoutSeconds,
-        $script:FuncDef,
-        $HostCredentials
-    )
+    $script:QueryJob = Start-ThreadJob -ScriptBlock ${function:Invoke-StatusRefresh} `
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $script:FuncDef, $HostCredentials
 
     $pollTimer.Start()
 })
@@ -923,7 +918,7 @@ $btnExportHtml.add_Click({
 })
 
 $form.add_Load({ $btnRefresh.PerformClick() })
-$form.add_FormClosed({
+$form.add_FormClosing({
     $autoTimer.Stop(); $autoTimer.Dispose()
     $pollTimer.Stop(); $pollTimer.Dispose()
     if ($script:QueryJob) {

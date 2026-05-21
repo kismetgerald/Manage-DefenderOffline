@@ -339,7 +339,27 @@ Querying… XX%  –  last: ENDPOINTNAME
 - [ ] Auto-refresh fires after 5 minutes without UI freeze
 - [ ] Window closes cleanly
 
-**Result:** PENDING
+**Result:** FAIL (Attempt 1–4) → PENDING (Attempt 5 — see fixes below)
+
+**Attempt 1 — BackgroundWorker "no runspace" error**
+GUI opened but no data loaded. BackgroundWorker `DoWork` fires on a .NET ThreadPool thread that has no PowerShell runspace; PS checked for a runspace before running the scriptblock and threw.
+Fix: attempted to create a PS runspace inside `DoWork`. Led to `SafeWaitHandle disposed` secondary exception on form close.
+
+**Attempt 2 — Runspace created in DoWork**
+Secondary `SafeWaitHandle disposed` WinForms exception at close. Background query still did not return results.
+Fix: removed `BackgroundWorker` entirely; replaced with `Start-ThreadJob` (runs from main PS thread, has runspace) + 250 ms `System.Windows.Forms.Timer` polling the job state.
+
+**Attempt 3 — Query returned no data**
+GUI opened, refresh triggered, timer polled correctly, but `$newData` was null after `Receive-Job`. The anonymous outer job scriptblock had issues returning a `List<pscustomobject>` from nested `Start-ThreadJob` calls (return value unrolling).
+Fix: extracted refresh logic into a named function `Invoke-StatusRefresh` captured via `${function:Invoke-StatusRefresh}`.
+
+**Attempt 4 — 26 rows, all empty ComputerName**
+Grid populated with 26 rows but every row showed empty `ComputerName` and 0.1 s duration. Root cause: the outer `Start-ThreadJob` call used `-ArgumentList @($TargetComputers, ...)`. PowerShell's `@()` array sub-expression **flattens** nested arrays, so all 26 computer names were scattered across the positional parameters instead of arriving as the `[string[]]$Computers` argument. Additionally, `add_FormClosed` fires after WinForms teardown begins, causing `SafeWaitHandle disposed` on timer disposal.
+
+**Fixes applied for Attempt 5 (commit on `feat/monitoring-service`):**
+- **ArgumentList flattening** — removed `@(...)` wrapper from outer `Start-ThreadJob` call; bare comma list preserves `$TargetComputers` as a single array element.
+- **Defensive queue construction** — `Invoke-StatusRefresh` now builds the queue with an explicit `foreach`/`Enqueue` loop and `[string]` cast; filters out any null/empty entries.
+- **SafeWaitHandle** — changed `add_FormClosed` to `add_FormClosing` so timers are disposed before WinForms teardown.
 
 ---
 
