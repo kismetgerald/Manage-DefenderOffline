@@ -758,33 +758,65 @@ function Update-Grid {
     $statOutdated.Label.Text = "Outdated`r`n$outdated"
 }
 
-#region BackgroundWorker
-$worker                             = [System.ComponentModel.BackgroundWorker]::new()
-$worker.WorkerReportsProgress       = $true
-$worker.WorkerSupportsCancellation  = $true
+#region Query engine  (Start-ThreadJob + polling Timer — avoids BackgroundWorker runspace issue)
+$script:QueryJob       = $null
+$script:QueryStartTime = [datetime]::MinValue
+$script:FuncDef        = ${function:Get-DefenderStatus}.ToString()
 
-$worker.add_DoWork({
-    param($s, $e)
+$pollTimer          = [System.Windows.Forms.Timer]::new()
+$pollTimer.Interval = 250   # fires on UI thread — safe for Forms controls
 
-    # BackgroundWorker fires on a .NET ThreadPool thread with no PowerShell
-    # runspace attached. Create one so PS cmdlets (including Start-ThreadJob)
-    # can execute on this thread.
-    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $rs.Open()
-    [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace = $rs
+$pollTimer.add_Tick({
+    if (-not $script:QueryJob) { $pollTimer.Stop(); return }
 
-    try {
-        $tc        = $e.Argument[0]
-        $avs       = $e.Argument[1]
-        $pt        = $e.Argument[2]
-        $ts        = $e.Argument[3]
-        $fDef      = $e.Argument[4]
-        $hostCreds = $e.Argument[5]
+    if ($script:QueryJob.State -in 'Running','NotStarted') {
+        $secs = [math]::Round(([datetime]::UtcNow - $script:QueryStartTime).TotalSeconds)
+        $statusLabel.Text = "Querying endpoints… ${secs}s elapsed"
+        return
+    }
 
-        . ([scriptblock]::Create($fDef))
+    $pollTimer.Stop()
+    $raw      = @(Receive-Job $script:QueryJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+    $jobState = $script:QueryJob.State
+    Remove-Job $script:QueryJob -Force -ErrorAction SilentlyContinue
+    $script:QueryJob = $null
 
-        $done  = [System.Collections.Generic.List[pscustomobject]]::new()
-        $total = $tc.Count
+    if ($jobState -eq 'Failed') {
+        $statusLabel.Text = 'Query failed — check WinRM connectivity and credentials'
+    } else {
+        $data = $raw | Where-Object { $_ -is [System.Collections.Generic.List[pscustomobject]] } | Select-Object -Last 1
+        if (-not $data -and $raw.Count -gt 0) { $data = $raw[-1] }
+        if ($data) {
+            $script:AllResults = $data
+            Update-Grid
+            $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  $($data.Count) computers"
+        } else {
+            $statusLabel.Text = 'Query returned no data'
+        }
+    }
+    $btnRefresh.Enabled = $true
+})
+#endregion
+
+#region Auto-refresh timer
+$autoTimer          = [System.Windows.Forms.Timer]::new()
+$autoTimer.Interval = 300000   # 5 minutes
+$autoTimer.add_Tick({ if ($chkAuto.Checked -and -not $script:QueryJob) { $btnRefresh.PerformClick() } })
+$autoTimer.Start()
+#endregion
+
+#region Wire-up
+$btnRefresh.add_Click({
+    if ($script:QueryJob) { return }
+    $btnRefresh.Enabled    = $false
+    $statusLabel.Text      = 'Querying endpoints…'
+    $script:QueryStartTime = [datetime]::UtcNow
+
+    $script:QueryJob = Start-ThreadJob -ScriptBlock {
+        param($tc, $avs, $pt, $ts, $fDef,
+              [System.Collections.Generic.Dictionary[string,System.Management.Automation.PSCredential]]$hostCreds)
+
+        $done = [System.Collections.Generic.List[pscustomobject]]::new()
 
         if ($PSVersionTable.PSVersion.Major -ge 7) {
             $queue  = [System.Collections.Generic.Queue[string]]::new($tc)
@@ -794,7 +826,11 @@ $worker.add_DoWork({
                 while ($active.Count -lt $pt -and $queue.Count -gt 0) {
                     $comp = $queue.Dequeue()
                     $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
-                    $job  = Start-ThreadJob -ScriptBlock $using:funcSB -ArgumentList @($comp, $ts, $avs, $cred)
+                    $job  = Start-ThreadJob -ScriptBlock {
+                        param($c, $ts2, $avs2, $fdef2, [System.Management.Automation.PSCredential]$cred2)
+                        . ([scriptblock]::Create($fdef2))
+                        Get-DefenderStatus -Computer $c -TimeoutSeconds $ts2 -AvailableVersionStr $avs2 -WinRmCredential $cred2
+                    } -ArgumentList $comp, $ts, $avs, $fDef, $cred
                     $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
                 }
                 foreach ($id in @($active.Keys)) {
@@ -806,7 +842,6 @@ $worker.add_DoWork({
                         $done.Add($r)
                         Remove-Job $m.Job -Force
                         [void]$active.Remove($id)
-                        $s.ReportProgress([int]($done.Count * 100 / $total), $r.ComputerName)
                     }
                 }
                 foreach ($id in @($active.Keys)) {
@@ -816,61 +851,23 @@ $worker.add_DoWork({
                         $done.Add([pscustomobject]@{ ComputerName='?'; Online=$false; Error='Timeout' })
                         Remove-Job $m.Job -Force
                         [void]$active.Remove($id)
-                        $s.ReportProgress([int]($done.Count * 100 / $total), 'timeout')
                     }
                 }
                 Start-Sleep -Milliseconds 150
             }
         } else {
-            $i = 0
+            # PS 5.1 serial fallback
+            . ([scriptblock]::Create($fDef))
             foreach ($comp in $tc) {
                 $cred = if ($hostCreds -and $hostCreds.ContainsKey($comp)) { $hostCreds[$comp] } else { $null }
-                $r = Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
-                $done.Add($r)
-                $i++
-                $s.ReportProgress([int]($i * 100 / $total), $comp)
+                $done.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred))
             }
         }
-        $e.Result = $done
-    } finally {
-        $rs.Close()
-        $rs.Dispose()
-    }
-})
 
-$worker.add_ProgressChanged({
-    param($s, $e)
-    $statusLabel.Text = "Querying… $($e.ProgressPercentage)%  –  last: $($e.UserState)"
-})
+        return $done
+    } -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $script:FuncDef, $HostCredentials
 
-$worker.add_RunWorkerCompleted({
-    param($s, $e)
-    if ($e.Error) {
-        $statusLabel.Text = "Query error: $($e.Error.Message)"
-    } elseif ($e.Result) {
-        $script:AllResults = $e.Result
-        Update-Grid
-        $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  $($e.Result.Count) computers"
-    }
-    $btnRefresh.Enabled = $true
-})
-#endregion
-
-#region Auto-refresh timer
-$autoTimer          = [System.Windows.Forms.Timer]::new()
-$autoTimer.Interval = 300000   # 5 minutes
-$autoTimer.add_Tick({ if ($chkAuto.Checked -and -not $worker.IsBusy) { $btnRefresh.PerformClick() } })
-$autoTimer.Start()
-#endregion
-
-#region Wire-up
-$funcSB = ${function:Get-DefenderStatus}
-
-$btnRefresh.add_Click({
-    if ($worker.IsBusy) { return }
-    $btnRefresh.Enabled = $false
-    $statusLabel.Text   = 'Querying endpoints…'
-    $worker.RunWorkerAsync(@($TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, ${function:Get-DefenderStatus}.ToString(), $HostCredentials))
+    $pollTimer.Start()
 })
 
 $txtFilter.add_TextChanged({
@@ -903,7 +900,14 @@ $btnExportHtml.add_Click({
 })
 
 $form.add_Load({ $btnRefresh.PerformClick() })
-$form.add_FormClosed({ $autoTimer.Stop(); $autoTimer.Dispose(); $worker.Dispose() })
+$form.add_FormClosed({
+    $autoTimer.Stop(); $autoTimer.Dispose()
+    $pollTimer.Stop(); $pollTimer.Dispose()
+    if ($script:QueryJob) {
+        Stop-Job  $script:QueryJob -Force -ErrorAction SilentlyContinue
+        Remove-Job $script:QueryJob -Force -ErrorAction SilentlyContinue
+    }
+})
 #endregion
 
 [System.Windows.Forms.Application]::Run($form)
