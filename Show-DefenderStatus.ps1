@@ -480,43 +480,6 @@ $($rows -join "`n")
 }
 
 # ===================================================================
-# Parallel Refresh Engine
-# (defined at script scope so ${function:Invoke-StatusRefresh} can be
-# captured and passed to Start-ThreadJob — same pattern as the dashboard)
-# ===================================================================
-function Invoke-StatusRefresh {
-    param(
-        [string[]]$Computers,
-        [string]$AvailableVersionStr,
-        [int]$Threads,
-        [int]$TSeconds,
-        [string]$FunctionDef,
-        [System.Collections.Generic.Dictionary[string, System.Management.Automation.PSCredential]]$HostCredentials
-    )
-
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        # ForEach-Object -Parallel runs directly inside the outer thread-job;
-        # $_ is the computer name string — no nested-job serialisation chain.
-        $Computers | ForEach-Object -Parallel {
-            $comp = [string]$_
-            . ([scriptblock]::Create($using:FunctionDef))
-            $hc   = $using:HostCredentials
-            $cred = if ($hc -and $hc.ContainsKey($comp)) { $hc[$comp] } else { $null }
-            Get-DefenderStatus -Computer $comp `
-                -TimeoutSeconds      $using:TSeconds `
-                -AvailableVersionStr $using:AvailableVersionStr `
-                -WinRmCredential     $cred
-        } -ThrottleLimit $Threads
-    } else {
-        . ([scriptblock]::Create($FunctionDef))
-        foreach ($comp in $Computers) {
-            $cred = if ($HostCredentials -and $HostCredentials.ContainsKey($comp)) { $HostCredentials[$comp] } else { $null }
-            Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $cred
-        }
-    }
-}
-
-# ===================================================================
 # Setup
 # ===================================================================
 $TargetComputers = @(Resolve-TargetComputers)
@@ -810,7 +773,6 @@ function Update-Grid {
 #region Query engine  (Start-ThreadJob + polling Timer — avoids BackgroundWorker runspace issue)
 $script:QueryJob       = $null
 $script:QueryStartTime = [datetime]::MinValue
-$script:FuncDef        = ${function:Get-DefenderStatus}.ToString()
 
 $pollTimer          = [System.Windows.Forms.Timer]::new()
 $pollTimer.Interval = 250   # fires on UI thread — safe for Forms controls
@@ -865,8 +827,42 @@ $btnRefresh.add_Click({
     $statusLabel.Text      = 'Querying endpoints…'
     $script:QueryStartTime = [datetime]::UtcNow
 
-    $script:QueryJob = Start-ThreadJob -ScriptBlock ${function:Invoke-StatusRefresh} `
-        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $script:FuncDef, $HostCredentials
+    # Snapshot all values into locals so $using: captures them without any
+    # -ArgumentList serialisation — this is the canonical PS7 pattern.
+    $localComputers = $TargetComputers
+    $localAvs       = $AvailableVersionStr
+    $localThreads   = $ParallelThreads
+    $localTs        = $TimeoutSeconds
+    $localFuncDef   = ${function:Get-DefenderStatus}.ToString()
+    $localCreds     = $HostCredentials
+
+    $script:QueryJob = Start-ThreadJob -ScriptBlock {
+        $computers = $using:localComputers
+        $avs       = $using:localAvs
+        $threads   = $using:localThreads
+        $ts        = $using:localTs
+        $fdef      = $using:localFuncDef
+        $hc        = $using:localCreds
+
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            $computers | ForEach-Object -Parallel {
+                $comp = [string]$_
+                . ([scriptblock]::Create($using:fdef))
+                $lhc  = $using:hc
+                $cred = if ($lhc -and $lhc.ContainsKey($comp)) { $lhc[$comp] } else { $null }
+                Get-DefenderStatus -Computer $comp `
+                    -TimeoutSeconds      $using:ts `
+                    -AvailableVersionStr $using:avs `
+                    -WinRmCredential     $cred
+            } -ThrottleLimit $threads
+        } else {
+            . ([scriptblock]::Create($fdef))
+            foreach ($comp in $computers) {
+                $cred = if ($hc -and $hc.ContainsKey($comp)) { $hc[$comp] } else { $null }
+                Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
+            }
+        }
+    }
 
     $pollTimer.Start()
 })
@@ -913,8 +909,6 @@ $form.add_FormClosing({
 
 # Suppress SafeWaitHandle ObjectDisposedException that WinForms/.NET 10 can
 # raise as an unhandled thread exception during timer teardown.
-[System.Windows.Forms.Application]::SetUnhandledExceptionMode(
-    [System.Windows.Forms.UnhandledExceptionMode]::CatchException)
 [System.Windows.Forms.Application]::add_ThreadException(
     [System.Threading.ThreadExceptionEventHandler]{
         param($s, $e)
