@@ -494,55 +494,26 @@ function Invoke-StatusRefresh {
         [System.Collections.Generic.Dictionary[string, System.Management.Automation.PSCredential]]$HostCredentials
     )
 
-    $results = [System.Collections.Generic.List[pscustomobject]]::new()
-
     if ($PSVersionTable.PSVersion.Major -ge 7) {
-        $queue  = [System.Collections.Generic.Queue[string]]::new()
-        foreach ($c in $Computers) { if ($c) { $queue.Enqueue([string]$c) } }
-        $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
-
-        while ($queue.Count -gt 0 -or $active.Count -gt 0) {
-            while ($active.Count -lt $Threads -and $queue.Count -gt 0) {
-                $comp = [string]$queue.Dequeue()
-                $cred = if ($HostCredentials -and $HostCredentials.ContainsKey($comp)) { $HostCredentials[$comp] } else { $null }
-                $job  = Start-ThreadJob -ScriptBlock {
-                    param($c, $ts, $avs, $fdef, [System.Management.Automation.PSCredential]$cred)
-                    . ([scriptblock]::Create($fdef))
-                    Get-DefenderStatus -Computer $c -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
-                } -ArgumentList ([string]$comp), $TSeconds, $AvailableVersionStr, $FunctionDef, $cred
-                $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
-            }
-            foreach ($id in @($active.Keys)) {
-                $m = $active[$id]
-                if ($m.Job.State -notin 'Running','NotStarted') {
-                    $r = Receive-Job $m.Job -ErrorAction SilentlyContinue
-                    if (-not $r) { $r = [pscustomobject]@{ ComputerName='?'; Online=$false; Error='No output'; QueryDuration=0 } }
-                    elseif ($r -is [array]) { $r = $r[-1] }
-                    $results.Add($r)
-                    Remove-Job $m.Job -Force
-                    [void]$active.Remove($id)
-                }
-            }
-            foreach ($id in @($active.Keys)) {
-                $m = $active[$id]
-                if (([datetime]::UtcNow - $m.Start).TotalSeconds -gt $TSeconds + 5) {
-                    Stop-Job $m.Job -Force
-                    $results.Add([pscustomobject]@{ ComputerName='?'; Online=$false; Error='Timeout'; QueryDuration=0 })
-                    Remove-Job $m.Job -Force
-                    [void]$active.Remove($id)
-                }
-            }
-            Start-Sleep -Milliseconds 150
-        }
+        # ForEach-Object -Parallel runs directly inside the outer thread-job;
+        # $_ is the computer name string — no nested-job serialisation chain.
+        $Computers | ForEach-Object -Parallel {
+            $comp = [string]$_
+            . ([scriptblock]::Create($using:FunctionDef))
+            $hc   = $using:HostCredentials
+            $cred = if ($hc -and $hc.ContainsKey($comp)) { $hc[$comp] } else { $null }
+            Get-DefenderStatus -Computer $comp `
+                -TimeoutSeconds      $using:TSeconds `
+                -AvailableVersionStr $using:AvailableVersionStr `
+                -WinRmCredential     $cred
+        } -ThrottleLimit $Threads
     } else {
         . ([scriptblock]::Create($FunctionDef))
         foreach ($comp in $Computers) {
             $cred = if ($HostCredentials -and $HostCredentials.ContainsKey($comp)) { $HostCredentials[$comp] } else { $null }
-            $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $cred))
+            Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $cred
         }
     }
-
-    return $results
 }
 
 # ===================================================================
@@ -931,13 +902,28 @@ $btnExportHtml.add_Click({
 
 $form.add_Load({ $btnRefresh.PerformClick() })
 $form.add_FormClosing({
-    $autoTimer.Stop(); $autoTimer.Dispose()
-    $pollTimer.Stop(); $pollTimer.Dispose()
+    $autoTimer.Stop()
+    $pollTimer.Stop()
     if ($script:QueryJob) {
         Stop-Job  $script:QueryJob -Force -ErrorAction SilentlyContinue
         Remove-Job $script:QueryJob -Force -ErrorAction SilentlyContinue
     }
 })
 #endregion
+
+# Suppress SafeWaitHandle ObjectDisposedException that WinForms/.NET 10 can
+# raise as an unhandled thread exception during timer teardown.
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode(
+    [System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+[System.Windows.Forms.Application]::add_ThreadException(
+    [System.Threading.ThreadExceptionEventHandler]{
+        param($s, $e)
+        if ($e.Exception -is [System.ObjectDisposedException] -and
+            $e.Exception.ObjectName -like '*SafeWaitHandle*') { return }
+        [System.Windows.Forms.MessageBox]::Show(
+            $e.Exception.ToString(), 'Unhandled Error',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error)
+    })
 
 [System.Windows.Forms.Application]::Run($form)

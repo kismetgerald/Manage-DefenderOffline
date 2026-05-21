@@ -361,6 +361,17 @@ Grid populated with 26 rows but every row showed empty `ComputerName` and 0.1 s 
 - **Defensive queue construction** — `Invoke-StatusRefresh` now builds the queue with an explicit `foreach`/`Enqueue` loop and `[string]` cast; filters out any null/empty entries.
 - **SafeWaitHandle** — changed `add_FormClosed` to `add_FormClosing` so timers are disposed before WinForms teardown.
 
+**Attempt 5 — 19 rows (exclusion list correct), still empty ComputerName**
+`@()` flattening fix reduced row count from 26 to 19 (correct after exclusions), confirming argument binding now works for `$Computers`. However all rows still showed empty `ComputerName` and `Cannot validate argument on parameter 'Com...'`. SafeWaitHandle exception still appeared during the run (not just at close).
+Root cause: `Invoke-StatusRefresh` (outer thread-job) was starting N inner `Start-ThreadJob` jobs per computer. Each inner job's result passed through two serialisation layers (inner→outer→main), stripping the `ComputerName` property. The inner-job→outer-job cross-runspace signalling also caused the SafeWaitHandle error under .NET 10.
+
+**Attempt 6 — same symptoms as Attempt 5**
+User ran from stale C:\Temp copy (old build). Same results confirmed old code, not the Attempt 5 build.
+
+**Fixes applied for Attempt 7 (commit on `feat/monitoring-service`):**
+- **Eliminated nested `Start-ThreadJob`** — replaced the inner-per-host job loop in `Invoke-StatusRefresh` with `ForEach-Object -Parallel`. Computer names arrive via pipeline `$_` with no serialisation; `$using:` captures outer-job variables directly. Same change applied to `Invoke-FleetRefresh` in `Start-DefenderDashboard.ps1`.
+- **SafeWaitHandle (.NET 10)** — added `Application.SetUnhandledExceptionMode(CatchException)` and a `ThreadException` handler that silently suppresses `ObjectDisposedException` on `SafeWaitHandle`; any other unhandled exception still surfaces as a dialog. `FormClosing` handler now only calls `Stop()`, not `Dispose()`, on both timers.
+
 ---
 
 ### v0.0.6e — Dashboard port check, fallback, status file, and Event Log

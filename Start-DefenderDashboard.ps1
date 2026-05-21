@@ -361,45 +361,15 @@ function Invoke-FleetRefresh {
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
 
     if ($PSVersionTable.PSVersion.Major -ge 7) {
-        $queue  = [System.Collections.Generic.Queue[string]]::new()
-        foreach ($c in $Computers) { if ($c) { $queue.Enqueue([string]$c) } }
-        $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
-
-        while ($queue.Count -gt 0 -or $active.Count -gt 0) {
-            while ($active.Count -lt $Threads -and $queue.Count -gt 0) {
-                $comp = [string]$queue.Dequeue()
-                $job  = Start-ThreadJob -ScriptBlock {
-                    param($c, $ts, $avs, $fdef, [System.Management.Automation.PSCredential]$cred)
-                    . ([scriptblock]::Create($fdef))
-                    Get-DefenderStatus -Computer $c -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
-                } -ArgumentList ([string]$comp), $TSeconds, $AvailableVersionStr, $FunctionDef, $WinRmCredential
-                $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
-            }
-
-            foreach ($id in @($active.Keys)) {
-                $m = $active[$id]
-                if ($m.Job.State -notin 'Running','NotStarted') {
-                    $r = Receive-Job $m.Job -ErrorAction SilentlyContinue
-                    if (-not $r) { $r = [pscustomobject]@{ ComputerName = '?'; Online = $false; Error = 'No output' } }
-                    elseif ($r -is [array]) { $r = $r[-1] }
-                    $results.Add($r)
-                    Remove-Job $m.Job -Force
-                    [void]$active.Remove($id)
-                }
-            }
-
-            foreach ($id in @($active.Keys)) {
-                $m = $active[$id]
-                if (([datetime]::UtcNow - $m.Start).TotalSeconds -gt $TSeconds + 10) {
-                    Stop-Job $m.Job -Force
-                    $results.Add([pscustomobject]@{ ComputerName = '?'; Online = $false; Error = 'Timeout' })
-                    Remove-Job $m.Job -Force
-                    [void]$active.Remove($id)
-                }
-            }
-
-            Start-Sleep -Milliseconds 200
-        }
+        $Computers | ForEach-Object -Parallel {
+            $comp = [string]$_
+            . ([scriptblock]::Create($using:FunctionDef))
+            $cred = $using:WinRmCredential
+            Get-DefenderStatus -Computer $comp `
+                -TimeoutSeconds      $using:TSeconds `
+                -AvailableVersionStr $using:AvailableVersionStr `
+                -WinRmCredential     $cred
+        } -ThrottleLimit $Threads | ForEach-Object { if ($_) { $results.Add($_) } }
     } else {
         foreach ($comp in $Computers) {
             $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $WinRmCredential))
