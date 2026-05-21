@@ -155,6 +155,11 @@ if (-not $PSBoundParameters.ContainsKey('LogPath')         -and $cfg['DashboardL
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelThreads']) { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 
+$ExcludeList = @()
+if ($cfg['ExcludeComputers']) {
+    $ExcludeList = $cfg['ExcludeComputers'] -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
+}
+
 # ===================================================================
 # Port Availability
 # ===================================================================
@@ -356,17 +361,18 @@ function Invoke-FleetRefresh {
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
 
     if ($PSVersionTable.PSVersion.Major -ge 7) {
-        $queue  = [System.Collections.Generic.Queue[string]]::new($Computers)
+        $queue  = [System.Collections.Generic.Queue[string]]::new()
+        foreach ($c in $Computers) { if ($c) { $queue.Enqueue([string]$c) } }
         $active = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
 
         while ($queue.Count -gt 0 -or $active.Count -gt 0) {
             while ($active.Count -lt $Threads -and $queue.Count -gt 0) {
-                $comp = $queue.Dequeue()
+                $comp = [string]$queue.Dequeue()
                 $job  = Start-ThreadJob -ScriptBlock {
                     param($c, $ts, $avs, $fdef, [System.Management.Automation.PSCredential]$cred)
                     . ([scriptblock]::Create($fdef))
                     Get-DefenderStatus -Computer $c -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
-                } -ArgumentList $comp, $TSeconds, $AvailableVersionStr, $FunctionDef, $WinRmCredential
+                } -ArgumentList ([string]$comp), $TSeconds, $AvailableVersionStr, $FunctionDef, $WinRmCredential
                 $active[$job.Id] = @{ Job = $job; Start = [datetime]::UtcNow }
             }
 
@@ -668,6 +674,13 @@ Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 
 $TargetComputers = @(Resolve-TargetComputers)
+if ($ExcludeList.Count -gt 0) {
+    $excluded = @($TargetComputers | Where-Object { $ExcludeList -contains $_ })
+    if ($excluded.Count -gt 0) {
+        Write-DashLog "Excluding $($excluded.Count) computer(s) per config.conf ExcludeComputers: $($excluded -join ', ')" 'WARN'
+    }
+    $TargetComputers = @($TargetComputers | Where-Object { $ExcludeList -notcontains $_ })
+}
 if ($TargetComputers.Count -eq 0) {
     Write-DashLog 'No target computers found. Exiting.' 'ERROR'
     exit 1
@@ -761,14 +774,8 @@ function Start-BackgroundRefresh {
     $script:IsRefreshing = $true
     Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
 
-    $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} -ArgumentList @(
-        $TargetComputers,
-        $AvailableVersionStr,
-        $ParallelThreads,
-        $TimeoutSeconds,
-        $FunctionDef,
-        $Credential
-    )
+    $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential
 }
 
 function Receive-RefreshIfDone {

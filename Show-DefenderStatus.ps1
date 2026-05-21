@@ -175,6 +175,11 @@ if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['Cl
 if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
 if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
 
+$ExcludeList = @()
+if ($cfg['ExcludeComputers']) {
+    $ExcludeList = $cfg['ExcludeComputers'] -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
+}
+
 # ===================================================================
 # WinRM Credential Auto-Load
 # ===================================================================
@@ -544,6 +549,13 @@ function Invoke-StatusRefresh {
 # Setup
 # ===================================================================
 $TargetComputers = @(Resolve-TargetComputers)
+if ($ExcludeList.Count -gt 0) {
+    $excluded = @($TargetComputers | Where-Object { $ExcludeList -contains $_ })
+    if ($excluded.Count -gt 0) {
+        Write-Host "Excluding $($excluded.Count) computer(s) per config.conf ExcludeComputers: $($excluded -join ', ')" -ForegroundColor Yellow
+    }
+    $TargetComputers = @($TargetComputers | Where-Object { $ExcludeList -notcontains $_ })
+}
 if ($TargetComputers.Count -eq 0) { throw 'No target computers found.' }
 
 $EndpointTiers = Get-EndpointClassification `
