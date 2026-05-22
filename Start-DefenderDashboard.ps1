@@ -226,21 +226,31 @@ function Resolve-TargetComputers {
             Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\S' } |
             ForEach-Object { $_.Trim().ToUpper() }
     }
-    Write-DashLog 'hosts.conf not found – querying Active Directory...' 'WARN'
+    Write-DashLog 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
+    $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
+    if (-not $hasAdModule) {
+        Write-DashLog 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' 'INFO'
+    }
     try {
-        if (Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue) {
+        if ($hasAdModule) {
             Import-Module ActiveDirectory -ErrorAction Stop
             return Get-ADComputer `
                 -Filter 'OperatingSystem -like "*Windows*" -and Enabled -eq $true' `
                 -Properties Name | Sort-Object Name | Select-Object -ExpandProperty Name
         } else {
+            # ADSI fallback (uses current process credentials)
             $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
             $searcher = [adsisearcher]'(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
             $searcher.SearchRoot = "LDAP://$domain"
             return $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
         }
     } catch {
-        throw "Cannot resolve target list: $($_.Exception.Message)"
+        $adErr = $_.Exception.Message
+        Write-DashLog "AD auto-discovery failed: $adErr" 'ERROR'
+        Write-DashLog 'Hint: dashboard service runs under its configured identity (gMSA or service account).' 'ERROR'
+        Write-DashLog '      That identity must have AD read permission, OR a hosts.conf must exist next to the script.' 'ERROR'
+        Write-DashLog "      hosts.conf path: $HostsFile" 'ERROR'
+        throw "Cannot resolve target list: $adErr"
     }
 }
 

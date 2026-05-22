@@ -469,9 +469,13 @@ function Resolve-TargetComputers {
     }
 
     # 3. Active Directory auto-discovery
-    Write-Log 'hosts.conf not found – querying Active Directory...' 'WARN'
+    Write-Log 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
+    $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
+    if (-not $hasAdModule) {
+        Write-Log 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' 'INFO'
+    }
     try {
-        if (Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue) {
+        if ($hasAdModule) {
             Import-Module ActiveDirectory -ErrorAction Stop
             $computers = Get-ADComputer `
                 -Filter 'OperatingSystem -like "*Windows*" -and Enabled -eq $true' `
@@ -479,7 +483,7 @@ function Resolve-TargetComputers {
                 Sort-Object Name |
                 Select-Object -ExpandProperty Name
         } else {
-            # ADSI fallback (no ActiveDirectory module required)
+            # ADSI fallback (uses current process credentials)
             $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
             $searcher = [adsisearcher]'(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
             $searcher.SearchRoot = "LDAP://$domain"
@@ -505,8 +509,46 @@ function Resolve-TargetComputers {
         return $computers
 
     } catch {
-        Write-Log "AD query failed: $($_.Exception.Message)" 'ERROR'
-        throw 'Cannot proceed without a target list. Create hosts.conf manually or use -ComputerName.'
+        $adErr = $_.Exception.Message
+        Write-Log "AD auto-discovery failed: $adErr" 'ERROR'
+        $help = @"
+
+==============================================================================
+ Active Directory auto-discovery failed.
+ Reason: $adErr
+==============================================================================
+
+Auto-discovery uses the credentials of the user running this script.  A
+common cause is running under a local or workstation-admin account that
+cannot bind to AD (e.g. STIG-hardened environments where Workstation Admin
+is local-only).
+
+You have three ways to proceed:
+
+  1. Create hosts.conf manually next to the script (one hostname per
+     line, '#' lines are ignored):
+
+       notepad "$HostsFile"
+
+  2. Pass the targets explicitly on the command line:
+
+       .\Update-DefenderOffline.ps1 -ComputerName SRV01,WS02
+
+  3. Re-run from a session with AD read permission (any Domain User
+     account normally suffices).  To get Get-ADComputer instead of the
+     ADSI fallback, install the RSAT ActiveDirectory PowerShell module:
+
+       # Windows 10/11 client:
+       Add-WindowsCapability -Online ``
+         -Name 'Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'
+
+       # Windows Server:
+       Install-WindowsFeature RSAT-AD-PowerShell
+
+==============================================================================
+"@
+        Write-Host $help -ForegroundColor Yellow
+        throw 'Cannot proceed without a target list.'
     }
 }
 
