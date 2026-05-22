@@ -875,6 +875,13 @@ Write-DashLog "Initial collection complete: $($script:CachedResults.Count) compu
 # ===================================================================
 Write-DashLog 'Entering main request loop. Press Ctrl+C to stop.' 'INFO'
 
+# HttpListener has no Pending() method (that's a TcpListener idiom).
+# Equivalent: start an async GetContext, wait up to 500 ms for a
+# request, then loop around to do background work if nothing arrived.
+# The IAsyncResult is held across loop iterations so we don't leak an
+# async operation every time we time out.
+$pendingCtx = $null
+
 try {
     while ($listener.IsListening) {
 
@@ -888,14 +895,19 @@ try {
             Start-BackgroundRefresh
         }
 
-        # Non-blocking HTTP request check
-        if (-not $listener.Pending()) {
-            Start-Sleep -Milliseconds 500
-            continue
+        # Non-blocking HTTP request check (500 ms quantum so the loop
+        # can service background-refresh work even when idle).
+        if ($null -eq $pendingCtx) {
+            $pendingCtx = $listener.BeginGetContext($null, $null)
         }
+        if (-not $pendingCtx.AsyncWaitHandle.WaitOne(500)) { continue }
 
-        $context = $listener.GetContext()
-        $path    = $context.Request.Url.AbsolutePath.TrimEnd('/')
+        # listener may have been stopped between WaitOne returning and now
+        if (-not $listener.IsListening) { break }
+
+        $context    = $listener.EndGetContext($pendingCtx)
+        $pendingCtx = $null
+        $path       = $context.Request.Url.AbsolutePath.TrimEnd('/')
 
         switch ($path) {
             '/defender' {
