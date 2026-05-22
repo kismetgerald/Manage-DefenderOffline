@@ -1246,11 +1246,22 @@ function New-HtmlReport {
   .sc-fail       { background: #d13438; }
   .sc-skip       { background: #9c5100; }
   .sc-info       { background: #0078d4; }
-  .version-grid  { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin: 16px 0; }
-  .vcard         { background: #fff; border-radius: 8px; padding: 16px 20px;
-                   box-shadow: 0 2px 8px rgba(0,0,0,.08); }
-  .vcard .label  { font-size: .85em; color: #666; margin-bottom: 4px; }
-  .vcard .value  { font-size: 1.3em; font-weight: 700; color: #0078d4; }
+  /* Use <table> for the version summary layout, not CSS Grid — Gmail's
+     CSS sanitizer strips 'display: grid' so the cards stack vertically
+     when the report is sent as the email body. */
+  .version-table  { width: 100%; border-collapse: separate; border-spacing: 8px 0; margin: 16px 0; }
+  .version-table td { width: 33.33%; padding: 0; vertical-align: top; }
+  .vcard          { background: #fff; border-radius: 8px; padding: 16px 20px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+                    border-top: 4px solid #0078d4; }
+  .vcard .label   { font-size: .85em; color: #666; margin-bottom: 4px; }
+  .vcard .value   { font-size: 1.4em; font-weight: 700; color: #0078d4; }
+  .vcard-oldest        { border-top-color: #b45309; }
+  .vcard-oldest .value { color: #b45309; }
+  .vcard-newest        { border-top-color: #107c10; }
+  .vcard-newest .value { color: #107c10; }
+  .vcard-hosts         { border-top-color: #0078d4; }
+  .vcard-hosts  .value { color: #0078d4; }
   .footer        { margin-top: 48px; color: #888; font-size: .85em; text-align: center;
                    border-top: 1px solid #ddd; padding-top: 16px; }
   a              { color: #0078d4; }
@@ -1303,11 +1314,13 @@ function New-HtmlReport {
   <p style="font-size:.8em; color:#888; margin-top:4px;">Click a badge to filter the results table. Click again to clear.</p>
 
   <h2>Fleet Version Summary</h2>
-  <div class="version-grid">
-    <div class="vcard"><div class="label">Oldest Version Found</div><div class="value">$OldestVersion</div></div>
-    <div class="vcard"><div class="label">Newest Version Applied</div><div class="value">$NewestVersion</div></div>
-    <div class="vcard"><div class="label">Hosts Updated</div><div class="value">$HostsUpdated</div></div>
-  </div>
+  <table class="version-table" role="presentation">
+    <tr>
+      <td><div class="vcard vcard-oldest"><div class="label">Oldest Version Found</div><div class="value">$OldestVersion</div></div></td>
+      <td><div class="vcard vcard-newest"><div class="label">Newest Version Applied</div><div class="value">$NewestVersion</div></div></td>
+      <td><div class="vcard vcard-hosts"><div class="label">Hosts Updated</div><div class="value">$HostsUpdated</div></div></td>
+    </tr>
+  </table>
 
   <h2>Detailed Results ($($Data.Count) computers)</h2>
   $($rows -join "`n")
