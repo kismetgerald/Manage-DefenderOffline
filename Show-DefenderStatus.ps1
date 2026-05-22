@@ -99,6 +99,8 @@ param(
     [string]$WorkstationPattern,
     [string]$DomainControllerPattern,
 
+    [bool]$DisableIPv6 = $true,
+
     [string]$ConfigPath
 )
 
@@ -174,6 +176,7 @@ if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')          -and $cfg['Ti
 if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['ClassificationMethod'])    { $ClassificationMethod    = $cfg['ClassificationMethod'] }
 if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
 if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
+if (-not $PSBoundParameters.ContainsKey('DisableIPv6')              -and $cfg['DisableIPv6'])              { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -304,7 +307,8 @@ function Get-DefenderStatus {
         [string]$Computer,
         [int]$TimeoutSeconds,
         [string]$AvailableVersionStr,
-        [System.Management.Automation.PSCredential]$WinRmCredential
+        [System.Management.Automation.PSCredential]$WinRmCredential,
+        [bool]$DisableIPv6 = $true
     )
 
     $result = [pscustomobject]@{
@@ -325,8 +329,27 @@ function Get-DefenderStatus {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 `
-                -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+        # Reachability check.  When DisableIPv6 is set (LAN default), resolve
+        # the hostname to IPv4 only and connect directly — avoids the ~21s
+        # TCP timeout that Test-NetConnection eats on IPv6 ULA addresses
+        # advertised in DNS but not actually routed.
+        $reachable = $false
+        if ($DisableIPv6) {
+            try {
+                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
+                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
+                if ($addrs) {
+                    $client = [System.Net.Sockets.TcpClient]::new()
+                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $reachable = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
+                    try { $client.Close() } catch {}
+                }
+            } catch { $reachable = $false }
+        } else {
+            $reachable = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
+                -InformationLevel Quiet -WarningAction SilentlyContinue)
+        }
+        if (-not $reachable) {
             $result.Error = 'WinRM not reachable'
             return $result
         }
@@ -1149,6 +1172,7 @@ $btnRefresh.add_Click({
         FuncDef             = ${function:Get-DefenderStatus}.ToString()
         CompletedHosts      = $script:CompletedHosts
         Credentials         = $HostCredentials
+        DisableIPv6         = $DisableIPv6
     }
 
     $script:QueryJob = Start-ThreadJob -ScriptBlock {
@@ -1167,7 +1191,8 @@ $btnRefresh.add_Click({
                 $r = Get-DefenderStatus -Computer $comp `
                     -TimeoutSeconds      $c.Ts `
                     -AvailableVersionStr $c.AvailableVersionStr `
-                    -WinRmCredential     $cred
+                    -WinRmCredential     $cred `
+                    -DisableIPv6         $c.DisableIPv6
                 $c.CompletedHosts.Add($comp)   # thread-safe; live progress counter
                 $r
             } -ThrottleLimit $Ctx.Threads
@@ -1181,7 +1206,8 @@ $btnRefresh.add_Click({
                 $r = Get-DefenderStatus -Computer $compStr `
                     -TimeoutSeconds      $Ctx.Ts `
                     -AvailableVersionStr $Ctx.AvailableVersionStr `
-                    -WinRmCredential     $cred
+                    -WinRmCredential     $cred `
+                    -DisableIPv6         $Ctx.DisableIPv6
                 $Ctx.CompletedHosts.Add($compStr)
                 $r
             }

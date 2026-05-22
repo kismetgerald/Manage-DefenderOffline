@@ -194,6 +194,9 @@ param(
     [string]$WorkstationPattern,
     [string]$DomainControllerPattern,
 
+    # Skip IPv6 in endpoint reachability tests. See conf/config.conf for details.
+    [bool]$DisableIPv6 = $true,
+
     # Path to configuration file. Defaults to .\conf\config.conf relative to the script.
     [string]$ConfigPath
 )
@@ -347,6 +350,7 @@ if ($cfg['ExcludeComputers']) {
 }
 if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
 if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
+if (-not $PSBoundParameters.ContainsKey('DisableIPv6')              -and $cfg['DisableIPv6'])              { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
 
 # ===================================================================
 # WinRM Credential Auto-Load
@@ -624,7 +628,8 @@ function Invoke-DefenderUpdate {
         [string]$AvailableVersionStr,
         [bool]$WhatIfMode,
         [string]$LogSharePath,
-        [System.Management.Automation.PSCredential]$WinRmCredential
+        [System.Management.Automation.PSCredential]$WinRmCredential,
+        [bool]$DisableIPv6 = $true
     )
 
     $WarningPreference = 'SilentlyContinue'
@@ -653,8 +658,28 @@ function Invoke-DefenderUpdate {
         # --- Connectivity ---
         $pingOk = Test-Connection -ComputerName $Computer -Count 1 -Quiet `
             -TimeoutSeconds 2 -ErrorAction SilentlyContinue
-        if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 `
-                -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+
+        # WinRM TCP test.  When DisableIPv6 is set (LAN default), resolve to
+        # IPv4 only and connect directly — avoids the ~21s Test-NetConnection
+        # timeout on DNS AAAA records whose IPv6 routes aren't actually live.
+        $winrmOk = $false
+        if ($DisableIPv6) {
+            try {
+                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
+                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
+                if ($addrs) {
+                    $client = [System.Net.Sockets.TcpClient]::new()
+                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $winrmOk = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
+                    try { $client.Close() } catch {}
+                }
+            } catch { $winrmOk = $false }
+        } else {
+            $winrmOk = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
+                -InformationLevel Quiet -WarningAction SilentlyContinue)
+        }
+
+        if (-not $winrmOk) {
             throw $(if ($pingOk) { 'Online but WinRM (5985) not reachable — may be blocked or disabled' }
                     else          { 'Host offline (no ping response; WinRM 5985 not reachable)' })
         }
@@ -912,7 +937,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 $AvailableVersionStr,
                 [bool]$WhatIfMode,
                 $LogSharePath,
-                $item.Credential
+                $item.Credential,
+                [bool]$DisableIPv6
             )
             $ActiveJobs[$job.Id] = @{
                 Job        = $job
@@ -1019,7 +1045,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
             -AvailableVersionStr $AvailableVersionStr `
             -WhatIfMode          ([bool]$WhatIfMode) `
             -LogSharePath        $LogSharePath `
-            -WinRmCredential     $HostCredentials[$comp]
+            -WinRmCredential     $HostCredentials[$comp] `
+            -DisableIPv6         $DisableIPv6
         $Results.Add($r)
     }
     Write-Progress -Activity 'Done' -Completed

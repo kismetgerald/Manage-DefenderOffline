@@ -89,6 +89,8 @@ param(
 
     [switch]$SaveCredential,
 
+    [bool]$DisableIPv6 = $true,
+
     [string]$ConfigPath
 )
 
@@ -154,6 +156,7 @@ if (-not $PSBoundParameters.ContainsKey('RefreshInterval') -and $cfg['RefreshInt
 if (-not $PSBoundParameters.ContainsKey('LogPath')         -and $cfg['DashboardLogPath']) { $LogPath           = $cfg['DashboardLogPath'] }
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelThreads']) { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
+if (-not $PSBoundParameters.ContainsKey('DisableIPv6')     -and $cfg['DisableIPv6'])     { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -263,7 +266,8 @@ function Get-DefenderStatus {
         [string]$Computer,
         [int]$TimeoutSeconds,
         [string]$AvailableVersionStr,
-        [System.Management.Automation.PSCredential]$WinRmCredential
+        [System.Management.Automation.PSCredential]$WinRmCredential,
+        [bool]$DisableIPv6 = $true
     )
 
     $result = [pscustomobject]@{
@@ -284,8 +288,27 @@ function Get-DefenderStatus {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 `
-                -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+        # Reachability check.  When DisableIPv6 is set (LAN default), resolve
+        # the hostname to IPv4 only and connect directly — avoids the ~21s
+        # TCP timeout that Test-NetConnection eats on IPv6 ULA addresses
+        # advertised in DNS but not actually routed.
+        $reachable = $false
+        if ($DisableIPv6) {
+            try {
+                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
+                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
+                if ($addrs) {
+                    $client = [System.Net.Sockets.TcpClient]::new()
+                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $reachable = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
+                    try { $client.Close() } catch {}
+                }
+            } catch { $reachable = $false }
+        } else {
+            $reachable = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
+                -InformationLevel Quiet -WarningAction SilentlyContinue)
+        }
+        if (-not $reachable) {
             $result.Error = 'WinRM not reachable'
             return $result
         }
@@ -353,7 +376,8 @@ function Invoke-FleetRefresh {
         [int]$Threads,
         [int]$TSeconds,
         [string]$FunctionDef,    # Get-DefenderStatus serialised as a string
-        [System.Management.Automation.PSCredential]$WinRmCredential
+        [System.Management.Automation.PSCredential]$WinRmCredential,
+        [bool]$DisableIPv6 = $true
     )
 
     ${function:Get-DefenderStatus} = [scriptblock]::Create($FunctionDef)
@@ -368,11 +392,12 @@ function Invoke-FleetRefresh {
             Get-DefenderStatus -Computer $comp `
                 -TimeoutSeconds      $using:TSeconds `
                 -AvailableVersionStr $using:AvailableVersionStr `
-                -WinRmCredential     $cred
+                -WinRmCredential     $cred `
+                -DisableIPv6         $using:DisableIPv6
         } -ThrottleLimit $Threads | ForEach-Object { if ($_) { $results.Add($_) } }
     } else {
         foreach ($comp in $Computers) {
-            $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $WinRmCredential))
+            $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $WinRmCredential -DisableIPv6 $DisableIPv6))
         }
     }
 
@@ -745,7 +770,7 @@ function Start-BackgroundRefresh {
     Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
 
     $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
-        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6
 }
 
 function Receive-RefreshIfDone {
@@ -776,7 +801,8 @@ $initResults = Invoke-FleetRefresh `
     -Threads             $ParallelThreads `
     -TSeconds            $TimeoutSeconds `
     -FunctionDef         $FunctionDef `
-    -WinRmCredential     $Credential
+    -WinRmCredential     $Credential `
+    -DisableIPv6         $DisableIPv6
 
 $script:CachedResults = $initResults
 $script:CachedAt      = Get-Date
