@@ -827,42 +827,53 @@ $btnRefresh.add_Click({
     $statusLabel.Text      = 'Querying endpoints…'
     $script:QueryStartTime = [datetime]::UtcNow
 
-    # Snapshot all values into locals so $using: captures them without any
-    # -ArgumentList serialisation — this is the canonical PS7 pattern.
-    $localComputers = $TargetComputers
-    $localAvs       = $AvailableVersionStr
-    $localThreads   = $ParallelThreads
-    $localTs        = $TimeoutSeconds
-    $localFuncDef   = ${function:Get-DefenderStatus}.ToString()
-    $localCreds     = $HostCredentials
+    # === DIAGNOSTIC BUILD (Attempt 9) ============================================
+    # Serial loop + hashtable -ArgumentList (no array flattening). File-based
+    # logging at every boundary so we can see precisely where data is lost.
+    # This logging will be removed once the root cause is identified.
+    $debugLog = 'C:\Temp\sds-debug.log'
+    if (-not (Test-Path 'C:\Temp')) { New-Item 'C:\Temp' -ItemType Directory -Force | Out-Null }
+    "===== $(Get-Date -f 'yyyy-MM-dd HH:mm:ss') REFRESH START =====" | Out-File $debugLog -Append
+    "[CLICK] TargetComputers.Count=$($TargetComputers.Count); Type=$($TargetComputers.GetType().FullName); First='$($TargetComputers[0])'; AVS='$AvailableVersionStr'" |
+        Out-File $debugLog -Append
+
+    $ctx = @{
+        Computers           = $TargetComputers
+        AvailableVersionStr = $AvailableVersionStr
+        Ts                  = $TimeoutSeconds
+        FuncDef             = ${function:Get-DefenderStatus}.ToString()
+        Credentials         = $HostCredentials
+        DebugLog            = $debugLog
+    }
 
     $script:QueryJob = Start-ThreadJob -ScriptBlock {
-        $computers = $using:localComputers
-        $avs       = $using:localAvs
-        $threads   = $using:localThreads
-        $ts        = $using:localTs
-        $fdef      = $using:localFuncDef
-        $hc        = $using:localCreds
+        param([hashtable]$Ctx)
 
-        if ($PSVersionTable.PSVersion.Major -ge 7) {
-            $computers | ForEach-Object -Parallel {
-                $comp = [string]$_
-                . ([scriptblock]::Create($using:fdef))
-                $lhc  = $using:hc
-                $cred = if ($lhc -and $lhc.ContainsKey($comp)) { $lhc[$comp] } else { $null }
-                Get-DefenderStatus -Computer $comp `
-                    -TimeoutSeconds      $using:ts `
-                    -AvailableVersionStr $using:avs `
-                    -WinRmCredential     $cred
-            } -ThrottleLimit $threads
-        } else {
-            . ([scriptblock]::Create($fdef))
-            foreach ($comp in $computers) {
-                $cred = if ($hc -and $hc.ContainsKey($comp)) { $hc[$comp] } else { $null }
-                Get-DefenderStatus -Computer $comp -TimeoutSeconds $ts -AvailableVersionStr $avs -WinRmCredential $cred
-            }
+        "[JOB] entered. Ctx is hashtable? $($Ctx -is [hashtable]); keys=$($Ctx.Keys -join ',')" |
+            Out-File $Ctx.DebugLog -Append
+        "[JOB] Ctx.Computers.Count=$($Ctx.Computers.Count); Type=$($Ctx.Computers.GetType().FullName); First='$($Ctx.Computers[0])'" |
+            Out-File $Ctx.DebugLog -Append
+
+        . ([scriptblock]::Create($Ctx.FuncDef))
+
+        foreach ($comp in $Ctx.Computers) {
+            $compStr = [string]$comp
+            "[LOOP] comp='$compStr'; type=$($comp.GetType().FullName)" | Out-File $Ctx.DebugLog -Append
+
+            $cred = if ($Ctx.Credentials -and $Ctx.Credentials.ContainsKey($compStr)) {
+                $Ctx.Credentials[$compStr]
+            } else { $null }
+
+            $r = Get-DefenderStatus -Computer $compStr `
+                -TimeoutSeconds      $Ctx.Ts `
+                -AvailableVersionStr $Ctx.AvailableVersionStr `
+                -WinRmCredential     $cred
+
+            "[POST] r.ComputerName='$($r.ComputerName)'; Online=$($r.Online); AvailableVersion='$($r.AvailableVersion)'; Error='$($r.Error)'" |
+                Out-File $Ctx.DebugLog -Append
+            $r
         }
-    }
+    } -ArgumentList $ctx
 
     $pollTimer.Start()
 })
