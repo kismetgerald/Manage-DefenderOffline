@@ -89,6 +89,10 @@ param(
 
     [switch]$SaveCredential,
 
+    # AD discovery credential (auto-loaded from .\conf\ADCredential.xml if present)
+    [pscredential]$ADCredential,
+    [switch]$SaveADCredential,
+
     [bool]$DisableIPv6 = $true,
 
     [string]$ConfigPath
@@ -114,6 +118,29 @@ if ($SaveCredential) {
         if ($cred) {
             $cred | Export-Clixml -Path (Join-Path $cfgDir 'WinRmCredential.xml') -Force
             Write-Host "  Saved: $(Join-Path $cfgDir 'WinRmCredential.xml')" -ForegroundColor Green
+        } else { Write-Host '  Cancelled.' -ForegroundColor Yellow }
+    } catch { Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
+    exit 0
+}
+
+# ===================================================================
+# AD Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveADCredential) {
+    Write-Host "`n=== AD Discovery Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Used ONLY for the LDAP bind that reads the computer list when no'
+    Write-Host '  hosts.conf is present.  Saved to conf\ADCredential.xml (DPAPI).'
+    Write-Host '  Run this helper as the dashboard service identity (the account that'
+    Write-Host '  will actually decrypt the XML at task start).'
+    Write-Host ''
+    $cfgDir = Join-Path $ScriptDir 'conf'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+    try {
+        $cred = Get-Credential -Message 'Enter AD credential (account with read on the domain naming context)'
+        if ($cred) {
+            $cred | Export-Clixml -Path (Join-Path $cfgDir 'ADCredential.xml') -Force
+            Write-Host "  Saved: $(Join-Path $cfgDir 'ADCredential.xml')" -ForegroundColor Green
         } else { Write-Host '  Cancelled.' -ForegroundColor Yellow }
     } catch { Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
     exit 0
@@ -148,6 +175,13 @@ if (-not $PSBoundParameters.ContainsKey('Credential')) {
     if (Test-Path $credPath -ErrorAction SilentlyContinue) {
         try { $Credential = Import-Clixml $credPath }
         catch { Write-Warning "Could not load WinRM credential from '$credPath': $($_.Exception.Message)" }
+    }
+}
+if (-not $PSBoundParameters.ContainsKey('ADCredential')) {
+    $adCredPath = Join-Path $ScriptDir 'conf\ADCredential.xml'
+    if (Test-Path $adCredPath -ErrorAction SilentlyContinue) {
+        try { $ADCredential = Import-Clixml $adCredPath }
+        catch { Write-Warning "Could not load AD credential from '$adCredPath': $($_.Exception.Message)" }
     }
 }
 if (-not $PSBoundParameters.ContainsKey('Port')            -and $cfg['Port'])            { try { $Port            = [int]$cfg['Port']            } catch {} }
@@ -231,25 +265,43 @@ function Resolve-TargetComputers {
     if (-not $hasAdModule) {
         Write-DashLog 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' 'INFO'
     }
+    if ($ADCredential) {
+        Write-DashLog "Using saved AD credential for LDAP bind: $($ADCredential.UserName)" 'INFO'
+    }
     try {
         if ($hasAdModule) {
-            Import-Module ActiveDirectory -ErrorAction Stop
-            return Get-ADComputer `
-                -Filter 'OperatingSystem -like "*Windows*" -and Enabled -eq $true' `
-                -Properties Name | Sort-Object Name | Select-Object -ExpandProperty Name
+            $adParams = @{
+                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
+                Properties = 'Name'
+            }
+            if ($ADCredential) { $adParams.Credential = $ADCredential }
+            return Get-ADComputer @adParams | Sort-Object Name | Select-Object -ExpandProperty Name
         } else {
-            # ADSI fallback (uses current process credentials)
-            $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
-            $searcher = [adsisearcher]'(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            $searcher.SearchRoot = "LDAP://$domain"
-            return $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
+            # ADSI fallback.  Use DirectoryEntry with explicit creds when ADCredential is set.
+            $domain = (Get-CimInstance Win32_ComputerSystem).Domain
+            $filter = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
+            if ($ADCredential) {
+                $de = [System.DirectoryServices.DirectoryEntry]::new(
+                    "LDAP://$domain",
+                    $ADCredential.UserName,
+                    $ADCredential.GetNetworkCredential().Password)
+                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
+                $searcher.Filter = $filter
+            } else {
+                $searcher = [adsisearcher]$filter
+                $searcher.SearchRoot = "LDAP://$domain"
+            }
+            $result = $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
+            if ($ADCredential) { $de.Dispose() }
+            return $result
         }
     } catch {
         $adErr = $_.Exception.Message
         Write-DashLog "AD auto-discovery failed: $adErr" 'ERROR'
-        Write-DashLog 'Hint: dashboard service runs under its configured identity (gMSA or service account).' 'ERROR'
-        Write-DashLog '      That identity must have AD read permission, OR a hosts.conf must exist next to the script.' 'ERROR'
-        Write-DashLog "      hosts.conf path: $HostsFile" 'ERROR'
+        Write-DashLog 'Remediation options for the service identity:' 'ERROR'
+        Write-DashLog '  - Save an AD credential once via:  .\Start-DefenderDashboard.ps1 -SaveADCredential' 'ERROR'
+        Write-DashLog "  - Or provide a hosts.conf at:  $HostsFile" 'ERROR'
+        Write-DashLog '  - Or grant the dashboard service identity AD read on the domain naming context.' 'ERROR'
         throw "Cannot resolve target list: $adErr"
     }
 }

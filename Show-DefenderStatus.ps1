@@ -94,6 +94,11 @@ param(
 
     [switch]$SaveCredential,
 
+    # AD discovery credential (used only for the LDAP bind that reads the
+    # computer list; not used for WinRM connections)
+    [pscredential]$ADCredential,
+    [switch]$SaveADCredential,
+
     [ValidateSet('AD','Pattern','Single')]
     [string]$ClassificationMethod,
     [string]$WorkstationPattern,
@@ -150,6 +155,28 @@ if ($SaveCredential) {
 }
 
 # ===================================================================
+# AD Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveADCredential) {
+    Write-Host "`n=== AD Discovery Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Used ONLY for the LDAP bind that reads the computer list when no' -ForegroundColor Gray
+    Write-Host '  hosts.conf is present and -ComputerName is not used.  Encrypted' -ForegroundColor Gray
+    Write-Host '  per-user per-machine (DPAPI). Saved to conf\ADCredential.xml.' -ForegroundColor Gray
+    Write-Host ''
+    $cfgDir = Join-Path $ScriptDir 'conf'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+    try {
+        $cred = Get-Credential -Message 'Enter AD credential (account with read on the domain naming context)'
+        if ($cred) {
+            $cred | Export-Clixml -Path (Join-Path $cfgDir 'ADCredential.xml') -Force
+            Write-Host "  Saved: $(Join-Path $cfgDir 'ADCredential.xml')" -ForegroundColor Green
+        } else { Write-Host '  Cancelled.' -ForegroundColor Yellow }
+    } catch { Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red }
+    exit 0
+}
+
+# ===================================================================
 # Configuration File
 # ===================================================================
 if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
@@ -200,6 +227,7 @@ if (-not $PSBoundParameters.ContainsKey('Credential'))                 { $Creden
 if (-not $PSBoundParameters.ContainsKey('WorkstationCredential'))      { $WorkstationCredential     = Import-SavedCredential 'WorkstationCredential.xml' }
 if (-not $PSBoundParameters.ContainsKey('ServerCredential'))           { $ServerCredential          = Import-SavedCredential 'ServerCredential.xml' }
 if (-not $PSBoundParameters.ContainsKey('DomainControllerCredential')) { $DomainControllerCredential = Import-SavedCredential 'DomainControllerCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('ADCredential'))               { $ADCredential              = Import-SavedCredential 'ADCredential.xml' }
 
 if (-not $ClassificationMethod) {
     $partOfDomain = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).PartOfDomain
@@ -223,18 +251,37 @@ function Resolve-TargetComputers {
     if (-not $hasAdModule) {
         Write-Host 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' -ForegroundColor DarkCyan
     }
+    if ($ADCredential) {
+        Write-Host "Using saved AD credential for LDAP bind: $($ADCredential.UserName)" -ForegroundColor DarkCyan
+    }
     try {
         if ($hasAdModule) {
             Import-Module ActiveDirectory -ErrorAction Stop
-            return Get-ADComputer `
-                -Filter 'OperatingSystem -like "*Windows*" -and Enabled -eq $true' `
-                -Properties Name | Sort-Object Name | Select-Object -ExpandProperty Name
+            $adParams = @{
+                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
+                Properties = 'Name'
+            }
+            if ($ADCredential) { $adParams.Credential = $ADCredential }
+            return Get-ADComputer @adParams | Sort-Object Name | Select-Object -ExpandProperty Name
         } else {
-            # ADSI fallback (uses current process credentials)
-            $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
-            $searcher = [adsisearcher]'(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            $searcher.SearchRoot = "LDAP://$domain"
-            return $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
+            # ADSI fallback.  When -ADCredential is supplied, bind via
+            # DirectoryEntry with explicit credentials.
+            $domain = (Get-CimInstance Win32_ComputerSystem).Domain
+            $filter = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
+            if ($ADCredential) {
+                $de = [System.DirectoryServices.DirectoryEntry]::new(
+                    "LDAP://$domain",
+                    $ADCredential.UserName,
+                    $ADCredential.GetNetworkCredential().Password)
+                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
+                $searcher.Filter = $filter
+            } else {
+                $searcher = [adsisearcher]$filter
+                $searcher.SearchRoot = "LDAP://$domain"
+            }
+            $result = $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
+            if ($ADCredential) { $de.Dispose() }
+            return $result
         }
     } catch {
         $adErr = $_.Exception.Message
@@ -250,20 +297,27 @@ common cause is running under a local or workstation-admin account that
 cannot bind to AD (e.g. STIG-hardened environments where Workstation Admin
 is local-only).
 
-You have three ways to proceed:
+You have four ways to proceed:
 
-  1. Create hosts.conf manually next to the script (one hostname per
+  1. Save a domain account with AD read permission and re-run (the
+     recommended path for STIG environments where the interactive
+     operator cannot bind to AD):
+
+       .\Show-DefenderStatus.ps1 -SaveADCredential
+       .\Show-DefenderStatus.ps1                # auto-loads it next run
+
+  2. Create hosts.conf manually next to the script (one hostname per
      line, '#' lines are ignored):
 
        notepad "$HostsFile"
 
-  2. Pass the targets explicitly on the command line:
+  3. Pass the targets explicitly on the command line:
 
        .\Show-DefenderStatus.ps1 -ComputerName SRV01,WS02
 
-  3. Re-run from a session with AD read permission (any Domain User
-     account normally suffices).  To get Get-ADComputer instead of the
-     ADSI fallback, install the RSAT ActiveDirectory PowerShell module:
+  4. Re-run from a session whose user already has AD read permission.
+     To use Get-ADComputer instead of the ADSI fallback, install the
+     RSAT ActiveDirectory PowerShell module:
 
        # Windows 10/11 client:
        Add-WindowsCapability -Online ``
