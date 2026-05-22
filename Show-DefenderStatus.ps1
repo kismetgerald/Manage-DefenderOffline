@@ -632,8 +632,49 @@ $statOffline  = New-StatCard 'OFFLINE'  $clrError        $clrWhite
 $statOutdated = New-StatCard 'OUTDATED' $clrOutdatedCard $clrTextDark
 $statRtOff    = New-StatCard 'RT OFF'   $clrRtOffCard    $clrTextDark
 
-foreach ($s in $statOnline, $statOffline, $statOutdated, $statRtOff) {
-    $pnlStats.Controls.Add($s.Panel)
+# Make each card clickable so it acts as a quick filter (matches the
+# HTML report's clickable stat badges).  The card's Tag stores the
+# filter key ('Online' / 'Offline' / 'Outdated' / 'RTOff').  A Paint
+# handler draws a 3px primary-blue outline when the card is the
+# currently-selected filter.
+$cardMap = @{
+    'Online'   = $statOnline
+    'Offline'  = $statOffline
+    'Outdated' = $statOutdated
+    'RTOff'    = $statRtOff
+}
+$script:CardFilter = $null   # null | 'Online' | 'Offline' | 'Outdated' | 'RTOff'
+
+$cardClickHandler = {
+    $key = $this.Tag
+    if (-not $key) { return }
+    $script:CardFilter = if ($script:CardFilter -eq $key) { $null } else { $key }
+    foreach ($c in $cardMap.Values) { $c.Panel.Invalidate() }
+    if ($script:AllResults) { Update-Grid }
+}
+
+$cardPaintHandler = {
+    param($src, $e)
+    if ($script:CardFilter -and $src.Tag -eq $script:CardFilter) {
+        $pen = [System.Drawing.Pen]::new($clrPrimary, 3)
+        $e.Graphics.DrawRectangle($pen, 1, 1, $src.Width - 3, $src.Height - 3)
+        $pen.Dispose()
+    }
+}
+
+foreach ($key in $cardMap.Keys) {
+    $cardPanel = $cardMap[$key].Panel
+    $cardPanel.Tag    = $key
+    $cardPanel.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $cardPanel.add_Click($cardClickHandler)
+    $cardPanel.add_Paint($cardPaintHandler)
+    # Child labels intercept the click; route them to the same handler
+    foreach ($child in $cardPanel.Controls) {
+        $child.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $child.Tag    = $key
+        $child.add_Click($cardClickHandler)
+    }
+    $pnlStats.Controls.Add($cardPanel)
 }
 #endregion
 
@@ -685,7 +726,14 @@ $chkAuto.AutoSize    = $true
 $chkAuto.ForeColor   = $clrTextDark
 $chkAuto.Padding     = [System.Windows.Forms.Padding]::new(12, 7, 0, 0)
 
-$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $sep, $lblFilter, $txtFilter, $chkAuto))
+$lblCountdown            = [System.Windows.Forms.Label]::new()
+$lblCountdown.Text       = ''
+$lblCountdown.AutoSize   = $true
+$lblCountdown.ForeColor  = $clrTextMuted
+$lblCountdown.Padding    = [System.Windows.Forms.Padding]::new(6, 7, 0, 0)
+$lblCountdown.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
+
+$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
 #endregion
 
 #region Status bar
@@ -901,6 +949,17 @@ function Update-Grid {
     $filter = $script:FilterText.Trim()
     if ($filter) { $data = @($data | Where-Object { $_.ComputerName -like "*$filter*" }) }
 
+    if ($script:CardFilter) {
+        $data = @($data | Where-Object {
+            switch ($script:CardFilter) {
+                'Online'   { $_.Online -eq $true }
+                'Offline'  { $_.Online -eq $false }
+                'Outdated' { $_.VersionStatus -eq 'Outdated' }
+                'RTOff'    { $_.RealTimeProtection -eq 'False' -and $_.Online -eq $true }
+            }
+        })
+    }
+
     $grid.SuspendLayout()
     $grid.Rows.Clear()
 
@@ -994,14 +1053,40 @@ $pollTimer.add_Tick({
     # Hide the overlay; bring the grid back to the front
     $pnlOverlay.Visible = $false
     $btnRefresh.Enabled = $true
+
+    # Re-anchor the auto-refresh countdown to "now" so it always reads
+    # full-interval remaining after any refresh (manual or automatic).
+    if ($chkAuto.Checked) { Reset-AutoRefreshCountdown }
 })
 #endregion
 
-#region Auto-refresh timer
+#region Auto-refresh timer + countdown
+$script:NextAutoRefreshAt = [datetime]::MaxValue
+
 $autoTimer          = [System.Windows.Forms.Timer]::new()
 $autoTimer.Interval = 300000   # 5 minutes
 $autoTimer.add_Tick({ if ($chkAuto.Checked -and -not $script:QueryJob) { $btnRefresh.PerformClick() } })
-$autoTimer.Start()
+
+$countdownTimer          = [System.Windows.Forms.Timer]::new()
+$countdownTimer.Interval = 1000
+
+$countdownTimer.add_Tick({
+    if (-not $chkAuto.Checked) { $countdownTimer.Stop(); $lblCountdown.Text = ''; return }
+    $remaining = $script:NextAutoRefreshAt - [datetime]::UtcNow
+    if ($remaining.TotalSeconds -le 0) {
+        $lblCountdown.Text = '  Refreshing…'
+    } else {
+        $lblCountdown.Text = '  Next refresh in {0:m\:ss}' -f $remaining
+    }
+})
+
+function Reset-AutoRefreshCountdown {
+    $script:NextAutoRefreshAt = [datetime]::UtcNow.AddMilliseconds($autoTimer.Interval)
+    # Stop+Start makes the underlying Win32 timer requeue from "now",
+    # so the auto-refresh actually fires 5 min after the last refresh
+    # rather than at an arbitrary point in the original 5-min cycle.
+    $autoTimer.Stop(); $autoTimer.Start()
+}
 #endregion
 
 #region Wire-up
@@ -1068,6 +1153,17 @@ $txtFilter.add_TextChanged({
     if ($script:AllResults) { Update-Grid }
 })
 
+$chkAuto.add_CheckedChanged({
+    if ($chkAuto.Checked) {
+        Reset-AutoRefreshCountdown
+        $countdownTimer.Start()
+    } else {
+        $countdownTimer.Stop()
+        $lblCountdown.Text = ''
+        $autoTimer.Stop()
+    }
+})
+
 $btnExportCsv.add_Click({
     if (-not $script:AllResults) { return }
     $dlg = [System.Windows.Forms.SaveFileDialog]::new()
@@ -1096,6 +1192,7 @@ $form.add_Load({ $btnRefresh.PerformClick() })
 $form.add_FormClosing({
     $autoTimer.Stop()
     $pollTimer.Stop()
+    $countdownTimer.Stop()
     if ($script:QueryJob) {
         Stop-Job  $script:QueryJob -Force -ErrorAction SilentlyContinue
         Remove-Job $script:QueryJob -Force -ErrorAction SilentlyContinue
