@@ -1382,6 +1382,15 @@ if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
             $smtp.Credentials = $SmtpCredential.GetNetworkCredential()
         }
 
+        # Resolve $ReportFile / $CsvFile to absolute paths BEFORE handing
+        # them to .NET.  System.Net.Mail.Attachment::new() resolves relative
+        # paths against the .NET process CurrentDirectory (which is the
+        # PowerShell launch directory, often C:\WINDOWS\system32 when
+        # elevated) — not PowerShell's $PWD.  Send-MailMessage used to
+        # handle this internally; SmtpClient does not.
+        $reportFull = (Resolve-Path -LiteralPath $ReportFile).ProviderPath
+        $csvFull    = (Resolve-Path -LiteralPath $CsvFile).ProviderPath
+
         $msg = [System.Net.Mail.MailMessage]::new()
         $msg.From = [System.Net.Mail.MailAddress]::new($From)
         foreach ($recipient in $To) { [void]$msg.To.Add($recipient) }
@@ -1393,9 +1402,9 @@ if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
         $msg.BodyEncoding    = [System.Text.Encoding]::UTF8
         $msg.HeadersEncoding = [System.Text.Encoding]::UTF8
         $msg.Subject     = $subject
-        $msg.Body        = (Get-Content $ReportFile -Raw -Encoding UTF8)
+        $msg.Body        = (Get-Content -LiteralPath $reportFull -Raw -Encoding UTF8)
         $msg.IsBodyHtml  = $true
-        foreach ($a in @($ReportFile, $CsvFile)) {
+        foreach ($a in @($reportFull, $csvFull)) {
             [void]$msg.Attachments.Add([System.Net.Mail.Attachment]::new($a))
         }
 
