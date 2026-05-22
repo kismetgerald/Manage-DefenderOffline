@@ -653,12 +653,24 @@ $cred = Import-Clixml ".\Config\SmtpCredential.xml"
 3. Open both attachments and confirm they are not corrupted and contain the expected data.
 
 **Expected result:**
-- [ ] `[SUCCESS] Email notification sent` in log
-- [ ] Email received with correct subject line
-- [ ] HTML body renders correctly
-- [ ] Both attachments present and openable
+- [x] `[SUCCESS] Email notification sent` in log
+- [x] Email received with correct subject line
+- [x] HTML body renders correctly
+- [x] Both attachments present and openable
 
-**Result:** PENDING *(skip if no SMTP access in test environment)*
+**Result:** PASS (Attempt 6) — exercised against Gmail SMTP (smtp.gmail.com:587 STARTTLS) with app password.
+
+**Attempts and fixes:**
+1. **Attempt 1 — AD auto-discovery failure.** `Resolve-TargetComputers` AD bind threw "user name or password is incorrect" because the interactive operator (Workstation Admin) lacks AD read; the existing ADSI fallback uses the current process credentials. Generic `Cannot proceed without a target list` error gave no guidance.
+2. **Attempt 2 — better UX for AD failure.** Added detailed three-option remediation help block (install RSAT, create hosts.conf, use -ComputerName); applied to all three scripts.
+3. **Attempt 3 — STIG-compatible AD credential.** Added `-ADCredential` / `-SaveADCredential` parameter pattern (mirrors `-SmtpCredential`/`-SaveSmtpCredential`). DPAPI-encrypted into `conf\ADCredential.xml`, auto-loaded on subsequent runs. `Get-ADComputer -Credential` when the AD module is present; `DirectoryEntry` with explicit creds for ADSI fallback. AD auto-discovery succeeded.
+4. **Attempt 4 — `Send-MailMessage` deprecation warning + email send failure.** PS7 marked `Send-MailMessage` `[Obsolete]` and emits a warning on every script run that references it. Replaced with `System.Net.Mail.SmtpClient` + `MailMessage`. First post-replacement run failed with `Could not find a part of the path 'C:\WINDOWS\system32\Reports\...'` — `Attachment::new()` resolves relative paths against the .NET process CurrentDirectory, not PowerShell's `$PWD`. Also discovered `Get-EndpointClassification` makes a second AD query that wasn't honoring `-ADCredential`.
+5. **Attempt 5 — UTF-8 mangling + classification credential.** Email arrived but non-ASCII chars (en-dash in `<h1>`, em-dash in failure text, → in version transitions) rendered as `?`. `MailMessage` defaults `Body/Subject/Headers` encoding to ASCII. Pinned all three to UTF-8. Also wired `-ADCredential` through `Get-EndpointClassification` so tier breakdown works in STIG environments. Fixed in same build.
+6. **Attempt 6 — Fleet Version Summary layout + color.** Cards rendered horizontally in the standalone HTML but stacked vertically in Gmail because `display: grid` is stripped by Gmail's CSS sanitizer. Replaced with `<table role="presentation">` (email-safe layout primitive) and added semantic colored top-borders + value colors (amber/green/blue). PASS — both surfaces now render identically.
+
+**Side improvements committed during this test:**
+- `-DisableIPv6` config option (default true) — unreachable host detection dropped from ~21s to ~3s.
+- `Get-EndpointClassification` honors `-ADCredential` (was silently downgrading all hosts to MemberServer when classification AD bind failed).
 
 ---
 
@@ -753,7 +765,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 - [ ] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export)
 - [ ] v0.0.6e PASS (port fallback; status file written/deleted; Event Log 101/100/102; all HTTP endpoints respond)
 - [ ] v0.0.6f PASS (installer prereqs; service identity; scheduled task; ACLs; firewall rule; status file read; reboot persistence)
-- [ ] v0.0.6g PASS *(or marked SKIP — SMTP not available in test environment)*
+- [x] v0.0.6g PASS (Gmail SMTP via app password; surfaced + fixed: AD-discovery UX, -ADCredential pattern, Send-MailMessage deprecation, attachment-path resolution, UTF-8 mangling, Fleet Version Summary layout)
 - [x] v0.0.6h PASS (delta integer; version sort; columns populated; version string; archive folder excluded. Log-filenames + no-transfer-for-current marked N/A — covered by prior v0.0.6b run)
 - [ ] `CLAUDE.md` reflects current architecture
 - [ ] `README.md` project name updated to Manage-DefenderOffline; repo renamed on GitHub ✓
