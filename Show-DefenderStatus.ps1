@@ -827,54 +827,47 @@ $btnRefresh.add_Click({
     $statusLabel.Text      = 'Querying endpoints…'
     $script:QueryStartTime = [datetime]::UtcNow
 
-    # === DIAGNOSTIC BUILD (Attempt 9) ============================================
-    # Serial loop + hashtable -ArgumentList (no array flattening). File-based
-    # logging at every boundary so we can see precisely where data is lost.
-    # This logging will be removed once the root cause is identified.
-    $debugLog = 'C:\Temp\sds-debug.log'
-    if (-not (Test-Path 'C:\Temp')) { New-Item 'C:\Temp' -ItemType Directory -Force | Out-Null }
-    "===== $(Get-Date -f 'yyyy-MM-dd HH:mm:ss') REFRESH START =====" | Out-File $debugLog -Append
-    "[CLICK] TargetComputers.Count=$($TargetComputers.Count); Type=$($TargetComputers.GetType().FullName); First='$($TargetComputers[0])'; AVS='$AvailableVersionStr'" |
-        Out-File $debugLog -Append
-
+    # Bundle everything in a hashtable to pass as a single -ArgumentList
+    # value (avoids the array-flattening trap with multi-arg lists).
     $ctx = @{
         Computers           = $TargetComputers
         AvailableVersionStr = $AvailableVersionStr
+        Threads             = $ParallelThreads
         Ts                  = $TimeoutSeconds
         FuncDef             = ${function:Get-DefenderStatus}.ToString()
         Credentials         = $HostCredentials
-        DebugLog            = $debugLog
     }
 
     $script:QueryJob = Start-ThreadJob -ScriptBlock {
         param([hashtable]$Ctx)
 
-        "[JOB] entered. Ctx is hashtable? $($Ctx -is [hashtable]); keys=$($Ctx.Keys -join ',')" |
-            Out-File $Ctx.DebugLog -Append
-        "[JOB] Ctx.Computers.Count=$($Ctx.Computers.Count); Type=$($Ctx.Computers.GetType().FullName); First='$($Ctx.Computers[0])'" |
-            Out-File $Ctx.DebugLog -Append
-
-        # Properly DEFINE the function in this runspace.  Dot-sourcing the
-        # body string only EXECUTES it once with null params; assigning to
-        # ${function:...} is what actually defines a callable function.
-        ${function:Get-DefenderStatus} = [scriptblock]::Create($Ctx.FuncDef)
-
-        foreach ($comp in $Ctx.Computers) {
-            $compStr = [string]$comp
-            "[LOOP] comp='$compStr'; type=$($comp.GetType().FullName)" | Out-File $Ctx.DebugLog -Append
-
-            $cred = if ($Ctx.Credentials -and $Ctx.Credentials.ContainsKey($compStr)) {
-                $Ctx.Credentials[$compStr]
-            } else { $null }
-
-            $r = Get-DefenderStatus -Computer $compStr `
-                -TimeoutSeconds      $Ctx.Ts `
-                -AvailableVersionStr $Ctx.AvailableVersionStr `
-                -WinRmCredential     $cred
-
-            "[POST] r.ComputerName='$($r.ComputerName)'; Online=$($r.Online); AvailableVersion='$($r.AvailableVersion)'; Error='$($r.Error)'" |
-                Out-File $Ctx.DebugLog -Append
-            $r
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            $Ctx.Computers | ForEach-Object -Parallel {
+                $c    = $using:Ctx
+                $comp = [string]$_
+                # Assigning to ${function:Name} actually DEFINES the function
+                # in this runspace; dot-sourcing the body alone does not.
+                ${function:Get-DefenderStatus} = [scriptblock]::Create($c.FuncDef)
+                $cred = if ($c.Credentials -and $c.Credentials.ContainsKey($comp)) {
+                    $c.Credentials[$comp]
+                } else { $null }
+                Get-DefenderStatus -Computer $comp `
+                    -TimeoutSeconds      $c.Ts `
+                    -AvailableVersionStr $c.AvailableVersionStr `
+                    -WinRmCredential     $cred
+            } -ThrottleLimit $Ctx.Threads
+        } else {
+            ${function:Get-DefenderStatus} = [scriptblock]::Create($Ctx.FuncDef)
+            foreach ($comp in $Ctx.Computers) {
+                $compStr = [string]$comp
+                $cred = if ($Ctx.Credentials -and $Ctx.Credentials.ContainsKey($compStr)) {
+                    $Ctx.Credentials[$compStr]
+                } else { $null }
+                Get-DefenderStatus -Computer $compStr `
+                    -TimeoutSeconds      $Ctx.Ts `
+                    -AvailableVersionStr $Ctx.AvailableVersionStr `
+                    -WinRmCredential     $cred
+            }
         }
     } -ArgumentList $ctx
 

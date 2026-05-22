@@ -337,9 +337,14 @@ Querying… XX%  –  last: ENDPOINTNAME
 - [ ] CSV export opens correctly in Excel with all columns
 - [ ] HTML export opens in browser with correct formatting
 - [ ] Auto-refresh fires after 5 minutes without UI freeze
-- [ ] Window closes cleanly
+- [x] Window closes cleanly
 
-**Result:** FAIL (Attempt 1–4) → PENDING (Attempt 5 — see fixes below)
+**Result:** PASS (Attempt 10) — see root cause and full attempt history below
+
+**Root cause (the bug that survived 9 attempts):**
+`${function:Get-DefenderStatus}.ToString()` returns only the function **body** (param block + statements), not `function Name { ... }`. Therefore `. ([scriptblock]::Create($body))` in each worker runspace did **not** define the function — it **executed the body once** with all parameters `$null`, emitting a single bogus `$result` (with empty `ComputerName` because `$Computer` was `$null`) to the job's output stream. Every subsequent call to `Get-DefenderStatus` then silently failed with command-not-found (non-terminating), leaving `$r = $null`. Earlier theories about argument-list flattening, nested-job serialisation, and `$using:` scope were distractions — those code paths *also* hit the same dot-source bug, which masked the real defect.
+
+**The fix:** Replace `. ([scriptblock]::Create($body))` with `${function:Get-DefenderStatus} = [scriptblock]::Create($body)`. The function variable assignment actually defines a callable function in the current runspace.
 
 **Attempt 1 — BackgroundWorker "no runspace" error**
 GUI opened but no data loaded. BackgroundWorker `DoWork` fires on a .NET ThreadPool thread that has no PowerShell runspace; PS checked for a runspace before running the scriptblock and threw.
@@ -370,7 +375,28 @@ User ran from stale C:\Temp copy (old build). Same results confirmed old code, n
 
 **Fixes applied for Attempt 7 (commit on `feat/monitoring-service`):**
 - **Eliminated nested `Start-ThreadJob`** — replaced the inner-per-host job loop in `Invoke-StatusRefresh` with `ForEach-Object -Parallel`. Computer names arrive via pipeline `$_` with no serialisation; `$using:` captures outer-job variables directly. Same change applied to `Invoke-FleetRefresh` in `Start-DefenderDashboard.ps1`.
-- **SafeWaitHandle (.NET 10)** — added `Application.SetUnhandledExceptionMode(CatchException)` and a `ThreadException` handler that silently suppresses `ObjectDisposedException` on `SafeWaitHandle`; any other unhandled exception still surfaces as a dialog. `FormClosing` handler now only calls `Stop()`, not `Dispose()`, on both timers.
+- **SafeWaitHandle (.NET 10)** — added `Application.SetUnhandledExceptionMode(CatchException)` (later removed — see Attempt 7 below) and a `ThreadException` handler that silently suppresses `ObjectDisposedException` on `SafeWaitHandle`. `FormClosing` handler now only calls `Stop()`, not `Dispose()`, on both timers.
+
+**Attempt 7 — same symptoms**
+`SetUnhandledExceptionMode` threw at startup ("Thread exception mode cannot be changed once any Controls are created on the thread") because it was placed after all controls were built. Grid still showed 19 empty ComputerName rows.
+Fix: removed `SetUnhandledExceptionMode` (the `add_ThreadException` handler alone is sufficient under default `Automatic` mode). Also bypassed `-ArgumentList` entirely — captured `$TargetComputers` etc. into named local variables in the click handler and used `$using:localComputers` etc. inside an inline `Start-ThreadJob` scriptblock. Removed the now-unused `Invoke-StatusRefresh` function.
+
+**Attempt 8 — same symptoms again**
+`$using:` capture from event-handler scope into a thread-job + nested `ForEach-Object -Parallel` chain still produced 19 empty rows.
+
+**Fixes applied for Attempt 9 (diagnostic build):**
+- Switched to **serial** loop inside the thread-job (eliminated parallelism temporarily to isolate the issue).
+- Bundled all args into a single `[hashtable]` and passed via `-ArgumentList` (single non-array reference, no flattening concern).
+- Added file-based diagnostic logging at four checkpoints: click handler, job entry, each loop iteration, and post-`Get-DefenderStatus`.
+
+**Attempt 9 — diagnostic log revealed the truth**
+Log showed `$comp = 'DB01'` correct in every iteration, but `$r.ComputerName = ''` after each call — and `$r.Online =` (empty, not even `False`), proving `$r` was actually `$null`. The form showed "1 computers" total despite 19 loop iterations because the only non-null output from the entire thread-job was a single accidental `$result` produced by the dot-source line itself executing the body with null params.
+
+**Fix applied for Attempt 10 — the actual root cause:**
+- Replaced `. ([scriptblock]::Create($body))` with `${function:Get-DefenderStatus} = [scriptblock]::Create($body)` in both `Show-DefenderStatus.ps1` and `Start-DefenderDashboard.ps1` (the dashboard had the same latent bug but had not yet been tested).
+
+**Attempt 10 — PASS**
+All 19 hosts show real Defender data: 18 healthy/current, 1 red (WIN11-05 offline, "WinRM not reachable"). Diagnostic log confirms every `[POST]` line has correct `ComputerName`, `Online=True/False`, `AvailableVersion='1.449.681.0'`. Subsequent cleanup commit: removed diagnostic logging and restored `ForEach-Object -Parallel` (with the `${function:…} =` fix applied inside the parallel block).
 
 ---
 
