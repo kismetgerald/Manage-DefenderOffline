@@ -854,7 +854,10 @@ $btnRefresh.add_Click({
         "[JOB] Ctx.Computers.Count=$($Ctx.Computers.Count); Type=$($Ctx.Computers.GetType().FullName); First='$($Ctx.Computers[0])'" |
             Out-File $Ctx.DebugLog -Append
 
-        . ([scriptblock]::Create($Ctx.FuncDef))
+        # Properly DEFINE the function in this runspace.  Dot-sourcing the
+        # body string only EXECUTES it once with null params; assigning to
+        # ${function:...} is what actually defines a callable function.
+        ${function:Get-DefenderStatus} = [scriptblock]::Create($Ctx.FuncDef)
 
         foreach ($comp in $Ctx.Computers) {
             $compStr = [string]$comp

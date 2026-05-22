@@ -356,14 +356,14 @@ function Invoke-FleetRefresh {
         [System.Management.Automation.PSCredential]$WinRmCredential
     )
 
-    . ([scriptblock]::Create($FunctionDef))
+    ${function:Get-DefenderStatus} = [scriptblock]::Create($FunctionDef)
 
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
 
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $Computers | ForEach-Object -Parallel {
             $comp = [string]$_
-            . ([scriptblock]::Create($using:FunctionDef))
+            ${function:Get-DefenderStatus} = [scriptblock]::Create($using:FunctionDef)
             $cred = $using:WinRmCredential
             Get-DefenderStatus -Computer $comp `
                 -TimeoutSeconds      $using:TSeconds `
