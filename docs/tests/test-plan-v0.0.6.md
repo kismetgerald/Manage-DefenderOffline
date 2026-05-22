@@ -415,7 +415,7 @@ Ensure `conf/dashboard.status` does not exist from a previous run.
 
 ```powershell
 cd "D:\Dropbox\IT Docs\Scripts\Manage-DefenderOffline"
-.\Start-DefenderDashboard.ps1 -Port 8080 -FallbackPort 8443
+.\Start-DefenderDashboard.ps1 -Port 8080 -FallbackPort 8090
 ```
 
 **Steps:**
@@ -423,8 +423,8 @@ cd "D:\Dropbox\IT Docs\Scripts\Manage-DefenderOffline"
 1. Confirm the fallback is detected and logged immediately:
 
 ```
-2026-xx-xx xx:xx:xx [WARN] Port 8080 is in use. Binding to fallback port 8443 instead.
-2026-xx-xx xx:xx:xx [SUCCESS] HTTP listener started on http://+:8443/
+2026-xx-xx xx:xx:xx [WARN] Port 8080 is in use. Binding to fallback port 8090 instead.
+2026-xx-xx xx:xx:xx [SUCCESS] HTTP listener started on http://+:8090/
 2026-xx-xx xx:xx:xx [WARN] Warning written to Windows Event Log (EventId 101).
 ```
 
@@ -432,31 +432,31 @@ cd "D:\Dropbox\IT Docs\Scripts\Manage-DefenderOffline"
 
 ```powershell
 Get-Content .\conf\dashboard.status
-# Expect fields: Port=8443, PrimaryPort=8080, IsFallback=True, StartTime, ProcessId, Hostname
+# Expect fields: Port=8090, PrimaryPort=8080, IsFallback=True, StartTime, ProcessId, Hostname
 ```
 
-3. Confirm the dashboard responds on port **8443** (not 8080):
+3. Confirm the dashboard responds on port **8090** (not 8080):
 
 ```powershell
-Invoke-WebRequest http://localhost:8443/health -UseBasicParsing | Select-Object StatusCode, Content
+Invoke-WebRequest http://localhost:8090/health -UseBasicParsing | Select-Object StatusCode, Content
 # Expect: StatusCode=200, Content=OK
 
-Invoke-WebRequest http://localhost:8443/defender -UseBasicParsing | Select-Object StatusCode
+Invoke-WebRequest http://localhost:8090/defender -UseBasicParsing | Select-Object StatusCode
 # Expect: StatusCode=200
 ```
 
-4. Open `http://localhost:8443/defender` in a browser. Confirm the dashboard loads, shows fleet data after initial query, and the header displays the correct available version.
+4. Open `http://localhost:8090/defender` in a browser. Confirm the dashboard loads, shows fleet data after initial query, and the header displays the correct available version.
 
-5. Navigate to `http://localhost:8443/status`. Confirm valid JSON is returned with `totalComputers`, `onlineCount`, and `computers` array.
+5. Navigate to `http://localhost:8090/status`. Confirm valid JSON is returned with `totalComputers`, `onlineCount`, and `computers` array.
 
-6. Navigate to `http://localhost:8443/refresh`. Confirm it redirects to `/defender` and triggers a background refresh (the dashboard header should show a refresh-in-progress banner briefly).
+6. Navigate to `http://localhost:8090/refresh`. Confirm it redirects to `/defender` and triggers a background refresh (the dashboard header should show a refresh-in-progress banner briefly).
 
 7. Confirm EventId 101 appears in the Windows Application Event Log:
 
 ```powershell
 Get-EventLog -LogName Application -Source 'Manage-DefenderOffline' -Newest 5 |
     Select-Object EventID, EntryType, Message
-# Expect: EventID=101, EntryType=Warning, Message contains "FALLBACK port 8443"
+# Expect: EventID=101, EntryType=Warning, Message contains "FALLBACK port 8090"
 ```
 
 8. Stop the dashboard (Ctrl+C). Confirm:
@@ -492,8 +492,8 @@ Get-EventLog -LogName Application -Source 'Manage-DefenderOffline' -Newest 3 |
 ```
 
 **Expected result:**
-- [ ] Fallback to port 8443 when 8080 is occupied; correct log messages
-- [ ] `conf/dashboard.status` written with correct `IsFallback=True`, `Port=8443`
+- [ ] Fallback to port 8090 when 8080 is occupied; correct log messages
+- [ ] `conf/dashboard.status` written with correct `IsFallback=True`, `Port=8090`
 - [ ] All four HTTP endpoints respond on fallback port
 - [ ] `/defender` renders correctly in browser
 - [ ] `/status` returns valid JSON

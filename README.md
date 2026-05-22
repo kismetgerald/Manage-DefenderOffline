@@ -176,7 +176,7 @@ ReportPath         = .\Reports
 
 [Dashboard]
 Port            = 8080
-FallbackPort    = 8443
+FallbackPort    = 8090
 RefreshInterval = 300                   ← seconds
 
 [Email]
