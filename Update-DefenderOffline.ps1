@@ -1367,23 +1367,37 @@ if ($successCount -gt 0) {
 # ===================================================================
 if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
     $subject = "Defender Update $(Get-Date -f 'yyyy-MM-dd') - $successCount/$($Results.Count) OK | v$AvailableVersionStr"
-    $mailParams = @{
-        From        = $From
-        To          = $To
-        Subject     = $subject
-        Body        = (Get-Content $ReportFile -Raw)
-        BodyAsHtml  = $true
-        SmtpServer  = $SmtpServer
-        Port        = $SmtpPort
-        UseSsl      = $SmtpUseSsl
-        Attachments = @($ReportFile, $CsvFile)
-    }
-    if ($SmtpCredential) { $mailParams.Credential = $SmtpCredential }
 
+    # Use System.Net.Mail.SmtpClient directly instead of Send-MailMessage.
+    # Send-MailMessage was marked [Obsolete] in PowerShell 7 and emits a
+    # WARNING during command resolution — i.e., every script run, even
+    # ones that don't actually send email.  SmtpClient ships in .NET and
+    # does not emit any such warning at runtime.
+    $smtp = $null
+    $msg  = $null
     try {
-        Send-MailMessage @mailParams -ErrorAction Stop
+        $smtp = [System.Net.Mail.SmtpClient]::new($SmtpServer, $SmtpPort)
+        $smtp.EnableSsl = [bool]$SmtpUseSsl
+        if ($SmtpCredential) {
+            $smtp.Credentials = $SmtpCredential.GetNetworkCredential()
+        }
+
+        $msg = [System.Net.Mail.MailMessage]::new()
+        $msg.From = [System.Net.Mail.MailAddress]::new($From)
+        foreach ($recipient in $To) { [void]$msg.To.Add($recipient) }
+        $msg.Subject     = $subject
+        $msg.Body        = (Get-Content $ReportFile -Raw)
+        $msg.IsBodyHtml  = $true
+        foreach ($a in @($ReportFile, $CsvFile)) {
+            [void]$msg.Attachments.Add([System.Net.Mail.Attachment]::new($a))
+        }
+
+        $smtp.Send($msg)
         Write-Log 'Email notification sent successfully' 'SUCCESS'
     } catch {
         Write-Log "Email failed: $($_.Exception.Message)" 'ERROR'
+    } finally {
+        if ($msg)  { $msg.Dispose() }
+        if ($smtp) { $smtp.Dispose() }
     }
 }
