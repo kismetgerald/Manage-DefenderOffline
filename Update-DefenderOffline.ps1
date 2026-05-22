@@ -1210,7 +1210,12 @@ function New-HtmlReport {
         _activeFilter = status;
         rows.forEach(function(r) {
           var badge = r.querySelector('.tag');
-          r.style.display = (badge && badge.textContent.trim() === status) ? '' : 'none';
+          // ConvertTo-Html -Fragment emits header <tr> and data <tr>s as
+          // siblings (no <thead>/<tbody>); browsers auto-wrap all of them
+          // in an implicit <tbody>, so this selector matches the header
+          // row too.  Skip rows without a .tag (header / non-data rows).
+          if (!badge) return;
+          r.style.display = badge.textContent.trim() === status ? '' : 'none';
         });
         document.querySelectorAll('.stat-card').forEach(function(c) { c.classList.remove('active-filter'); });
         el.classList.add('active-filter');
