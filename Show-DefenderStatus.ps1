@@ -541,7 +541,7 @@ $clrWhite         = [System.Drawing.Color]::White
 
 #region Form
 $form               = [System.Windows.Forms.Form]::new()
-$form.Text          = "Defender Fleet Monitor v$ScriptVersion"
+$form.Text          = "Microsoft Defender Fleet Monitor v$ScriptVersion"
 $form.Size          = [System.Drawing.Size]::new(1440, 860)
 $form.MinimumSize   = [System.Drawing.Size]::new(960, 540)
 $form.StartPosition = 'CenterScreen'
@@ -596,29 +596,35 @@ for ($c = 0; $c -lt 4; $c++) {
 }
 
 function New-StatCard ([string]$Label, [System.Drawing.Color]$Bg, [System.Drawing.Color]$Fg) {
-    $p           = [System.Windows.Forms.Panel]::new()
-    $p.Dock      = 'Fill'
-    $p.Margin    = [System.Windows.Forms.Padding]::new(6, 0, 6, 0)
-    $p.BackColor = $Bg
+    # TableLayoutPanel with two rows gives deterministic row heights — using
+    # Dock=Fill + Dock=Bottom on plain Panel was clipping the label.
+    $card             = [System.Windows.Forms.TableLayoutPanel]::new()
+    $card.Dock        = 'Fill'
+    $card.Margin      = [System.Windows.Forms.Padding]::new(6, 0, 6, 0)
+    $card.BackColor   = $Bg
+    $card.RowCount    = 2
+    $card.ColumnCount = 1
+    [void]$card.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 100))
+    [void]$card.RowStyles.Add([System.Windows.Forms.RowStyle]::new('Percent', 65))
+    [void]$card.RowStyles.Add([System.Windows.Forms.RowStyle]::new('Percent', 35))
 
-    $lblLabel          = [System.Windows.Forms.Label]::new()
-    $lblLabel.Text     = $Label
-    $lblLabel.Dock     = 'Bottom'
-    $lblLabel.Height   = 24
-    $lblLabel.TextAlign = 'MiddleCenter'
-    $lblLabel.Font     = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-    $lblLabel.ForeColor = $Fg
-
-    $lblNumber          = [System.Windows.Forms.Label]::new()
-    $lblNumber.Text     = '—'
-    $lblNumber.Dock     = 'Fill'
-    $lblNumber.TextAlign = 'MiddleCenter'
-    $lblNumber.Font     = [System.Drawing.Font]::new('Segoe UI', 22, [System.Drawing.FontStyle]::Bold)
+    $lblNumber           = [System.Windows.Forms.Label]::new()
+    $lblNumber.Text      = '—'
+    $lblNumber.Dock      = 'Fill'
+    $lblNumber.TextAlign = 'BottomCenter'
+    $lblNumber.Font      = [System.Drawing.Font]::new('Segoe UI', 22, [System.Drawing.FontStyle]::Bold)
     $lblNumber.ForeColor = $Fg
 
-    $p.Controls.Add($lblNumber)
-    $p.Controls.Add($lblLabel)
-    return @{ Panel = $p; Number = $lblNumber }
+    $lblLabel            = [System.Windows.Forms.Label]::new()
+    $lblLabel.Text       = $Label
+    $lblLabel.Dock       = 'Fill'
+    $lblLabel.TextAlign  = 'TopCenter'
+    $lblLabel.Font       = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblLabel.ForeColor  = $Fg
+
+    $card.Controls.Add($lblNumber, 0, 0)
+    $card.Controls.Add($lblLabel,  0, 1)
+    return @{ Panel = $card; Number = $lblNumber }
 }
 
 $statOnline   = New-StatCard 'ONLINE'   $clrSuccess      $clrWhite
@@ -724,35 +730,37 @@ $grid.AlternatingRowsDefaultCellStyle.BackColor = $clrRowAlt
 $grid.AlternatingRowsDefaultCellStyle.SelectionBackColor = $clrSelection
 $grid.RowTemplate.Height                      = 32
 
-# 11 columns matching the HTML report (Online dropped — Status pill covers it; Error / Detail kept as GUI extra)
+# 11 columns matching the HTML report (Online dropped — Status pill covers it; Error / Detail kept as GUI extra).
+# AutoSizeColumnsMode = Fill on the grid + per-column FillWeight makes every
+# column resize proportionally with the form, and MinimumWidth keeps content
+# legible when the window is narrowed.
+$grid.AutoSizeColumnsMode = 'Fill'
 $colDefs = @(
-    'Computer',150
-    'Status',105
-    'Installed Version',130
-    'Available Version',130
-    'Currency',95
-    'RT Protection',100
-    'AV Enabled',90
-    'Last Quick Scan',140
-    'Threats',65
-    'Query Time',80
-    'Error / Detail',0
+    @{ Name = 'Computer';          Weight = 14; Min = 110 }
+    @{ Name = 'Status';            Weight = 11; Min = 110 }
+    @{ Name = 'Installed Version'; Weight = 12; Min = 110 }
+    @{ Name = 'Available Version'; Weight = 12; Min = 110 }
+    @{ Name = 'Currency';          Weight =  9; Min =  85 }
+    @{ Name = 'RT Protection';     Weight = 10; Min =  90 }
+    @{ Name = 'AV Enabled';        Weight =  9; Min =  85 }
+    @{ Name = 'Last Quick Scan';   Weight = 14; Min = 130 }
+    @{ Name = 'Threats';           Weight =  6; Min =  60 }
+    @{ Name = 'Query Time';        Weight =  8; Min =  75 }
+    @{ Name = 'Error / Detail';    Weight = 22; Min = 180 }
 )
-for ($i = 0; $i -lt $colDefs.Count; $i += 2) {
-    $col            = [System.Windows.Forms.DataGridViewTextBoxColumn]::new()
-    $col.HeaderText = $colDefs[$i]
-    $col.SortMode   = 'Automatic'
-    if ($colDefs[$i+1] -eq 0) {
-        $col.AutoSizeMode = 'Fill'
-    } else {
-        $col.Width = $colDefs[$i+1]
-    }
-    $grid.Columns.Add($col) | Out-Null
+foreach ($cd in $colDefs) {
+    $col              = [System.Windows.Forms.DataGridViewTextBoxColumn]::new()
+    $col.HeaderText   = $cd.Name
+    $col.SortMode     = 'Automatic'
+    $col.AutoSizeMode = 'Fill'
+    $col.FillWeight   = $cd.Weight
+    $col.MinimumWidth = $cd.Min
+    [void]$grid.Columns.Add($col)
 }
 
 # Custom-paint the Status column as a rounded pill, matching the HTML report's .tag styling.
 $grid.add_CellPainting({
-    param($sender, $e)
+    param($src, $e)
     if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 1) { return }
     $statusText = "$($e.Value)"
     if (-not $statusText) { return }
@@ -819,11 +827,65 @@ $grid.add_CellPainting({
 })
 #endregion
 
+#region Refresh overlay  (covers the grid area during a query with a marquee)
+$pnlOverlay              = [System.Windows.Forms.TableLayoutPanel]::new()
+$pnlOverlay.Dock         = 'Fill'
+$pnlOverlay.BackColor    = $clrCardBg
+$pnlOverlay.Visible      = $false
+$pnlOverlay.RowCount     = 3
+$pnlOverlay.ColumnCount  = 3
+[void]$pnlOverlay.RowStyles.Add([System.Windows.Forms.RowStyle]::new('Percent', 50))
+[void]$pnlOverlay.RowStyles.Add([System.Windows.Forms.RowStyle]::new('AutoSize'))
+[void]$pnlOverlay.RowStyles.Add([System.Windows.Forms.RowStyle]::new('Percent', 50))
+[void]$pnlOverlay.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 50))
+[void]$pnlOverlay.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('AutoSize'))
+[void]$pnlOverlay.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 50))
+
+$pnlOverlayContent              = [System.Windows.Forms.FlowLayoutPanel]::new()
+$pnlOverlayContent.FlowDirection = 'TopDown'
+$pnlOverlayContent.AutoSize     = $true
+$pnlOverlayContent.AutoSizeMode = 'GrowAndShrink'
+$pnlOverlayContent.WrapContents = $false
+$pnlOverlayContent.BackColor    = $clrCardBg
+
+$lblOverlayTitle           = [System.Windows.Forms.Label]::new()
+$lblOverlayTitle.Text      = 'Querying endpoints…'
+$lblOverlayTitle.Font      = [System.Drawing.Font]::new('Segoe UI', 16, [System.Drawing.FontStyle]::Regular)
+$lblOverlayTitle.ForeColor = $clrPrimary
+$lblOverlayTitle.AutoSize  = $true
+$lblOverlayTitle.Anchor    = 'None'
+$lblOverlayTitle.Margin    = [System.Windows.Forms.Padding]::new(0, 0, 0, 14)
+$lblOverlayTitle.TextAlign = 'MiddleCenter'
+
+$lblOverlaySub             = [System.Windows.Forms.Label]::new()
+$lblOverlaySub.Text        = ''
+$lblOverlaySub.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
+$lblOverlaySub.ForeColor   = $clrTextMuted
+$lblOverlaySub.AutoSize    = $true
+$lblOverlaySub.Anchor      = 'None'
+$lblOverlaySub.Margin      = [System.Windows.Forms.Padding]::new(0, 0, 0, 10)
+$lblOverlaySub.TextAlign   = 'MiddleCenter'
+
+$pgOverlay                       = [System.Windows.Forms.ProgressBar]::new()
+$pgOverlay.Style                 = 'Marquee'
+$pgOverlay.MarqueeAnimationSpeed = 30
+$pgOverlay.Width                 = 360
+$pgOverlay.Height                = 8
+$pgOverlay.Anchor                = 'None'
+
+$pnlOverlayContent.Controls.Add($lblOverlayTitle)
+$pnlOverlayContent.Controls.Add($lblOverlaySub)
+$pnlOverlayContent.Controls.Add($pgOverlay)
+$pnlOverlay.Controls.Add($pnlOverlayContent, 1, 1)
+#endregion
+
 # Add controls in the order that yields the visual top→bottom layout
 # (Header → Stats → Toolbar → Grid → StatusBar).  WinForms stacks the
 # LAST-added Dock=Top control closest to the edge, so add top-docked
-# panels in reverse visual order.
-$form.Controls.Add($grid)         # Dock=Fill (added first, behind everything)
+# panels in reverse visual order.  The overlay is added AFTER the grid
+# so it sits in front of the grid in z-order when made visible.
+$form.Controls.Add($grid)         # Dock=Fill (added first, behind the overlay)
+$form.Controls.Add($pnlOverlay)   # Dock=Fill (front of grid; hidden by default)
 $form.Controls.Add($pnlToolbar)   # Dock=Top — lowest of the top-docked
 $form.Controls.Add($pnlStats)     # Dock=Top — above the toolbar
 $form.Controls.Add($pnlHeader)    # Dock=Top — very top
@@ -900,7 +962,8 @@ $pollTimer.add_Tick({
 
     if ($script:QueryJob.State -in 'Running','NotStarted') {
         $secs = [math]::Round(([datetime]::UtcNow - $script:QueryStartTime).TotalSeconds)
-        $statusLabel.Text = "Querying endpoints… ${secs}s elapsed"
+        $statusLabel.Text   = "Querying endpoints… ${secs}s elapsed"
+        $lblOverlaySub.Text = "Elapsed: ${secs}s     Targets: $($TargetComputers.Count)"
         return
     }
 
@@ -927,6 +990,9 @@ $pollTimer.add_Tick({
     } else {
         $statusLabel.Text = 'Query returned no data'
     }
+
+    # Hide the overlay; bring the grid back to the front
+    $pnlOverlay.Visible = $false
     $btnRefresh.Enabled = $true
 })
 #endregion
@@ -944,6 +1010,11 @@ $btnRefresh.add_Click({
     $btnRefresh.Enabled    = $false
     $statusLabel.Text      = 'Querying endpoints…'
     $script:QueryStartTime = [datetime]::UtcNow
+
+    # Show the marquee overlay over the grid area
+    $lblOverlaySub.Text  = "Elapsed: 0s     Targets: $($TargetComputers.Count)"
+    $pnlOverlay.Visible  = $true
+    $pnlOverlay.BringToFront()
 
     # Bundle everything in a hashtable to pass as a single -ArgumentList
     # value (avoids the array-flattening trap with multi-arg lists).
