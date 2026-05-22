@@ -608,12 +608,16 @@ function New-StatCard ([string]$Label, [System.Drawing.Color]$Bg, [System.Drawin
     [void]$card.RowStyles.Add([System.Windows.Forms.RowStyle]::new('Percent', 65))
     [void]$card.RowStyles.Add([System.Windows.Forms.RowStyle]::new('Percent', 35))
 
+    # Non-zero top/bottom margins leave a small strip of the card's
+    # BackColor visible at the top + bottom edges — needed so the
+    # selection paint (inset border) has somewhere to render.
     $lblNumber           = [System.Windows.Forms.Label]::new()
     $lblNumber.Text      = '—'
     $lblNumber.Dock      = 'Fill'
     $lblNumber.TextAlign = 'BottomCenter'
     $lblNumber.Font      = [System.Drawing.Font]::new('Segoe UI', 22, [System.Drawing.FontStyle]::Bold)
     $lblNumber.ForeColor = $Fg
+    $lblNumber.Margin    = [System.Windows.Forms.Padding]::new(3, 4, 3, 0)
 
     $lblLabel            = [System.Windows.Forms.Label]::new()
     $lblLabel.Text       = $Label
@@ -621,6 +625,7 @@ function New-StatCard ([string]$Label, [System.Drawing.Color]$Bg, [System.Drawin
     $lblLabel.TextAlign  = 'TopCenter'
     $lblLabel.Font       = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $lblLabel.ForeColor  = $Fg
+    $lblLabel.Margin     = [System.Windows.Forms.Padding]::new(3, 0, 3, 4)
 
     $card.Controls.Add($lblNumber, 0, 0)
     $card.Controls.Add($lblLabel,  0, 1)
@@ -645,20 +650,41 @@ $cardMap = @{
 }
 $script:CardFilter = $null   # null | 'Online' | 'Offline' | 'Outdated' | 'RTOff'
 
+# Capture each card's resting BackColor so we can swap to a darker shade
+# when the card is the active filter, and restore it when deselected.
+$script:CardOriginalColors = @{}
+foreach ($k in $cardMap.Keys) { $script:CardOriginalColors[$k] = $cardMap[$k].Panel.BackColor }
+
+function script:Get-DarkerShade {
+    param([System.Drawing.Color]$c, [double]$f = 0.72)
+    [System.Drawing.Color]::FromArgb($c.A,
+        [int]([Math]::Max(0, $c.R * $f)),
+        [int]([Math]::Max(0, $c.G * $f)),
+        [int]([Math]::Max(0, $c.B * $f)))
+}
+
 $cardClickHandler = {
     $key = $this.Tag
     if (-not $key) { return }
     $script:CardFilter = if ($script:CardFilter -eq $key) { $null } else { $key }
-    foreach ($c in $cardMap.Values) { $c.Panel.Invalidate() }
+    foreach ($k in $cardMap.Keys) {
+        $card = $cardMap[$k].Panel
+        $orig = $script:CardOriginalColors[$k]
+        $card.BackColor = if ($script:CardFilter -eq $k) { Get-DarkerShade $orig } else { $orig }
+        $card.Invalidate()
+    }
     if ($script:AllResults) { Update-Grid }
 }
 
+# Sunken-edge effect: a semi-transparent dark inset border on the
+# selected card, drawn into the small strips left by the label margins.
 $cardPaintHandler = {
     param($src, $e)
     if ($script:CardFilter -and $src.Tag -eq $script:CardFilter) {
-        $pen = [System.Drawing.Pen]::new($clrPrimary, 3)
-        $e.Graphics.DrawRectangle($pen, 1, 1, $src.Width - 3, $src.Height - 3)
-        $pen.Dispose()
+        $darkPen = [System.Drawing.Pen]::new(
+            [System.Drawing.Color]::FromArgb(140, 0, 0, 0), 2)
+        $e.Graphics.DrawRectangle($darkPen, 0, 0, $src.Width - 1, $src.Height - 1)
+        $darkPen.Dispose()
     }
 }
 
@@ -730,7 +756,9 @@ $lblCountdown            = [System.Windows.Forms.Label]::new()
 $lblCountdown.Text       = ''
 $lblCountdown.AutoSize   = $true
 $lblCountdown.ForeColor  = $clrTextMuted
-$lblCountdown.Padding    = [System.Windows.Forms.Padding]::new(6, 7, 0, 0)
+# Top padding tuned to match the checkbox text baseline (the checkbox
+# glyph centers its text a few px higher than a bare Label would).
+$lblCountdown.Padding    = [System.Windows.Forms.Padding]::new(6, 9, 0, 0)
 $lblCountdown.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
 
 $pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
@@ -950,12 +978,15 @@ function Update-Grid {
     if ($filter) { $data = @($data | Where-Object { $_.ComputerName -like "*$filter*" }) }
 
     if ($script:CardFilter) {
+        # Capture $_ in $item BEFORE switch — inside switch, $_ rebinds
+        # to the switch's matched value, not the pipeline item.
         $data = @($data | Where-Object {
+            $item = $_
             switch ($script:CardFilter) {
-                'Online'   { $_.Online -eq $true }
-                'Offline'  { $_.Online -eq $false }
-                'Outdated' { $_.VersionStatus -eq 'Outdated' }
-                'RTOff'    { $_.RealTimeProtection -eq 'False' -and $_.Online -eq $true }
+                'Online'   { $item.Online -eq $true }
+                'Offline'  { $item.Online -eq $false }
+                'Outdated' { $item.VersionStatus -eq 'Outdated' }
+                'RTOff'    { $item.RealTimeProtection -eq 'False' -and $item.Online -eq $true }
             }
         })
     }
@@ -1020,9 +1051,11 @@ $pollTimer.add_Tick({
     if (-not $script:QueryJob) { $pollTimer.Stop(); return }
 
     if ($script:QueryJob.State -in 'Running','NotStarted') {
-        $secs = [math]::Round(([datetime]::UtcNow - $script:QueryStartTime).TotalSeconds)
-        $statusLabel.Text   = "Querying endpoints… ${secs}s elapsed"
-        $lblOverlaySub.Text = "Elapsed: ${secs}s     Targets: $($TargetComputers.Count)"
+        $secs  = [math]::Round(([datetime]::UtcNow - $script:QueryStartTime).TotalSeconds)
+        $done  = if ($script:CompletedHosts) { $script:CompletedHosts.Count } else { 0 }
+        $total = $TargetComputers.Count
+        $statusLabel.Text   = "Querying endpoints… $done of $total  (${secs}s elapsed)"
+        $lblOverlaySub.Text = "Completed $done of $total     Elapsed: ${secs}s"
         return
     }
 
@@ -1096,8 +1129,13 @@ $btnRefresh.add_Click({
     $statusLabel.Text      = 'Querying endpoints…'
     $script:QueryStartTime = [datetime]::UtcNow
 
+    # Fresh thread-safe "completed" tracker for this run.  The parallel
+    # workers Add() to it as each host finishes; the poll timer reads
+    # .Count to display live "X/N" progress.
+    $script:CompletedHosts = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
     # Show the marquee overlay over the grid area
-    $lblOverlaySub.Text  = "Elapsed: 0s     Targets: $($TargetComputers.Count)"
+    $lblOverlaySub.Text  = "Completed 0 of $($TargetComputers.Count)     Elapsed: 0s"
     $pnlOverlay.Visible  = $true
     $pnlOverlay.BringToFront()
 
@@ -1109,6 +1147,7 @@ $btnRefresh.add_Click({
         Threads             = $ParallelThreads
         Ts                  = $TimeoutSeconds
         FuncDef             = ${function:Get-DefenderStatus}.ToString()
+        CompletedHosts      = $script:CompletedHosts
         Credentials         = $HostCredentials
     }
 
@@ -1125,10 +1164,12 @@ $btnRefresh.add_Click({
                 $cred = if ($c.Credentials -and $c.Credentials.ContainsKey($comp)) {
                     $c.Credentials[$comp]
                 } else { $null }
-                Get-DefenderStatus -Computer $comp `
+                $r = Get-DefenderStatus -Computer $comp `
                     -TimeoutSeconds      $c.Ts `
                     -AvailableVersionStr $c.AvailableVersionStr `
                     -WinRmCredential     $cred
+                $c.CompletedHosts.Add($comp)   # thread-safe; live progress counter
+                $r
             } -ThrottleLimit $Ctx.Threads
         } else {
             ${function:Get-DefenderStatus} = [scriptblock]::Create($Ctx.FuncDef)
@@ -1137,10 +1178,12 @@ $btnRefresh.add_Click({
                 $cred = if ($Ctx.Credentials -and $Ctx.Credentials.ContainsKey($compStr)) {
                     $Ctx.Credentials[$compStr]
                 } else { $null }
-                Get-DefenderStatus -Computer $compStr `
+                $r = Get-DefenderStatus -Computer $compStr `
                     -TimeoutSeconds      $Ctx.Ts `
                     -AvailableVersionStr $Ctx.AvailableVersionStr `
                     -WinRmCredential     $cred
+                $Ctx.CompletedHosts.Add($compStr)
+                $r
             }
         }
     } -ArgumentList $ctx
