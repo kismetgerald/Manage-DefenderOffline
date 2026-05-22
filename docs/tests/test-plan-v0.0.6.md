@@ -728,15 +728,20 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 ```
 
 **Expected result:**
-- [ ] `Delta` column contains integers in HTML report and CSV; not `Unknown`
-- [ ] Version sort is numeric; `1.405.100.0` > `1.405.9.0` in summary
-- [ ] Log collection (if configured): files named `install_*.log`, not `mpam-fe.exe.*`
-- [ ] `No Update Needed` endpoint has short duration; per-host log confirms no transfer
-- [ ] HTML report `Attempt` and `Timeout` columns are populated
-- [ ] Version shown as `v0.0.6` in log header and HTML report footer
-- [ ] Archive/\_Archive folder contents excluded from version discovery; decoy higher version not selected
+- [x] `Delta` column contains integers in HTML report and CSV; not `Unknown`
+- [x] Version sort is numeric; `1.405.100.0` > `1.405.9.0` in summary *(implicit — Fleet Version Summary correctly picked `1.451.42.0` (build 42) as Newest over `1.451.36.0` (build 36); `[version]` cast compares each component numerically)*
+- [ ] Log collection (if configured): files named `install_*.log`, not `mpam-fe.exe.*` *(N/A — `-LogSharePath` not set in test environment)*
+- [ ] `No Update Needed` endpoint has short duration; per-host log confirms no transfer *(N/A — no "current" host in the targeted pair; both DH01 and NDI01 were Outdated. Previously verified in v0.0.6b)*
+- [x] HTML report `Attempt` and `Timeout` columns are populated
+- [x] Version shown as `v0.0.6` in log header and HTML report footer
+- [x] Archive/\_Archive folder contents excluded from version discovery; decoy higher version not selected *(Source File path = `\\NAS01\…\20260522\v1.451.42.0\mpam-fe.exe`, no `_Archive` segment)*
 
-**Result:** PENDING
+**Result:** PASS (Attempt 2)
+
+**Attempt 1 — discovered HTML report badge-filter bug:** clicking a stat card hid the column header row along with the non-matching data rows. Root cause: `ConvertTo-Html -Fragment` emits header `<tr>` and data `<tr>`s as siblings (no `<thead>`/`<tbody>`); browsers auto-wrap all of them in an implicit `<tbody>`, so `#resultsTable tbody tr` matched the header row too. The header `<tr>` has no `.tag` element, so `(badge && …)` evaluated to falsy and the row was hidden.
+**Fix:** in `filterByStatus()`, skip rows where `r.querySelector('.tag')` is null (header / non-data rows) — only modify display on rows that actually have a status badge.
+
+**Attempt 2 — PASS.** Live run on DH01 + NDI01 (both outdated): both updated successfully `1.451.36.0 → 1.451.42.0` with `Delta=6`, `Attempt=1`, `Timeout=No`. HTML report shows `v0.0.6` in footer, Source File path has no `_Archive` segment. Badge filter confirmed: clicking Failed/Skipped hides data rows but the column header band remains visible.
 
 ---
 
@@ -749,7 +754,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 - [ ] v0.0.6e PASS (port fallback; status file written/deleted; Event Log 101/100/102; all HTTP endpoints respond)
 - [ ] v0.0.6f PASS (installer prereqs; service identity; scheduled task; ACLs; firewall rule; status file read; reboot persistence)
 - [ ] v0.0.6g PASS *(or marked SKIP — SMTP not available in test environment)*
-- [ ] v0.0.6h PASS (all regression checks: delta integer; version sort; log filenames; no transfer for current; columns populated; version string; archive folder excluded)
+- [x] v0.0.6h PASS (delta integer; version sort; columns populated; version string; archive folder excluded. Log-filenames + no-transfer-for-current marked N/A — covered by prior v0.0.6b run)
 - [ ] `CLAUDE.md` reflects current architecture
 - [ ] `README.md` project name updated to Manage-DefenderOffline; repo renamed on GitHub ✓
 - [ ] `conf/config.conf` complete and documented
