@@ -519,72 +519,138 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-#region Colour palette
-$clrBlue         = [System.Drawing.Color]::FromArgb(0, 120, 212)
-$clrBackground   = [System.Drawing.Color]::FromArgb(240, 242, 246)
-$clrToolbar      = [System.Drawing.Color]::FromArgb(220, 225, 235)
-$clrStats        = [System.Drawing.Color]::FromArgb(228, 232, 240)
-$clrOkBg         = [System.Drawing.Color]::FromArgb(198, 239, 206)
-$clrOkFg         = [System.Drawing.Color]::FromArgb(0, 97, 0)
-$clrWarnBg       = [System.Drawing.Color]::FromArgb(255, 235, 156)
-$clrWarnFg       = [System.Drawing.Color]::FromArgb(120, 72, 0)
-$clrBadBg        = [System.Drawing.Color]::FromArgb(255, 199, 206)
-$clrBadFg        = [System.Drawing.Color]::FromArgb(156, 0, 6)
-$clrGridHeader   = [System.Drawing.Color]::FromArgb(20, 20, 60)
+#region Colour palette  (mirrors the HTML report exported by Export HTML)
+$clrPrimary       = [System.Drawing.Color]::FromArgb(0,   120, 212)  # #0078d4 Fluent blue
+$clrBackground    = [System.Drawing.Color]::FromArgb(245, 247, 250)  # #f5f7fa page bg
+$clrCardBg        = [System.Drawing.Color]::White                    # #ffffff
+$clrToolbarBg     = [System.Drawing.Color]::FromArgb(248, 250, 252)  # very light gray
+$clrTextDark      = [System.Drawing.Color]::FromArgb(51,  51,  51)   # #333333
+$clrTextMuted     = [System.Drawing.Color]::FromArgb(136, 136, 136)  # #888888
+$clrBorder        = [System.Drawing.Color]::FromArgb(232, 232, 232)  # #e8e8e8
+$clrRowAlt        = [System.Drawing.Color]::FromArgb(249, 249, 249)  # #f9f9f9
+$clrSelection     = [System.Drawing.Color]::FromArgb(220, 233, 248)  # selection tint
+# Status colours (match HTML .tag classes and stat cards)
+$clrSuccess       = [System.Drawing.Color]::FromArgb(16,  124, 16)   # #107c10 - Healthy/Online
+$clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 - Offline
+$clrOutdatedPill  = [System.Drawing.Color]::FromArgb(156, 81,  0)    # #9c5100 - Outdated pill (HTML .skipped)
+$clrWarn          = [System.Drawing.Color]::FromArgb(184, 134, 11)   # #b8860b - Degraded pill (HTML .warn)
+$clrOutdatedCard  = [System.Drawing.Color]::FromArgb(250, 179, 135)  # #fab387 - Outdated stat card (HTML .s3)
+$clrRtOffCard     = [System.Drawing.Color]::FromArgb(249, 226, 175)  # #f9e2af - RT Off stat card (HTML .s4)
+$clrWhite         = [System.Drawing.Color]::White
 #endregion
 
 #region Form
-$form              = [System.Windows.Forms.Form]::new()
-$form.Text         = "Defender Fleet Monitor v$ScriptVersion"
-$form.Size         = [System.Drawing.Size]::new(1420, 840)
-$form.MinimumSize  = [System.Drawing.Size]::new(900, 500)
+$form               = [System.Windows.Forms.Form]::new()
+$form.Text          = "Defender Fleet Monitor v$ScriptVersion"
+$form.Size          = [System.Drawing.Size]::new(1440, 860)
+$form.MinimumSize   = [System.Drawing.Size]::new(960, 540)
 $form.StartPosition = 'CenterScreen'
-$form.BackColor    = $clrBackground
-$form.Font         = [System.Drawing.Font]::new('Segoe UI', 9)
+$form.BackColor     = $clrBackground
+$form.ForeColor     = $clrTextDark
+$form.Font          = [System.Drawing.Font]::new('Segoe UI', 9)
 #endregion
 
-#region Header strip
+#region Header  (matches HTML <h1> with blue underline + status subline)
 $pnlHeader           = [System.Windows.Forms.Panel]::new()
 $pnlHeader.Dock      = 'Top'
-$pnlHeader.Height    = 56
-$pnlHeader.BackColor = $clrBlue
+$pnlHeader.Height    = 84
+$pnlHeader.BackColor = $clrCardBg
 
 $lblTitle            = [System.Windows.Forms.Label]::new()
-$lblTitle.Text       = '  Defender Fleet Monitor'
-$lblTitle.Font       = [System.Drawing.Font]::new('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
-$lblTitle.ForeColor  = [System.Drawing.Color]::White
+$lblTitle.Text       = 'Microsoft Defender Fleet Status'
+$lblTitle.Font       = [System.Drawing.Font]::new('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+$lblTitle.ForeColor  = $clrPrimary
 $lblTitle.AutoSize   = $true
-$lblTitle.Location   = [System.Drawing.Point]::new(8, 10)
+$lblTitle.Location   = [System.Drawing.Point]::new(20, 14)
 
-$lblAvail            = [System.Windows.Forms.Label]::new()
-$lblAvail.Text       = if ($AvailableVersionStr) { "  Available: v$AvailableVersionStr" } else { '  Available: N/A (no share specified)' }
-$lblAvail.ForeColor  = [System.Drawing.Color]::FromArgb(200, 230, 255)
-$lblAvail.AutoSize   = $true
-$lblAvail.Location   = [System.Drawing.Point]::new(8, 36)
+$lblInfo             = [System.Windows.Forms.Label]::new()
+$lblInfo.Text        = if ($AvailableVersionStr) {
+    "Available Version: v$AvailableVersionStr     Total Systems: $($TargetComputers.Count)"
+} else {
+    "Available Version: N/A (no share specified)     Total Systems: $($TargetComputers.Count)"
+}
+$lblInfo.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
+$lblInfo.ForeColor   = $clrTextMuted
+$lblInfo.AutoSize    = $true
+$lblInfo.Location    = [System.Drawing.Point]::new(20, 50)
 
-$pnlHeader.Controls.AddRange(@($lblTitle, $lblAvail))
-$form.Controls.Add($pnlHeader)
+# 3px blue accent line at the bottom (matches HTML h1 border-bottom)
+$pnlHeaderAccent           = [System.Windows.Forms.Panel]::new()
+$pnlHeaderAccent.Dock      = 'Bottom'
+$pnlHeaderAccent.Height    = 3
+$pnlHeaderAccent.BackColor = $clrPrimary
+
+$pnlHeader.Controls.AddRange(@($lblTitle, $lblInfo, $pnlHeaderAccent))
+#endregion
+
+#region Stat cards  (4 cards mirroring the HTML stats grid)
+$pnlStats              = [System.Windows.Forms.TableLayoutPanel]::new()
+$pnlStats.Dock         = 'Top'
+$pnlStats.Height       = 96
+$pnlStats.ColumnCount  = 4
+$pnlStats.RowCount     = 1
+$pnlStats.BackColor    = $clrBackground
+$pnlStats.Padding      = [System.Windows.Forms.Padding]::new(16, 10, 16, 8)
+for ($c = 0; $c -lt 4; $c++) {
+    $pnlStats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 25)) | Out-Null
+}
+
+function New-StatCard ([string]$Label, [System.Drawing.Color]$Bg, [System.Drawing.Color]$Fg) {
+    $p           = [System.Windows.Forms.Panel]::new()
+    $p.Dock      = 'Fill'
+    $p.Margin    = [System.Windows.Forms.Padding]::new(6, 0, 6, 0)
+    $p.BackColor = $Bg
+
+    $lblLabel          = [System.Windows.Forms.Label]::new()
+    $lblLabel.Text     = $Label
+    $lblLabel.Dock     = 'Bottom'
+    $lblLabel.Height   = 24
+    $lblLabel.TextAlign = 'MiddleCenter'
+    $lblLabel.Font     = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblLabel.ForeColor = $Fg
+
+    $lblNumber          = [System.Windows.Forms.Label]::new()
+    $lblNumber.Text     = '—'
+    $lblNumber.Dock     = 'Fill'
+    $lblNumber.TextAlign = 'MiddleCenter'
+    $lblNumber.Font     = [System.Drawing.Font]::new('Segoe UI', 22, [System.Drawing.FontStyle]::Bold)
+    $lblNumber.ForeColor = $Fg
+
+    $p.Controls.Add($lblNumber)
+    $p.Controls.Add($lblLabel)
+    return @{ Panel = $p; Number = $lblNumber }
+}
+
+$statOnline   = New-StatCard 'ONLINE'   $clrSuccess      $clrWhite
+$statOffline  = New-StatCard 'OFFLINE'  $clrError        $clrWhite
+$statOutdated = New-StatCard 'OUTDATED' $clrOutdatedCard $clrTextDark
+$statRtOff    = New-StatCard 'RT OFF'   $clrRtOffCard    $clrTextDark
+
+foreach ($s in $statOnline, $statOffline, $statOutdated, $statRtOff) {
+    $pnlStats.Controls.Add($s.Panel)
+}
 #endregion
 
 #region Toolbar
 $pnlToolbar           = [System.Windows.Forms.FlowLayoutPanel]::new()
 $pnlToolbar.Dock      = 'Top'
-$pnlToolbar.Height    = 44
-$pnlToolbar.Padding   = [System.Windows.Forms.Padding]::new(8, 7, 0, 0)
-$pnlToolbar.BackColor = $clrToolbar
+$pnlToolbar.Height    = 46
+$pnlToolbar.Padding   = [System.Windows.Forms.Padding]::new(20, 9, 20, 0)
+$pnlToolbar.BackColor = $clrToolbarBg
 
 function New-ToolButton ([string]$Text) {
     $b             = [System.Windows.Forms.Button]::new()
     $b.Text        = $Text
     $b.AutoSize    = $true
     $b.Height      = 28
-    $b.Padding     = [System.Windows.Forms.Padding]::new(10, 0, 10, 0)
+    $b.Padding     = [System.Windows.Forms.Padding]::new(12, 0, 12, 0)
     $b.FlatStyle   = 'Flat'
-    $b.BackColor   = $clrBlue
-    $b.ForeColor   = [System.Drawing.Color]::White
+    $b.BackColor   = $clrPrimary
+    $b.ForeColor   = $clrWhite
     $b.Font        = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $b.FlatAppearance.BorderSize = 0
     $b.Cursor      = [System.Windows.Forms.Cursors]::Hand
+    $b.Margin      = [System.Windows.Forms.Padding]::new(0, 0, 8, 0)
     return $b
 }
 
@@ -592,73 +658,38 @@ $btnRefresh     = New-ToolButton '⟳  Refresh Now'
 $btnExportCsv   = New-ToolButton '⬇  Export CSV'
 $btnExportHtml  = New-ToolButton '⬇  Export HTML'
 
-$sep = [System.Windows.Forms.Label]::new()
-$sep.Width = 16
+$sep            = [System.Windows.Forms.Label]::new()
+$sep.Width      = 24
 
 $lblFilter      = [System.Windows.Forms.Label]::new()
 $lblFilter.Text = 'Filter:'
-$lblFilter.AutoSize = $true
-$lblFilter.Padding  = [System.Windows.Forms.Padding]::new(0, 6, 4, 0)
+$lblFilter.AutoSize  = $true
+$lblFilter.ForeColor = $clrTextDark
+$lblFilter.Padding   = [System.Windows.Forms.Padding]::new(0, 7, 4, 0)
 
-$txtFilter      = [System.Windows.Forms.TextBox]::new()
-$txtFilter.Width  = 200
-$txtFilter.Height = 24
-$txtFilter.Margin = [System.Windows.Forms.Padding]::new(2, 4, 0, 0)
+$txtFilter             = [System.Windows.Forms.TextBox]::new()
+$txtFilter.Width       = 220
+$txtFilter.Height      = 24
+$txtFilter.Margin      = [System.Windows.Forms.Padding]::new(2, 5, 0, 0)
+$txtFilter.BorderStyle = 'FixedSingle'
 
-$chkAuto        = [System.Windows.Forms.CheckBox]::new()
-$chkAuto.Text   = 'Auto-refresh (5 min)'
-$chkAuto.AutoSize = $true
-$chkAuto.Padding  = [System.Windows.Forms.Padding]::new(12, 6, 0, 0)
+$chkAuto             = [System.Windows.Forms.CheckBox]::new()
+$chkAuto.Text        = 'Auto-refresh (5 min)'
+$chkAuto.AutoSize    = $true
+$chkAuto.ForeColor   = $clrTextDark
+$chkAuto.Padding     = [System.Windows.Forms.Padding]::new(12, 7, 0, 0)
 
 $pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $sep, $lblFilter, $txtFilter, $chkAuto))
-$form.Controls.Add($pnlToolbar)
-#endregion
-
-#region Stat cards
-$pnlStats              = [System.Windows.Forms.TableLayoutPanel]::new()
-$pnlStats.Dock         = 'Top'
-$pnlStats.Height       = 72
-$pnlStats.ColumnCount  = 5
-$pnlStats.RowCount     = 1
-$pnlStats.BackColor    = $clrStats
-$pnlStats.Padding      = [System.Windows.Forms.Padding]::new(8, 8, 8, 0)
-for ($c = 0; $c -lt 5; $c++) {
-    $pnlStats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 20)) | Out-Null
-}
-$form.Controls.Add($pnlStats)
-
-function New-StatCard ([string]$InitText, [System.Drawing.Color]$Bg, [System.Drawing.Color]$Fg) {
-    $p           = [System.Windows.Forms.Panel]::new()
-    $p.Dock      = 'Fill'
-    $p.Margin    = [System.Windows.Forms.Padding]::new(4)
-    $p.BackColor = $Bg
-    $lbl         = [System.Windows.Forms.Label]::new()
-    $lbl.Dock    = 'Fill'
-    $lbl.Text    = $InitText
-    $lbl.TextAlign = 'MiddleCenter'
-    $lbl.Font    = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-    $lbl.ForeColor = $Fg
-    $p.Controls.Add($lbl)
-    return @{ Panel = $p; Label = $lbl }
-}
-
-$statTotal    = New-StatCard "Total`r`n—"    ([System.Drawing.Color]::FromArgb(210,220,240)) ([System.Drawing.Color]::FromArgb(20,20,80))
-$statOnline   = New-StatCard "Online`r`n—"  $clrOkBg  $clrOkFg
-$statOffline  = New-StatCard "Offline`r`n—" $clrBadBg $clrBadFg
-$statCurrent  = New-StatCard "Current`r`n—" $clrOkBg  $clrOkFg
-$statOutdated = New-StatCard "Outdated`r`n—" $clrWarnBg $clrWarnFg
-
-foreach ($s in $statTotal, $statOnline, $statOffline, $statCurrent, $statOutdated) {
-    $pnlStats.Controls.Add($s.Panel)
-}
 #endregion
 
 #region Status bar
-$statusStrip  = [System.Windows.Forms.StatusStrip]::new()
-$statusLabel  = [System.Windows.Forms.ToolStripStatusLabel]::new()
-$statusLabel.Text = "Ready – $($TargetComputers.Count) computers loaded"
+$statusStrip            = [System.Windows.Forms.StatusStrip]::new()
+$statusStrip.BackColor  = $clrToolbarBg
+$statusStrip.SizingGrip = $false
+$statusLabel            = [System.Windows.Forms.ToolStripStatusLabel]::new()
+$statusLabel.Text       = "Ready – $($TargetComputers.Count) computers loaded"
+$statusLabel.ForeColor  = $clrTextDark
 $statusStrip.Items.Add($statusLabel) | Out-Null
-$form.Controls.Add($statusStrip)
 #endregion
 
 #region DataGridView
@@ -672,32 +703,40 @@ $grid.MultiSelect           = $false
 $grid.SelectionMode         = 'FullRowSelect'
 $grid.RowHeadersVisible     = $false
 $grid.AutoSizeColumnsMode   = 'None'
-$grid.BackgroundColor       = $clrBackground
+$grid.BackgroundColor       = $clrCardBg
 $grid.BorderStyle           = 'None'
 $grid.CellBorderStyle       = 'SingleHorizontal'
-$grid.GridColor             = [System.Drawing.Color]::FromArgb(210, 215, 225)
-$grid.ColumnHeadersDefaultCellStyle.BackColor = $clrGridHeader
-$grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-$grid.ColumnHeadersDefaultCellStyle.Font      = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$grid.ColumnHeadersHeightSizeMode             = 'DisableResizing'
-$grid.ColumnHeadersHeight                     = 32
+$grid.GridColor             = $clrBorder
 $grid.EnableHeadersVisualStyles               = $false
-$grid.DefaultCellStyle.Padding                = [System.Windows.Forms.Padding]::new(4, 0, 4, 0)
-$grid.RowTemplate.Height                      = 26
+$grid.ColumnHeadersDefaultCellStyle.BackColor = $clrPrimary
+$grid.ColumnHeadersDefaultCellStyle.ForeColor = $clrWhite
+$grid.ColumnHeadersDefaultCellStyle.Font      = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$grid.ColumnHeadersDefaultCellStyle.Alignment = 'MiddleLeft'
+$grid.ColumnHeadersDefaultCellStyle.Padding   = [System.Windows.Forms.Padding]::new(10, 0, 0, 0)
+$grid.ColumnHeadersHeightSizeMode             = 'DisableResizing'
+$grid.ColumnHeadersHeight                     = 38
+$grid.DefaultCellStyle.BackColor              = $clrCardBg
+$grid.DefaultCellStyle.ForeColor              = $clrTextDark
+$grid.DefaultCellStyle.SelectionBackColor     = $clrSelection
+$grid.DefaultCellStyle.SelectionForeColor     = $clrTextDark
+$grid.DefaultCellStyle.Padding                = [System.Windows.Forms.Padding]::new(8, 0, 4, 0)
+$grid.AlternatingRowsDefaultCellStyle.BackColor = $clrRowAlt
+$grid.AlternatingRowsDefaultCellStyle.SelectionBackColor = $clrSelection
+$grid.RowTemplate.Height                      = 32
 
+# 11 columns matching the HTML report (Online dropped — Status pill covers it; Error / Detail kept as GUI extra)
 $colDefs = @(
-    'Computer Name',150
-    'Online',70
-    'Status',90
+    'Computer',150
+    'Status',105
     'Installed Version',130
     'Available Version',130
-    'Currency',90
+    'Currency',95
     'RT Protection',100
     'AV Enabled',90
     'Last Quick Scan',140
     'Threats',65
     'Query Time',80
-    'Error / Detail',0   # 0 = Fill
+    'Error / Detail',0
 )
 for ($i = 0; $i -lt $colDefs.Count; $i += 2) {
     $col            = [System.Windows.Forms.DataGridViewTextBoxColumn]::new()
@@ -711,8 +750,84 @@ for ($i = 0; $i -lt $colDefs.Count; $i += 2) {
     $grid.Columns.Add($col) | Out-Null
 }
 
-$form.Controls.Add($grid)
+# Custom-paint the Status column as a rounded pill, matching the HTML report's .tag styling.
+$grid.add_CellPainting({
+    param($sender, $e)
+    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 1) { return }
+    $statusText = "$($e.Value)"
+    if (-not $statusText) { return }
+
+    $pillBg = switch ($statusText) {
+        'Healthy'  { $clrSuccess }
+        'Offline'  { $clrError }
+        'Outdated' { $clrOutdatedPill }
+        'Degraded' { $clrWarn }
+        default    { [System.Drawing.Color]::Gray }
+    }
+    $pillFg = $clrWhite
+
+    # Cell background — respect alternating row tint and selection
+    $isSelected = ($e.State -band [System.Windows.Forms.DataGridViewElementStates]::Selected) -ne 0
+    $cellBg = if ($isSelected) { $clrSelection }
+              elseif ($e.RowIndex % 2 -eq 1) { $clrRowAlt }
+              else { $clrCardBg }
+    $bgBrush = [System.Drawing.SolidBrush]::new($cellBg)
+    $e.Graphics.FillRectangle($bgBrush, $e.CellBounds)
+    $bgBrush.Dispose()
+
+    # Bottom cell border to match the rest of the grid
+    $borderPen = [System.Drawing.Pen]::new($clrBorder)
+    $e.Graphics.DrawLine($borderPen,
+        $e.CellBounds.Left, $e.CellBounds.Bottom - 1,
+        $e.CellBounds.Right, $e.CellBounds.Bottom - 1)
+    $borderPen.Dispose()
+
+    # Rounded pill
+    $padX = 14; $padY = 6
+    $pill = [System.Drawing.Rectangle]::new(
+        $e.CellBounds.X + $padX,
+        $e.CellBounds.Y + $padY,
+        $e.CellBounds.Width - 2 * $padX,
+        $e.CellBounds.Height - 2 * $padY)
+    $r    = [Math]::Min([int]($pill.Height / 2), 12)
+    $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
+    $path.AddArc($pill.X,            $pill.Y,            $r * 2, $r * 2, 180, 90)
+    $path.AddArc($pill.Right - $r*2, $pill.Y,            $r * 2, $r * 2, 270, 90)
+    $path.AddArc($pill.Right - $r*2, $pill.Bottom - $r*2,$r * 2, $r * 2,   0, 90)
+    $path.AddArc($pill.X,            $pill.Bottom - $r*2,$r * 2, $r * 2,  90, 90)
+    $path.CloseFigure()
+
+    $prevSmoothing = $e.Graphics.SmoothingMode
+    $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $fillBrush = [System.Drawing.SolidBrush]::new($pillBg)
+    $e.Graphics.FillPath($fillBrush, $path)
+    $fillBrush.Dispose()
+
+    $sf            = [System.Drawing.StringFormat]::new()
+    $sf.Alignment  = 'Center'
+    $sf.LineAlignment = 'Center'
+    $pillFont      = [System.Drawing.Font]::new('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+    $textBrush     = [System.Drawing.SolidBrush]::new($pillFg)
+    $e.Graphics.DrawString($statusText, $pillFont, $textBrush, [System.Drawing.RectangleF]$pill, $sf)
+    $textBrush.Dispose()
+    $pillFont.Dispose()
+    $sf.Dispose()
+    $path.Dispose()
+
+    $e.Graphics.SmoothingMode = $prevSmoothing
+    $e.Handled = $true
+})
 #endregion
+
+# Add controls in the order that yields the visual top→bottom layout
+# (Header → Stats → Toolbar → Grid → StatusBar).  WinForms stacks the
+# LAST-added Dock=Top control closest to the edge, so add top-docked
+# panels in reverse visual order.
+$form.Controls.Add($grid)         # Dock=Fill (added first, behind everything)
+$form.Controls.Add($pnlToolbar)   # Dock=Top — lowest of the top-docked
+$form.Controls.Add($pnlStats)     # Dock=Top — above the toolbar
+$form.Controls.Add($pnlHeader)    # Dock=Top — very top
+$form.Controls.Add($statusStrip)  # Dock=Bottom
 
 $script:AllResults = $null
 $script:FilterText = ''
@@ -735,7 +850,6 @@ function Update-Grid {
 
         $idx = $grid.Rows.Add(
             $r.ComputerName,
-            $(if ($r.Online) { 'Yes' } else { 'No' }),
             $status,
             $r.SignatureVersion,
             $r.AvailableVersion,
@@ -747,12 +861,10 @@ function Update-Grid {
             "$($r.QueryDuration)s",
             $r.Error
         )
-        $row = $grid.Rows[$idx]
-        switch ($status) {
-            'Offline'  { $row.DefaultCellStyle.BackColor = $clrBadBg;  $row.DefaultCellStyle.ForeColor = $clrBadFg }
-            'Outdated' { $row.DefaultCellStyle.BackColor = $clrWarnBg; $row.DefaultCellStyle.ForeColor = $clrWarnFg }
-            'Degraded' { $row.DefaultCellStyle.BackColor = $clrWarnBg; $row.DefaultCellStyle.ForeColor = $clrWarnFg }
-            default    { $row.DefaultCellStyle.BackColor = $clrOkBg;   $row.DefaultCellStyle.ForeColor = $clrOkFg }
+        # Pill badge in the Status column carries the visual indicator;
+        # mute the text on offline rows so they read as deactivated.
+        if ($status -eq 'Offline') {
+            $grid.Rows[$idx].DefaultCellStyle.ForeColor = $clrTextMuted
         }
     }
     $grid.ResumeLayout()
@@ -760,14 +872,20 @@ function Update-Grid {
     $all      = $script:AllResults
     $online   = @($all | Where-Object Online).Count
     $offline  = $all.Count - $online
-    $current  = @($all | Where-Object VersionStatus -eq 'Current').Count
     $outdated = @($all | Where-Object VersionStatus -eq 'Outdated').Count
+    $rtOff    = @($all | Where-Object { $_.RealTimeProtection -eq 'False' -and $_.Online }).Count
 
-    $statTotal.Label.Text    = "Total`r`n$($all.Count)"
-    $statOnline.Label.Text   = "Online`r`n$online"
-    $statOffline.Label.Text  = "Offline`r`n$offline"
-    $statCurrent.Label.Text  = "Current`r`n$current"
-    $statOutdated.Label.Text = "Outdated`r`n$outdated"
+    $statOnline.Number.Text   = "$online"
+    $statOffline.Number.Text  = "$offline"
+    $statOutdated.Number.Text = "$outdated"
+    $statRtOff.Number.Text    = "$rtOff"
+
+    # Refresh the info subline with the latest total
+    $lblInfo.Text = if ($AvailableVersionStr) {
+        "Available Version: v$AvailableVersionStr     Total Systems: $($all.Count)"
+    } else {
+        "Available Version: N/A (no share specified)     Total Systems: $($all.Count)"
+    }
 }
 
 #region Query engine  (Start-ThreadJob + polling Timer — avoids BackgroundWorker runspace issue)
