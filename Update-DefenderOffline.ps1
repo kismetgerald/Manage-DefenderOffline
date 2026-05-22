@@ -654,7 +654,8 @@ function Get-EndpointClassification {
         [string[]]$Computers,
         [string]$Method,
         [string]$WsPattern,
-        [string]$DcPattern
+        [string]$DcPattern,
+        [System.Management.Automation.PSCredential]$ADCredential
     )
 
     $tiers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -667,19 +668,33 @@ function Get-EndpointClassification {
             $adMap = [System.Collections.Generic.Dictionary[string,pscustomobject]]::new([System.StringComparer]::OrdinalIgnoreCase)
             if (Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue) {
                 Import-Module ActiveDirectory -ErrorAction Stop
-                Get-ADComputer -Filter 'Enabled -eq $true' `
-                    -Properties Name, OperatingSystem, userAccountControl `
-                    -ErrorAction SilentlyContinue |
-                ForEach-Object {
+                $adParams = @{
+                    Filter      = 'Enabled -eq $true'
+                    Properties  = 'Name','OperatingSystem','userAccountControl'
+                    ErrorAction = 'SilentlyContinue'
+                }
+                if ($ADCredential) { $adParams.Credential = $ADCredential }
+                Get-ADComputer @adParams | ForEach-Object {
                     $adMap[$_.Name] = [pscustomobject]@{
                         OS   = $_.OperatingSystem
                         IsDC = ($_.userAccountControl -band 0x2000) -ne 0
                     }
                 }
             } else {
-                $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
-                $searcher = [adsisearcher]'(objectCategory=computer)'
-                $searcher.SearchRoot = "LDAP://$domain"
+                # ADSI fallback.  Use DirectoryEntry with explicit creds when
+                # ADCredential is set, mirroring Resolve-TargetComputers.
+                $domain = (Get-CimInstance Win32_ComputerSystem).Domain
+                if ($ADCredential) {
+                    $de = [System.DirectoryServices.DirectoryEntry]::new(
+                        "LDAP://$domain",
+                        $ADCredential.UserName,
+                        $ADCredential.GetNetworkCredential().Password)
+                    $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
+                    $searcher.Filter = '(objectCategory=computer)'
+                } else {
+                    $searcher = [adsisearcher]'(objectCategory=computer)'
+                    $searcher.SearchRoot = "LDAP://$domain"
+                }
                 $searcher.PropertiesToLoad.AddRange(@('name','operatingsystem','useraccountcontrol'))
                 $searcher.PageSize = 1000
                 $searcher.FindAll() | ForEach-Object {
@@ -690,6 +705,7 @@ function Get-EndpointClassification {
                         $adMap[$n] = [pscustomobject]@{ OS = $os; IsDC = ($uac -band 0x2000) -ne 0 }
                     }
                 }
+                if ($ADCredential) { $de.Dispose() }
             }
             foreach ($c in $Computers) {
                 if ($adMap.ContainsKey($c)) {
@@ -943,10 +959,11 @@ if ($ExcludeList.Count -gt 0) {
 # ===================================================================
 Write-Log "Classifying endpoints (method: $ClassificationMethod)..." 'INFO'
 $EndpointTiers = Get-EndpointClassification `
-    -Computers  $TargetComputers `
-    -Method     $ClassificationMethod `
-    -WsPattern  $WorkstationPattern `
-    -DcPattern  $DomainControllerPattern
+    -Computers    $TargetComputers `
+    -Method       $ClassificationMethod `
+    -WsPattern    $WorkstationPattern `
+    -DcPattern    $DomainControllerPattern `
+    -ADCredential $ADCredential
 
 $tierGroups = $EndpointTiers.Values | Group-Object | ForEach-Object { "$($_.Count) $($_.Name)" }
 Write-Log "Tier breakdown : $($tierGroups -join ' | ')" 'INFO'
