@@ -1385,8 +1385,15 @@ if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
         $msg = [System.Net.Mail.MailMessage]::new()
         $msg.From = [System.Net.Mail.MailAddress]::new($From)
         foreach ($recipient in $To) { [void]$msg.To.Add($recipient) }
+        # MailMessage defaults Body/Subject/Headers encoding to ASCII, which
+        # mangles non-ASCII chars (en-dash, em-dash, arrows) in the HTML
+        # report to '?'.  Pin everything to UTF-8 to match the report file
+        # on disk and the <meta charset="utf-8"> in its <head>.
+        $msg.SubjectEncoding = [System.Text.Encoding]::UTF8
+        $msg.BodyEncoding    = [System.Text.Encoding]::UTF8
+        $msg.HeadersEncoding = [System.Text.Encoding]::UTF8
         $msg.Subject     = $subject
-        $msg.Body        = (Get-Content $ReportFile -Raw)
+        $msg.Body        = (Get-Content $ReportFile -Raw -Encoding UTF8)
         $msg.IsBodyHtml  = $true
         foreach ($a in @($ReportFile, $CsvFile)) {
             [void]$msg.Attachments.Add([System.Net.Mail.Attachment]::new($a))
