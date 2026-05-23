@@ -585,9 +585,9 @@ tr:nth-child(even) td { background: #f9f9f9; }
     @"
 <!DOCTYPE html><html lang="en">
 <head><meta charset="utf-8">
-<title>Defender Status – $(Get-Date -f 'yyyy-MM-dd')</title>$css</head>
+<title>Microsoft Defender Antivirus – Fleet Status – $(Get-Date -f 'yyyy-MM-dd')</title>$css</head>
 <body>
-<h1>Microsoft Defender Fleet Status</h1>
+<h1>Microsoft Defender Antivirus – Fleet Status</h1>
 <p><strong>Generated:</strong> $($AsOf.ToString('yyyy-MM-dd HH:mm:ss')) &nbsp;|&nbsp;
 <strong>Available Version:</strong> $(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' }) &nbsp;|&nbsp;
 <strong>Total Systems:</strong> $($Data.Count)</p>
@@ -691,7 +691,7 @@ $pnlHeader.Height    = 84
 $pnlHeader.BackColor = $clrCardBg
 
 $lblTitle            = [System.Windows.Forms.Label]::new()
-$lblTitle.Text       = 'Microsoft Defender Fleet Status'
+$lblTitle.Text       = 'Microsoft Defender Antivirus – Fleet Status'
 $lblTitle.Font       = [System.Drawing.Font]::new('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor  = $clrPrimary
 $lblTitle.AutoSize   = $true

@@ -497,6 +497,12 @@ function Build-DashboardHtml {
 
     $nextRefresh  = $AsOf.AddSeconds($RefreshInterval)
     $secsUntil    = [math]::Max(0, [int]($nextRefresh - (Get-Date)).TotalSeconds)
+    # Meta-refresh fires this many seconds after page load.  Align it
+    # with $secsUntil + 5 so the browser reloads ~5s after the countdown
+    # reaches 0 — instead of the previous hardcoded $RefreshInterval
+    # which could be wildly out of sync (page sat at 'Next refresh: 0s'
+    # for up to 5 minutes before actually reloading).
+    $metaRefreshSecs = [math]::Max(5, $secsUntil + 5)
 
     $rows = foreach ($r in $Data | Sort-Object ComputerName) {
         $status = if (-not $r.Online) { 'Offline' }
@@ -540,8 +546,8 @@ function Build-DashboardHtml {
 <html lang="en" data-theme="$themeAttr">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="$RefreshInterval">
-  <title>Defender Fleet Monitor</title>
+  <meta http-equiv="refresh" content="$metaRefreshSecs">
+  <title>Microsoft Defender Antivirus &#8211; Fleet Status</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxNiAxNic+PHBhdGggZmlsbD0nIzAwNzhkNCcgZD0nTTggMUwyIDN2NWMwIDMuNSAyLjUgNi41IDYgNyAzLjUtLjUgNi0zLjUgNi03VjNMOCAxeicvPjwvc3ZnPg==">
   <script>
     // Early-load: apply per-browser theme preference (if any) BEFORE the
@@ -675,7 +681,7 @@ function Build-DashboardHtml {
 </head>
 <body>
   <div class="topbar">
-    <h1>&#x1F6E1; Defender Fleet Monitor</h1>
+    <h1>&#x1F6E1; Microsoft Defender Antivirus &#8211; Fleet Status</h1>
     <div class="meta">
       <div class="meta-text">
         Available: <strong>$(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' })</strong><br>
