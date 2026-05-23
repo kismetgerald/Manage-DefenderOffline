@@ -95,6 +95,11 @@ param(
 
     [bool]$DisableIPv6 = $true,
 
+    # Default theme applied to /defender when the visiting browser has no
+    # localStorage preference yet.  Operators can pick this in conf/config.conf.
+    [ValidateSet('Dark','Light')]
+    [string]$DashboardTheme = 'Dark',
+
     [string]$ConfigPath
 )
 
@@ -191,6 +196,10 @@ if (-not $PSBoundParameters.ContainsKey('LogPath')         -and $cfg['DashboardL
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelThreads']) { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 if (-not $PSBoundParameters.ContainsKey('DisableIPv6')     -and $cfg['DisableIPv6'])     { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
+if (-not $PSBoundParameters.ContainsKey('DashboardTheme')  -and $cfg['DashboardTheme'])  {
+    $t = $cfg['DashboardTheme'].Trim()
+    if ($t -match '^(?i)light$|^(?i)dark$') { $DashboardTheme = (Get-Culture).TextInfo.ToTitleCase($t.ToLower()) }
+}
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -474,8 +483,12 @@ function Build-DashboardHtml {
         [object[]]$Data,
         [string]$AvailableVersionStr,
         [datetime]$AsOf,
-        [bool]$IsRefreshing
+        [bool]$IsRefreshing,
+        [ValidateSet('Dark','Light')]
+        [string]$Theme = 'Dark'
     )
+
+    $themeAttr = if ($Theme -eq 'Light') { 'light' } else { 'dark' }
 
     $onlineCount  = @($Data | Where-Object Online).Count
     $offlineCount = $Data.Count - $onlineCount
@@ -500,7 +513,12 @@ function Build-DashboardHtml {
             " title=`"$($r.Error -replace '"','&quot;' -replace '<','&lt;' -replace '>','&gt;')`""
         } else { '' }
 
-        "<tr>
+        # Data attributes drive client-side card-click filtering
+        $isOnline   = if ($r.Online) { 'true' } else { 'false' }
+        $isOutdated = if ($r.VersionStatus -eq 'Outdated') { 'true' } else { 'false' }
+        $isRtOff    = if ($r.RealTimeProtection -eq 'False' -and $r.Online) { 'true' } else { 'false' }
+
+        "<tr data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`">
           <td$tip>$($r.ComputerName)</td>
           <td>$badge</td>
           <td>$($r.SignatureVersion)</td>
@@ -519,85 +537,174 @@ function Build-DashboardHtml {
 
     @"
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="$themeAttr">
 <head>
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="$RefreshInterval">
   <title>Defender Fleet Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxNiAxNic+PHBhdGggZmlsbD0nIzAwNzhkNCcgZD0nTTggMUwyIDN2NWMwIDMuNSAyLjUgNi41IDYgNyAzLjUtLjUgNi0zLjUgNi03VjNMOCAxeicvPjwvc3ZnPg==">
+  <script>
+    // Early-load: apply per-browser theme preference (if any) BEFORE the
+    // stylesheet renders, so we never flash the server-side default and
+    // then snap to the user's choice.
+    (function() {
+      try {
+        var t = localStorage.getItem('mdo-dashboard-theme');
+        if (t === 'light' || t === 'dark') {
+          document.documentElement.setAttribute('data-theme', t);
+        }
+      } catch(e) {}
+    })();
+  </script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: "Segoe UI", Arial, sans-serif; background: #1e1e2e; color: #cdd6f4; min-height: 100vh; }
 
-    .topbar { background: #313244; padding: 14px 28px; display: flex; align-items: center;
-              justify-content: space-between; border-bottom: 2px solid #45475a; }
-    .topbar h1 { font-size: 1.25em; color: #cba6f7; font-weight: 700; }
-    .topbar .meta { font-size: .82em; color: #a6adc8; text-align: right; line-height: 1.6; }
-    .topbar .meta a { color: #89b4fa; text-decoration: none; }
+    /* Dark is the implicit base.  data-theme="light" overrides below. */
+    :root {
+      --bg-page: #1e1e2e;
+      --bg-elev: #313244;
+      --bg-input: #45475a;
+      --bg-input-hover: #585b70;
+      --bg-row-hover: rgba(255,255,255,.04);
+      --text-primary: #cdd6f4;
+      --text-muted: #a6adc8;
+      --text-faint: #6c7086;
+      --accent: #cba6f7;
+      --link: #89b4fa;
+      --border: #45475a;
+      --border-strong: #585b70;
+      --th-bg: #45475a;
+      --th-text: #cba6f7;
+      /* Status colours — identical in both themes for visual continuity
+         with the Forms GUI and HTML report. */
+      --c-online-bg:   #107c10; --c-online-fg:   #ffffff;
+      --c-offline-bg:  #d13438; --c-offline-fg:  #ffffff;
+      --c-outdated-bg: #fab387; --c-outdated-fg: #1e1e2e;
+      --c-rtoff-bg:    #f9e2af; --c-rtoff-fg:    #1e1e2e;
+      --c-degraded-bg: #b8860b; --c-degraded-fg: #ffffff;
+    }
+    [data-theme="light"] {
+      --bg-page: #f5f7fa;
+      --bg-elev: #ffffff;
+      --bg-input: #ffffff;
+      --bg-input-hover: #f1f5f9;
+      --bg-row-hover: rgba(0,120,212,.04);
+      --text-primary: #333333;
+      --text-muted: #888888;
+      --text-faint: #aaaaaa;
+      --accent: #0078d4;
+      --link: #0078d4;
+      --border: #e8e8e8;
+      --border-strong: #d1d5db;
+      --th-bg: #0078d4;
+      --th-text: #ffffff;
+    }
+
+    body { font-family: "Segoe UI", Arial, sans-serif; background: var(--bg-page);
+           color: var(--text-primary); min-height: 100vh; }
+
+    .topbar { background: var(--bg-elev); padding: 14px 28px; display: flex;
+              align-items: center; justify-content: space-between;
+              border-bottom: 3px solid var(--accent); }
+    .topbar h1 { font-size: 1.25em; color: var(--accent); font-weight: 700; }
+    .topbar .meta { font-size: .82em; color: var(--text-muted); text-align: right;
+                    line-height: 1.6; display: flex; align-items: center; gap: 14px; }
+    .topbar .meta .meta-text { text-align: right; }
+    .topbar .meta a { color: var(--link); text-decoration: none; }
     .topbar .meta a:hover { text-decoration: underline; }
+
+    .theme-toggle { background: transparent; border: 1px solid var(--border-strong);
+                    color: var(--text-primary); cursor: pointer; padding: 6px 10px;
+                    border-radius: 6px; font-size: 1.1em; line-height: 1; }
+    .theme-toggle:hover { background: var(--bg-input-hover); }
 
     .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
              padding: 20px 28px 8px; }
-    .stat { background: #313244; border-radius: 10px; padding: 14px 18px; border-left: 4px solid transparent; }
-    .stat .lbl { font-size: .78em; color: #a6adc8; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .05em; }
+    .stat { border-radius: 10px; padding: 14px 18px; cursor: pointer;
+            border: 3px solid transparent; transition: filter .12s;
+            user-select: none; }
+    .stat:hover { filter: brightness(1.06); }
+    .stat.active { filter: brightness(.78); box-shadow: inset 0 0 0 3px rgba(0,0,0,.35); }
+    .stat .lbl { font-size: .78em; margin-bottom: 6px; text-transform: uppercase;
+                 letter-spacing: .05em; font-weight: 700; }
     .stat .val { font-size: 2em; font-weight: 800; line-height: 1; }
-    .st-online  { border-color: #a6e3a1; } .st-online  .val { color: #a6e3a1; }
-    .st-offline { border-color: #f38ba8; } .st-offline .val { color: #f38ba8; }
-    .st-out     { border-color: #fab387; } .st-out     .val { color: #fab387; }
-    .st-rt      { border-color: #f9e2af; } .st-rt      .val { color: #f9e2af; }
+    .st-online  { background: var(--c-online-bg);   color: var(--c-online-fg); }
+    .st-offline { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
+    .st-out     { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
+    .st-rt      { background: var(--c-rtoff-bg);    color: var(--c-rtoff-fg); }
 
-    .toolbar { padding: 10px 28px; display: flex; align-items: center; gap: 10px; }
-    .toolbar input { background: #45475a; border: 1px solid #585b70; color: #cdd6f4;
-                     padding: 7px 12px; border-radius: 6px; font-size: .88em; width: 240px; }
-    .toolbar a.btn { background: #45475a; color: #cdd6f4; padding: 7px 16px; border-radius: 6px;
-                     text-decoration: none; font-size: .85em; border: 1px solid #585b70; }
-    .toolbar a.btn:hover { background: #585b70; }
+    .toolbar { padding: 12px 28px; display: flex; align-items: center; gap: 10px; }
+    .toolbar input { background: var(--bg-input); border: 1px solid var(--border-strong);
+                     color: var(--text-primary); padding: 7px 12px; border-radius: 6px;
+                     font-size: .88em; width: 240px; }
+    .toolbar input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    .toolbar a.btn { background: var(--accent); color: #ffffff; padding: 7px 16px;
+                     border-radius: 6px; text-decoration: none; font-size: .85em;
+                     border: 1px solid var(--accent); font-weight: 600; }
+    .toolbar a.btn:hover { filter: brightness(1.08); }
+    .toolbar .clear-filter { color: var(--link); font-size: .82em; text-decoration: none;
+                             margin-left: auto; display: none; }
+    .toolbar .clear-filter.visible { display: inline-block; }
+    .toolbar .clear-filter:hover { text-decoration: underline; }
 
-    .banner { background: #45475a; color: #f9e2af; text-align: center; padding: 6px;
-              font-size: .85em; margin: 0 28px 8px; border-radius: 6px; }
+    .banner { background: var(--c-outdated-bg); color: var(--c-outdated-fg);
+              text-align: center; padding: 6px; font-size: .85em;
+              margin: 0 28px 8px; border-radius: 6px; font-weight: 600; }
 
     .wrap { padding: 0 28px 32px; overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; background: #313244; border-radius: 10px; overflow: hidden; }
-    th { background: #45475a; color: #cba6f7; padding: 11px 14px; text-align: left;
-         font-size: .82em; font-weight: 700; cursor: pointer; user-select: none;
-         white-space: nowrap; }
-    th:hover { background: #585b70; }
-    td { padding: 10px 14px; border-bottom: 1px solid #45475a; font-size: .88em; }
+    table { width: 100%; border-collapse: collapse; background: var(--bg-elev);
+            border-radius: 10px; overflow: hidden; }
+    th { background: var(--th-bg); color: var(--th-text); padding: 11px 14px;
+         text-align: left; font-size: .82em; font-weight: 700; cursor: pointer;
+         user-select: none; white-space: nowrap; }
+    th:hover { filter: brightness(.92); }
+    td { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: .88em; }
     tr:last-child td { border-bottom: none; }
-    tr:hover td { background: rgba(255,255,255,.04); }
+    tr:hover td { background: var(--bg-row-hover); }
 
-    .badge { display: inline-block; padding: 2px 10px; border-radius: 10px;
+    .badge { display: inline-block; padding: 3px 12px; border-radius: 12px;
              font-size: .78em; font-weight: 700; }
-    .b-ok  { background: #a6e3a1; color: #1e3a1e; }
-    .b-off { background: #f38ba8; color: #1e1e2e; }
-    .b-out { background: #fab387; color: #1e1e2e; }
-    .b-deg { background: #f9e2af; color: #1e1e2e; }
+    .b-ok  { background: var(--c-online-bg);   color: var(--c-online-fg); }
+    .b-off { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
+    .b-out { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
+    .b-deg { background: var(--c-degraded-bg); color: var(--c-degraded-fg); }
 
-    .footer { text-align: center; padding: 16px 28px; font-size: .78em; color: #6c7086;
-              border-top: 1px solid #313244; }
+    .footer { text-align: center; padding: 16px 28px; font-size: .78em;
+              color: var(--text-faint); border-top: 1px solid var(--border); }
   </style>
 </head>
 <body>
   <div class="topbar">
     <h1>&#x1F6E1; Defender Fleet Monitor</h1>
     <div class="meta">
-      Available: <strong>$(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' })</strong><br>
-      Last data: <strong>$($AsOf.ToString('yyyy-MM-dd HH:mm:ss'))</strong> &nbsp;|&nbsp;
-      Next refresh in: <strong id="countdown">$secsUntil</strong>s &nbsp;|&nbsp;
-      <a href="/refresh">Force Refresh</a> &nbsp;|&nbsp;
-      <a href="/status" target="_blank">JSON</a>
+      <div class="meta-text">
+        Available: <strong>$(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' })</strong><br>
+        Last data: <strong>$($AsOf.ToString('yyyy-MM-dd HH:mm:ss'))</strong> &nbsp;|&nbsp;
+        Next refresh in: <strong id="countdown">$secsUntil</strong>s &nbsp;|&nbsp;
+        <a href="/refresh">Force Refresh</a> &nbsp;|&nbsp;
+        <a href="/status" target="_blank">JSON</a>
+      </div>
+      <button type="button" class="theme-toggle" id="themeToggle"
+              onclick="toggleTheme()" title="Switch theme">&#9728;</button>
     </div>
   </div>
 
   <div class="stats">
-    <div class="stat st-online">  <div class="lbl">Online</div>  <div class="val">$onlineCount</div></div>
-    <div class="stat st-offline"> <div class="lbl">Offline</div> <div class="val">$offlineCount</div></div>
-    <div class="stat st-out">     <div class="lbl">Outdated</div><div class="val">$outdated</div></div>
-    <div class="stat st-rt">      <div class="lbl">RT Prot Off</div><div class="val">$rtOff</div></div>
+    <div class="stat st-online"  data-card="online"   onclick="filterByCard('online')">
+      <div class="lbl">Online</div><div class="val">$onlineCount</div></div>
+    <div class="stat st-offline" data-card="offline"  onclick="filterByCard('offline')">
+      <div class="lbl">Offline</div><div class="val">$offlineCount</div></div>
+    <div class="stat st-out"     data-card="outdated" onclick="filterByCard('outdated')">
+      <div class="lbl">Outdated</div><div class="val">$outdated</div></div>
+    <div class="stat st-rt"      data-card="rtoff"    onclick="filterByCard('rtoff')">
+      <div class="lbl">RT Prot Off</div><div class="val">$rtOff</div></div>
   </div>
 
   <div class="toolbar">
     <input type="text" id="filter" placeholder="Filter by computer name…" oninput="applyFilter()">
     <a href="/refresh" class="btn">&#x21BB; Refresh Now</a>
+    <a href="#" class="clear-filter" id="clearFilter"
+       onclick="clearAllFilters(); return false;">Clear filters</a>
   </div>
 
   $refreshingBanner
@@ -627,6 +734,69 @@ function Build-DashboardHtml {
   </div>
 
   <script>
+    // Theme handling.  The <head> early-load script already applied the
+    // localStorage preference (if any), so here we just sync the button
+    // icon and provide the toggle action.
+    function syncThemeButton() {
+      var t = document.documentElement.getAttribute('data-theme') || 'dark';
+      var btn = document.getElementById('themeToggle');
+      if (!btn) return;
+      // Sun (&#9728;) = currently dark, click for light
+      // Moon (&#127769;) = currently light, click for dark
+      btn.innerHTML = t === 'light' ? '&#127769;' : '&#9728;';
+      btn.title     = t === 'light' ? 'Switch to dark mode' : 'Switch to light mode';
+    }
+    function toggleTheme() {
+      var current = document.documentElement.getAttribute('data-theme') || 'dark';
+      var next    = current === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      try { localStorage.setItem('mdo-dashboard-theme', next); } catch(e) {}
+      syncThemeButton();
+    }
+    syncThemeButton();
+
+    // Card-click filtering — same behaviour as the HTML report.
+    var activeCard = null;
+    function filterByCard(key) {
+      activeCard = (activeCard === key) ? null : key;
+      var cards = document.querySelectorAll('.stat');
+      for (var i = 0; i < cards.length; i++) {
+        if (cards[i].dataset.card === activeCard) cards[i].classList.add('active');
+        else cards[i].classList.remove('active');
+      }
+      applyFilter();
+    }
+    function clearAllFilters() {
+      activeCard = null;
+      var cards = document.querySelectorAll('.stat');
+      for (var i = 0; i < cards.length; i++) cards[i].classList.remove('active');
+      document.getElementById('filter').value = '';
+      applyFilter();
+    }
+    function updateClearVisibility() {
+      var has = (activeCard !== null) || (document.getElementById('filter').value.length > 0);
+      var cf  = document.getElementById('clearFilter');
+      if (cf) cf.classList.toggle('visible', has);
+    }
+
+    // Combined text-filter + card-filter applied to every row
+    function applyFilter() {
+      var q = document.getElementById('filter').value.toLowerCase();
+      var rows = document.getElementById('tbl').tBodies[0].rows;
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        var name = row.cells[0] ? row.cells[0].innerText.toLowerCase() : '';
+        var nameMatch = name.indexOf(q) !== -1;
+        var cardMatch = true;
+        if      (activeCard === 'online')   cardMatch = row.dataset.online   === 'true';
+        else if (activeCard === 'offline')  cardMatch = row.dataset.online   === 'false';
+        else if (activeCard === 'outdated') cardMatch = row.dataset.outdated === 'true';
+        else if (activeCard === 'rtoff')    cardMatch = row.dataset.rtoff    === 'true';
+        row.style.display = (nameMatch && cardMatch) ? '' : 'none';
+      }
+      updateClearVisibility();
+    }
+
     // Countdown timer
     var secs = $secsUntil;
     setInterval(function() {
@@ -634,16 +804,6 @@ function Build-DashboardHtml {
       var el = document.getElementById('countdown');
       if (el) el.textContent = secs;
     }, 1000);
-
-    // Filter
-    function applyFilter() {
-      var q = document.getElementById('filter').value.toLowerCase();
-      var rows = document.getElementById('tbl').tBodies[0].rows;
-      for (var i = 0; i < rows.length; i++) {
-        var name = rows[i].cells[0] ? rows[i].cells[0].innerText.toLowerCase() : '';
-        rows[i].style.display = name.includes(q) ? '' : 'none';
-      }
-    }
 
     // Sort
     var sortDir = {};
@@ -915,7 +1075,8 @@ try {
                     -Data               $script:CachedResults `
                     -AvailableVersionStr $AvailableVersionStr `
                     -AsOf               $script:CachedAt `
-                    -IsRefreshing       $script:IsRefreshing
+                    -IsRefreshing       $script:IsRefreshing `
+                    -Theme              $DashboardTheme
                 Send-HttpResponse -Context $context -Body $html
             }
 
