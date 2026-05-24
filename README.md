@@ -40,7 +40,7 @@
 - ☐ **WinRM enabled** on target computers (TCP port 5985)
 - ☐ **Network share** with definitions in the required folder structure (see below)
 - ☐ **Firewall rules** allow TCP 5985 between the admin machine and all targets
-- ☐ **Domain membership** OR ActiveDirectory PowerShell module (for auto-discovery)
+- ☐ **Active Directory** *(optional — only required for hosts.conf auto-discovery and gMSA service identity; workgroup deployments are fully supported, see [Workgroup deployments](#workgroup-deployments) below)*
 
 ### Quick Environment Test
 
@@ -152,6 +152,41 @@ Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
 
 # Windows Server
 Install-WindowsFeature -Name RSAT-AD-PowerShell
+```
+
+---
+
+## Workgroup deployments
+
+The toolkit runs fine on workgroup-joined machines. Three constraints apply versus a domain deployment:
+
+| Constraint | Workaround |
+|---|---|
+| No AD auto-discovery | Maintain `hosts.conf` manually (plain text, one computer name or IP per line). The script auto-creates an empty template on first run; just add your targets. |
+| No tiered credential classification | The script auto-detects workgroup and defaults to `ClassificationMethod = Single`. Supply one WinRM credential via `-Credential`, or save it once with `.\Update-DefenderOffline.ps1 -SaveCredential`. |
+| gMSA service identity unavailable | Use a traditional local account when installing the dashboard service (`-ServiceAccount` + `-Credential` instead of `-GmsaName`). The same account must exist as a local administrator on each target. |
+
+**One-time WinRM trust setup on the admin machine:**
+
+```powershell
+# Trust all target hostnames (use the wildcard or list them explicitly)
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value "TARGET01,TARGET02,*.lab.local" -Concatenate -Force
+Restart-Service WinRM
+```
+
+**On each target:** enable PSRemoting and ensure the local admin account you'll use is reachable:
+
+```powershell
+Enable-PSRemoting -Force
+# Verify the account you'll use has local admin rights
+Get-LocalGroupMember -Group Administrators
+```
+
+**Example workgroup update run:**
+
+```powershell
+$cred = Get-Credential -UserName "TARGET01\LocalAdmin" -Message "Local admin password"
+.\Update-DefenderOffline.ps1 -Credential $cred
 ```
 
 ---
