@@ -500,7 +500,10 @@ try {
     }
 
     Register-ScheduledTask @registerParams | Out-Null
-    Write-Ok "Task registered: $TaskFolder$TaskName"
+    # $TaskFolder may or may not have a trailing '\'; ensure exactly one
+    # separator between folder and task name in display output.
+    $fullTaskPath = if ($TaskFolder.EndsWith('\')) { "$TaskFolder$TaskName" } else { "$TaskFolder\$TaskName" }
+    Write-Ok "Task registered: $fullTaskPath"
 } catch {
     Write-Fail "Failed to register scheduled task: $($_.Exception.Message)"
     exit 1
@@ -514,19 +517,24 @@ if ($AddFirewallRule) {
     $ruleName = "DefenderDashboard-TCP-$Port"
     $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
     if ($existing -and -not $Force) {
-        Write-Warn "Firewall rule '$ruleName' already exists – skipping."
+        Write-Warn "Firewall rule '$ruleName' already exists – skipping. (Re-run with -Force to replace.)"
     } else {
         try {
+            if ($existing) {
+                Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction Stop
+                Write-Info "Removed existing rule '$ruleName' (replacing because -Force was specified)."
+            }
+            # New-NetFirewallRule has no -Force parameter; -Enabled takes
+            # the string 'True'/'False', not [bool] $true/$false.
             New-NetFirewallRule `
-                -DisplayName  $ruleName `
-                -Description  "Allows inbound HTTP traffic to the Defender Fleet Dashboard on TCP $Port" `
-                -Direction    Inbound `
-                -Protocol     TCP `
-                -LocalPort    $Port `
-                -Action       Allow `
-                -Profile      Domain, Private `
-                -Enabled      True `
-                -Force | Out-Null
+                -DisplayName $ruleName `
+                -Description "Allows inbound HTTP traffic to the Defender Fleet Dashboard on TCP $Port" `
+                -Direction   Inbound `
+                -Protocol    TCP `
+                -LocalPort   $Port `
+                -Action      Allow `
+                -Profile     Domain, Private `
+                -Enabled     True | Out-Null
             Write-Ok "Firewall rule created: $ruleName (TCP $Port, Domain+Private profiles)"
         } catch {
             Write-Warn "Could not create firewall rule: $($_.Exception.Message)"
@@ -580,15 +588,29 @@ if ($StartImmediately) {
             Write-Ok "Dashboard started on port $actualPort"
         }
 
-        # Secondary confirmation: HTTP health probe
-        try {
-            $resp = Invoke-WebRequest -Uri "http://localhost:$actualPort/health" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-            if ($resp.StatusCode -eq 200) {
-                Write-Ok "HTTP health probe passed: http://localhost:$actualPort/health → 200 OK"
+        # Secondary confirmation: HTTP health probe. The dashboard runs the
+        # initial fleet collection synchronously *after* HttpListener.Start()
+        # but *before* entering the request loop, so /health does not respond
+        # until that initial pass completes (~0.5s per host). Retry up to 6
+        # times with a 10-second per-probe timeout to give large fleets room.
+        $probeOk    = $false
+        $lastErr    = $null
+        $probeStart = Get-Date
+        for ($i = 1; $i -le 6; $i++) {
+            try {
+                $resp = Invoke-WebRequest -Uri "http://localhost:$actualPort/health" -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+                if ($resp.StatusCode -eq 200) { $probeOk = $true; break }
+            } catch {
+                $lastErr = $_.Exception.Message
+                Start-Sleep -Seconds 5
             }
-        } catch {
-            Write-Warn "Status file present but /health probe failed: $($_.Exception.Message)"
-            Write-Info "The listener may still be initialising; try again in a few seconds."
+        }
+        $elapsed = [int]((Get-Date) - $probeStart).TotalSeconds
+        if ($probeOk) {
+            Write-Ok "HTTP health probe passed after ${elapsed}s: http://localhost:$actualPort/health → 200 OK"
+        } else {
+            Write-Warn "Status file present but /health probe failed after ${elapsed}s of retries: $lastErr"
+            Write-Info "Initial fleet collection may still be running for a large fleet. Check the dashboard log: $LogPath"
         }
     } else {
         Write-Warn "Dashboard did not write a status file within 45 seconds."
@@ -606,7 +628,7 @@ Write-Host "  ============================================================" -For
 Write-Host "   Installation Complete" -ForegroundColor Magenta
 Write-Host "  ============================================================" -ForegroundColor Magenta
 Write-Host ""
-Write-Host "  Task name    : $TaskFolder$TaskName" -ForegroundColor White
+Write-Host "  Task name    : $fullTaskPath" -ForegroundColor White
 Write-Host "  Identity     : $identityLabel" -ForegroundColor White
 if ($portResult.IsFallback) {
     Write-Host "  Port         : $Port  " -NoNewline -ForegroundColor Yellow
@@ -619,11 +641,12 @@ Write-Host "  JSON status  : http://<this-host>:$Port/status" -ForegroundColor W
 Write-Host "  Health probe : http://<this-host>:$Port/health" -ForegroundColor White
 Write-Host "  Logs         : $LogPath" -ForegroundColor White
 Write-Host ""
+$pathArg = if ($TaskFolder -eq '\') { '' } else { " -TaskPath '$TaskFolder'" }
 Write-Host "  Useful commands:" -ForegroundColor Cyan
-Write-Host "    Start  : Start-ScheduledTask -TaskName '$TaskName'" -ForegroundColor Gray
-Write-Host "    Stop   : Stop-ScheduledTask  -TaskName '$TaskName'" -ForegroundColor Gray
-Write-Host "    Status : Get-ScheduledTask   -TaskName '$TaskName' | Select-Object State,LastRunTime,LastTaskResult" -ForegroundColor Gray
-Write-Host "    Remove : Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false" -ForegroundColor Gray
+Write-Host "    Start  : Start-ScheduledTask -TaskName '$TaskName'$pathArg" -ForegroundColor Gray
+Write-Host "    Stop   : Stop-ScheduledTask  -TaskName '$TaskName'$pathArg" -ForegroundColor Gray
+Write-Host "    Status : Get-ScheduledTask   -TaskName '$TaskName'$pathArg | Select-Object State,LastRunTime,LastTaskResult" -ForegroundColor Gray
+Write-Host "    Remove : Unregister-ScheduledTask -TaskName '$TaskName'$pathArg -Confirm:`$false" -ForegroundColor Gray
 Write-Host ""
 
 # ===================================================================
