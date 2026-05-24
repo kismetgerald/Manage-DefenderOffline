@@ -893,6 +893,7 @@ Write-DashLog "=== Defender Dashboard v$ScriptVersion starting ===" 'SUCCESS'
 Write-DashLog "Port            : $Port"
 Write-DashLog "Refresh interval: ${RefreshInterval}s"
 Write-DashLog "Parallel threads: $ParallelThreads"
+Write-DashLog "Default theme   : $DashboardTheme"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 
