@@ -442,14 +442,16 @@ $action = New-ScheduledTaskAction `
 # Trigger: at system startup
 $trigger = New-ScheduledTaskTrigger -AtStartup
 
-# Settings: run indefinitely, restart on failure, no concurrent instances
+# Settings: run indefinitely, restart on failure, no concurrent instances.
+# -StartWhenAvailable is a [switch]; PS treats `-Switch $true` as a positional
+# argument, so use presence-only form. -RunOnlyIfNetworkAvailable defaults to
+# $false (omit it).
 $settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit       ([timespan]::Zero) `
-    -MultipleInstances        IgnoreNew `
-    -StartWhenAvailable       $true `
-    -RunOnlyIfNetworkAvailable $false `
-    -RestartCount             3 `
-    -RestartInterval          ([timespan]::FromMinutes(1))
+    -ExecutionTimeLimit  ([timespan]::Zero) `
+    -MultipleInstances   IgnoreNew `
+    -StartWhenAvailable `
+    -RestartCount        3 `
+    -RestartInterval     ([timespan]::FromMinutes(1))
 
 # Principal
 if ($isGmsa) {
