@@ -164,25 +164,38 @@ All scripts read `conf\config.conf` at startup. **Command-line parameters always
 # conf\config.conf — example values
 
 [Common]
-SourceSharePath = \\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender
-ParallelThreads = 16
-TimeoutSeconds  = 30
-LogPath         = C:\Logs
+SourceSharePath  = \\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender
+ExcludeComputers =                      ← comma-separated; skip these endpoints entirely
+ParallelThreads  = 16
+TimeoutSeconds   = 30
+LogPath          = C:\Logs
+DisableIPv6      = true                 ← drops unreachable-host detection from ~21s to ~3s
 
 [Update]
 TempFolderOnTarget = C:\Temp\Update-DefenderOffline
-LogSharePath       =                    ← leave blank to disable
+LogSharePath       =                    ← leave blank to disable centralised log collection
 ReportPath         = .\Reports
 
 [Dashboard]
 Port            = 8080
-FallbackPort    = 8090
+FallbackPort    = 8090                  ← 8443 is commonly taken (Tomcat, Splunk); 8090 is safer
 RefreshInterval = 300                   ← seconds
+DashboardTheme  = Dark                  ← Dark | Light (per-browser toggle overrides this default)
+
+[Install]
+TaskName   = DefenderDashboard
+TaskFolder = \                          ← e.g. \Security to keep tasks organised
+
+[Credentials]
+ClassificationMethod    =               ← AD | Pattern | Single (auto-detected if blank)
+WorkstationPattern      = ^(DESKTOP|LAPTOP|WS|WIN10|WIN11)
+DomainControllerPattern = ^DC
 
 [Email]
 SendEmail  = false
 SmtpServer =
 SmtpPort   = 25
+SmtpUseSsl = false
 EmailFrom  = DefenderUpdate@contoso.com
 EmailTo    =
 ```
@@ -204,7 +217,18 @@ See `conf\config.conf` for full documentation of every setting.
 | `-LogPath` | `C:\Logs` | Local log directory |
 | `-ReportPath` | `.\Reports` | HTML and CSV report output directory |
 | `-ParallelThreads` | `16` | Max concurrent threads (PS 7+ only, range 1–32) |
+| `-DisableIPv6` | `$true` | Skip IPv6 in reachability tests (drops unreachable-host detection from ~21s to ~3s on LANs that advertise AAAA but don't route IPv6) |
 | `-WhatIfMode` | `$false` | Dry-run — no changes made |
+| `-Credential` | *(caller context)* | Single WinRM credential for all endpoints when classification isn't needed |
+| `-WorkstationCredential` | — | Tier-specific WinRM credential for workstations (used with classification) |
+| `-ServerCredential` | — | Tier-specific WinRM credential for member servers |
+| `-DomainControllerCredential` | — | Tier-specific WinRM credential for domain controllers |
+| `-SaveCredential` | — | Interactive helper; saves WinRM credentials to `conf\*.xml` (DPAPI per-user + per-machine) |
+| `-ADCredential` | *(caller context)* | Credential for AD auto-discovery — required in STIG-hardened environments where the running account lacks AD read rights |
+| `-SaveADCredential` | — | Interactive helper; saves AD credential to `conf\ADCredential.xml` |
+| `-ClassificationMethod` | `AD` *(or `Single` off-domain)* | How to classify endpoints into credential tiers: `AD`, `Pattern`, or `Single` |
+| `-WorkstationPattern` | *(see config)* | Regex for workstation hostnames (used with `-ClassificationMethod Pattern`) |
+| `-DomainControllerPattern` | `^DC` | Regex for DC hostnames (used with `-ClassificationMethod Pattern`) |
 | `-SendEmail` | `$false` | Enable email notification after each run |
 | `-SmtpServer` | *(required if -SendEmail)* | SMTP server address |
 | `-SmtpPort` | `25` | SMTP port |
@@ -212,7 +236,7 @@ See `conf\config.conf` for full documentation of every setting.
 | `-From` | `DefenderUpdate@contoso.com` | Sender address |
 | `-To` | *(required if -SendEmail)* | Recipient address(es) |
 | `-SmtpCredential` | *(optional)* | PSCredential for SMTP authentication |
-| `-SaveSmtpCredential` | — | Interactive helper; saves encrypted credentials to `.\Config\SmtpCredential.xml` |
+| `-SaveSmtpCredential` | — | Interactive helper; saves encrypted SMTP credentials to `.\Config\SmtpCredential.xml` |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
 ### Email Setup
@@ -291,7 +315,7 @@ Opens a live Windows Forms dashboard showing the Defender health status of all e
 .\Show-DefenderStatus.ps1
 ```
 
-**Features:** Colour-coded data grid (green = healthy, amber = outdated/degraded, red = offline) · Stat cards · Name filter · Manual and auto-refresh (5 min) · Export CSV · Export HTML
+**Features:** Fluent-style dark theme matching the HTML report · Colour-coded badges (Healthy / Outdated / Degraded / Offline) · **Clickable stat cards** filter the grid (Online / Offline / Outdated / RT Prot Off) · Name filter · Live query-progress counter (`12/33`) · Manual refresh + auto-refresh with countdown timer · Export CSV · Export HTML
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -299,6 +323,12 @@ Opens a live Windows Forms dashboard showing the Defender health status of all e
 | `-ComputerName` | *(auto-discover)* | Query specific computers only |
 | `-ParallelThreads` | `16` | Concurrent WinRM queries (PS 7+) |
 | `-TimeoutSeconds` | `30` | Per-host query timeout |
+| `-DisableIPv6` | `$true` | Skip IPv6 in reachability tests (see Update reference) |
+| `-Credential` / `-WorkstationCredential` / `-ServerCredential` / `-DomainControllerCredential` | — | Same tiered WinRM credential model as `Update-DefenderOffline.ps1` |
+| `-SaveCredential` | — | Interactive helper; saves WinRM credentials to `conf\*.xml` |
+| `-ADCredential` | *(caller context)* | AD-bind credential for hosts.conf auto-discovery in STIG environments |
+| `-SaveADCredential` | — | Interactive helper; saves AD credential to `conf\ADCredential.xml` |
+| `-ClassificationMethod` / `-WorkstationPattern` / `-DomainControllerPattern` | — | Same classification model as `Update-DefenderOffline.ps1` |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
 ---
@@ -311,12 +341,14 @@ Headless HTTP server that serves a self-refreshing browser dashboard. Designed t
 
 | Path | Response |
 |---|---|
-| `/defender` | HTML dashboard (auto-refreshes every `RefreshInterval` seconds) |
+| `/defender` | HTML dashboard with **clickable stat cards** (Online / Offline / Outdated / RT Prot Off filter the table), **light/dark theme toggle** (☀/☾) persisted per-browser via `localStorage`, and meta-refresh aligned with the data-refresh countdown |
 | `/status` | JSON snapshot of current fleet data |
 | `/health` | Plain-text `OK` liveness probe |
 | `/refresh` | Forces immediate background data refresh; redirects to `/defender` |
 
 **Port fallback:** If the configured port is in use at startup, the script automatically tries `FallbackPort` and up to 9 sequential candidates. The actual bound port is written to `conf\dashboard.status` so admins and monitoring tools can always discover it. A Windows Event Log Warning (EventId 101) is also written when a fallback fires.
+
+**Theme priority:** Browser `localStorage` (per-user, persists across visits) > `DashboardTheme` in config.conf (server-supplied default) > script default `Dark`.
 
 ```powershell
 # Run interactively for testing
@@ -328,13 +360,19 @@ Headless HTTP server that serves a self-refreshing browser dashboard. Designed t
 | Parameter | Default | Description |
 |---|---|---|
 | `-Port` | `8080` | Primary HTTP port |
-| `-FallbackPort` | `8443` | First fallback candidate if primary is in use |
+| `-FallbackPort` | `8443` | First fallback candidate if primary is in use (config.conf ships `8090` because 8443 collides with Tomcat/Splunk/etc.) |
 | `-RefreshInterval` | `300` | Data refresh interval in seconds |
 | `-LogPath` | `C:\Logs\DefenderDashboard` | Service log directory |
 | `-SourceSharePath` | *(config)* | Enables version currency comparison |
 | `-ComputerName` | *(auto-discover)* | Query specific computers only |
 | `-ParallelThreads` | `16` | Concurrent WinRM queries per refresh cycle |
 | `-TimeoutSeconds` | `30` | Per-host query timeout |
+| `-DisableIPv6` | `$true` | Skip IPv6 in reachability tests |
+| `-DashboardTheme` | `Dark` | Default theme served to first-time visitors: `Dark` or `Light` |
+| `-Credential` | *(caller context)* | WinRM credential for endpoint queries |
+| `-SaveCredential` | — | Interactive helper; saves WinRM credential to `conf\WinRmCredential.xml` (run once under the service identity) |
+| `-ADCredential` | *(caller context)* | AD-bind credential for hosts.conf auto-discovery in STIG environments |
+| `-SaveADCredential` | — | Interactive helper; saves AD credential to `conf\ADCredential.xml` |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
 ---
@@ -384,16 +422,26 @@ $cred = Get-Credential -UserName "CONTOSO\svc-defender" -Message "Service accoun
 | `-TaskFolder` | `\` | Task Scheduler folder |
 | `-AddFirewallRule` | — | Create inbound TCP rule for the dashboard port |
 | `-StartImmediately` | — | Start task after registration and verify via status file |
-| `-Force` | — | Overwrite existing task without prompting |
+| `-Force` | — | Overwrite existing task without prompting; replaces existing firewall rule if `-AddFirewallRule` is supplied |
+| `-SaveCredential` | — | Pass-through to `Start-DefenderDashboard.ps1`; saves WinRM credential under the running identity |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
-**Manage the installed service:**
+The installer prints a tailored "Useful commands" block at the end of every run. If `TaskFolder` is non-root, those commands include `-TaskPath` because `Get-ScheduledTask -TaskPath` requires the **trailing backslash** (`'\WGSDAC\'`, not `'\WGSDAC'`).
+
+**Manage the installed service** (substitute the `-TaskPath` value the installer printed):
 ```powershell
+# Root folder (TaskFolder = '\') — no -TaskPath required
 Start-ScheduledTask  -TaskName 'DefenderDashboard'
 Stop-ScheduledTask   -TaskName 'DefenderDashboard'
 Get-ScheduledTask    -TaskName 'DefenderDashboard' | Select-Object State, LastRunTime, LastTaskResult
 Unregister-ScheduledTask -TaskName 'DefenderDashboard' -Confirm:$false
+
+# Non-root folder (e.g. TaskFolder = '\Security') — trailing backslash required
+Get-ScheduledTask -TaskName 'DefenderDashboard' -TaskPath '\Security\' |
+    Select-Object State, LastRunTime, LastTaskResult
 ```
+
+**Initial collection delay:** The dashboard runs its first fleet collection synchronously after `HttpListener.Start()` and before entering the request loop, so `/health` won't respond until that pass finishes (~0.5s per host). The installer's `-StartImmediately` probe retries up to 6× / 10s each to accommodate large fleets.
 
 ---
 
@@ -564,25 +612,46 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.6 (2026-05-19) — Current
+### v0.0.6 (2026-05-24) — Current
 
 **New scripts:**
-- ✨ `Show-DefenderStatus.ps1` — interactive Windows Forms fleet monitor
-- ✨ `Start-DefenderDashboard.ps1` — headless HTTP dashboard with auto-refresh, JSON endpoint, and port fallback
-- ✨ `Install-DefenderDashboard.ps1` — scheduled task installer supporting gMSA and traditional service accounts
+- ✨ `Show-DefenderStatus.ps1` — interactive Windows Forms fleet monitor with Fluent-style theme, clickable stat cards that filter the grid, live query-progress counter, and auto-refresh countdown
+- ✨ `Start-DefenderDashboard.ps1` — headless HTTP dashboard with auto-refresh, JSON endpoint, port fallback, light/dark theme toggle (config-supplied default + per-browser localStorage override), and clickable stat-card filtering
+- ✨ `Install-DefenderDashboard.ps1` — scheduled task installer supporting gMSA and traditional service accounts; registers Windows Event Log source, sets ACLs, optional firewall rule, optional immediate start with `/health` retry probe
 
-**Update script (`Update-DefenderOffline.ps1`) changes:**
+**Configuration system (`conf/config.conf`):**
+- ✨ Central configuration with `[Common]`, `[Update]`, `[Dashboard]`, `[Install]`, `[Credentials]`, `[Email]` sections
+- ✨ `DisableIPv6` — drops unreachable-host detection from ~21s to ~3s on LANs that advertise AAAA records but don't route IPv6
+- ✨ `DashboardTheme` — server-supplied default theme for first-time visitors
+- ✨ `ExcludeComputers` — comma-separated list to bypass entirely (e.g. third-party AV endpoints)
+
+**Update script (`Update-DefenderOffline.ps1`):**
 - ✨ Version discovery now parses `v#.###.###.#` folder name (removed `-MpamFileName` parameter)
 - ✨ Pre-transfer version check — endpoints already current are skipped without file transfer
 - ✨ Unified execution path for parallel and serial modes
-- ✨ `conf/config.conf` — central configuration with per-script sections
-- ✨ Port availability check with automatic fallback (`Start-DefenderDashboard.ps1`, `Install-DefenderDashboard.ps1`)
-- ✨ `conf/dashboard.status` runtime file and Windows Event Log integration
+- ✨ Tiered WinRM credentials (`-Credential` / `-WorkstationCredential` / `-ServerCredential` / `-DomainControllerCredential`) with AD-, Pattern-, or Single-based classification
+- ✨ `-ADCredential` / `-SaveADCredential` — DPAPI-encrypted AD-bind credential for STIG-hardened environments where the running account lacks AD read rights
+- ✨ Email backend rewritten on top of `System.Net.Mail.SmtpClient` (Send-MailMessage deprecated in PS7); UTF-8 pinned for Subject/Body/Headers; attachment paths resolved to absolute before passing to `MailMessage`
+- ✨ HTML report uses semantic table-based Fleet Version Summary that renders correctly in Gmail (CSS Grid was stripped)
 - 🐛 Fixed version delta calculation (was always `Unknown`)
 - 🐛 Fixed version sorting (was string-based, not version-based)
 - 🐛 Fixed log collection copying wrong files
 - 🐛 Fixed HTML report referencing unpopulated columns
 - 🐛 Fixed `$ScriptVersion` hardcoded as `0.0.1`
+- 🐛 Fixed HTML report badge-filter hiding the column header row
+
+**Dashboard service (`Start-DefenderDashboard.ps1`):**
+- ✨ Async `BeginGetContext` request loop (HttpListener has no `Pending()` method)
+- ✨ Port availability check with automatic fallback; `conf/dashboard.status` runtime file
+- ✨ Windows Event Log integration (EventId 100 = started normally, 101 = fallback port, 102 = stopped)
+- ✨ Meta-refresh aligned with countdown so the page reload always fires shortly after "Next refresh in: 0s"
+
+**Installer (`Install-DefenderDashboard.ps1`):**
+- ✨ `Manage-DefenderOffline` event log source registration
+- ✨ ACL grants to the service identity (script folder + conf + log path)
+- ✨ Optional `-AddFirewallRule` (Inbound TCP, Domain+Private profiles); `-Force` replaces an existing rule
+- ✨ `-StartImmediately` waits up to 45s for `dashboard.status`, then probes `/health` with retries
+- ✨ Normalizes `TaskFolder` with trailing backslash so `Get-ScheduledTask -TaskPath` matches
 
 ### v0.0.1 (2025-12-18) — Initial Release
 
