@@ -502,7 +502,13 @@ Get-EventLog -LogName Application -Source 'Manage-DefenderOffline' -Newest 3 |
 - [ ] On clean stop: `conf/dashboard.status` deleted; EventId 102 logged
 - [ ] On re-run with primary port free: binds to 8080; EventId 100 logged
 
-**Result:** PENDING
+**Result:** PASS — 38+ hours of continuous uptime with no errors; 5-minute refresh cadence rock-steady; port fallback works; status file written/deleted on clean stop; AD discovery via `-ADCredential` works in STIG-hardened env. EventLog assertions (101/100/102) deferred to v0.0.6f (installer registers the `Manage-DefenderOffline` event source). Surfaced and fixed during this attempt:
+- `HttpListener.Pending()` crash (method does not exist) → switched to `BeginGetContext` + persistent `IAsyncResult` pattern
+- Dashboard UI redesigned to match HTML/Email report styling (Fluent palette, card-click filtering, favicon)
+- Light/Dark theme toggle with config-supplied default (`[Dashboard] DashboardTheme`) + per-browser `localStorage` override
+- Title normalized across all surfaces to "Microsoft Defender Antivirus – Fleet Status"
+- Auto-refresh timing fix: meta-refresh now aligned with countdown via `[math]::Max(5, $secsUntil + 5)` (was hardcoded to `$RefreshInterval`, could drift up to 5 min)
+- Added `Default theme : <value>` diagnostic to startup banner
 
 ---
 
@@ -762,8 +768,8 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 - [x] v0.0.6a PASS (config loading; WhatIf mode; AD auto-discovery; hosts.conf generation; HTML + CSV report)
 - [x] v0.0.6b PASS (live update; parallel mode; version skip without file transfer; integer delta; HTML + CSV correct)
 - [x] v0.0.6c PASS (offline hard fail; retry behaviour; correct error messages; No Update Needed validated)
-- [ ] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export)
-- [ ] v0.0.6e PASS (port fallback; status file written/deleted; Event Log 101/100/102; all HTTP endpoints respond)
+- [x] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export; full UI redesign matching HTML report; card-click filter; live progress counter; auto-refresh countdown)
+- [x] v0.0.6e PASS (port fallback; status file written/deleted; all HTTP endpoints respond; 38h stability; theme system; card-click filter. EventLog 101/100/102 deferred to v0.0.6f)
 - [ ] v0.0.6f PASS (installer prereqs; service identity; scheduled task; ACLs; firewall rule; status file read; reboot persistence)
 - [x] v0.0.6g PASS (Gmail SMTP via app password; surfaced + fixed: AD-discovery UX, -ADCredential pattern, Send-MailMessage deprecation, attachment-path resolution, UTF-8 mangling, Fleet Version Summary layout)
 - [x] v0.0.6h PASS (delta integer; version sort; columns populated; version string; archive folder excluded. Log-filenames + no-transfer-for-current marked N/A — covered by prior v0.0.6b run)
