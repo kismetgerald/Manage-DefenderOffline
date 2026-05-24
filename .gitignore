@@ -10,6 +10,9 @@ Reports/
 hosts.conf
 conf/dashboard.status
 
+# AI assistant working notes (local to the maintainer; not part of the public project)
+CLAUDE.md
+
 # IDE settings
 .vscode/
 

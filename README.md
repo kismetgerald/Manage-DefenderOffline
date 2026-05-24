@@ -236,7 +236,7 @@ See `conf\config.conf` for full documentation of every setting.
 | `-From` | `DefenderUpdate@contoso.com` | Sender address |
 | `-To` | *(required if -SendEmail)* | Recipient address(es) |
 | `-SmtpCredential` | *(optional)* | PSCredential for SMTP authentication |
-| `-SaveSmtpCredential` | — | Interactive helper; saves encrypted SMTP credentials to `.\Config\SmtpCredential.xml` |
+| `-SaveSmtpCredential` | — | Interactive helper; saves encrypted SMTP credentials to `.\conf\SmtpCredential.xml` |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
 ### Email Setup
@@ -245,11 +245,11 @@ See `conf\config.conf` for full documentation of every setting.
 ```powershell
 .\Update-DefenderOffline.ps1 -SaveSmtpCredential
 ```
-This creates `.\Config\SmtpCredential.xml` encrypted per-user + per-machine via DPAPI. Safe for scheduled tasks running as the same account.
+This creates `.\conf\SmtpCredential.xml` encrypted per-user + per-machine via DPAPI. Safe for scheduled tasks running as the same account.
 
 **Production run with email:**
 ```powershell
-$cred = Import-Clixml ".\Config\SmtpCredential.xml"
+$cred = Import-Clixml ".\conf\SmtpCredential.xml"
 
 .\Update-DefenderOffline.ps1 `
     -SendEmail `
@@ -688,7 +688,7 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 ### Security
 
 - Use Group Managed Service Accounts (gMSA) where possible — no password rotation required
-- SMTP credentials stored via `Export-Clixml` use DPAPI (per-user + per-machine) — never commit `Config\SmtpCredential.xml` to version control
+- SMTP credentials stored via `Export-Clixml` use DPAPI (per-user + per-machine) — never commit `conf\SmtpCredential.xml` to version control (`.gitignore` excludes `*.xml`)
 - Restrict `-LogSharePath` write access to the service account only
 
 ---
@@ -717,7 +717,7 @@ MIT — see [LICENSE.txt](LICENSE.txt)
 ## Documentation
 
 - [Quick Reference](README.md) — this file
-- [Technical Reference](CLAUDE.md) — architecture, parameters, internals
+- [Architecture](ARCHITECTURE.md) — system overview, lifecycles, runtime state, design decisions
 
 **Getting Help:**
 - [GitHub Issues](https://github.com/kismetgerald/Manage-DefenderOffline/issues) — bug reports and feature requests

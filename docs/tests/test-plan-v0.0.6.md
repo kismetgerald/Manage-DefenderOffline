@@ -28,9 +28,9 @@ Deliverables validated by this test plan:
 | `Start-DefenderDashboard.ps1` | Headless HTTP dashboard; port check; status file; Event Log |
 | `Install-DefenderDashboard.ps1` | Scheduled task installer; Event Log source registration; reads status file |
 | `conf/config.conf` | Central configuration with documented settings |
-| `CLAUDE.md` | Technical reference (rewritten; now tracked in git) |
+| `ARCHITECTURE.md` | System overview with Mermaid diagrams (added during v0.0.6) |
 | `README.md` | Project renamed to Manage-DefenderOffline; updated throughout |
-| `.gitignore` | `hosts.conf` and `conf/dashboard.status` excluded; `Config/` `.gitkeep` removed |
+| `.gitignore` | `hosts.conf`, `conf/dashboard.status`, and `CLAUDE.md` (maintainer-local) excluded |
 
 ### Key behaviors
 
@@ -779,10 +779,10 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 - [x] v0.0.6f PASS (installer prereqs; service identity; scheduled task; ACLs; firewall rule; status file read; health probe with retries; reboot persistence + remote access; 6 bugs surfaced and fixed)
 - [x] v0.0.6g PASS (Gmail SMTP via app password; surfaced + fixed: AD-discovery UX, -ADCredential pattern, Send-MailMessage deprecation, attachment-path resolution, UTF-8 mangling, Fleet Version Summary layout)
 - [x] v0.0.6h PASS (delta integer; version sort; columns populated; version string; archive folder excluded. Log-filenames + no-transfer-for-current marked N/A — covered by prior v0.0.6b run)
-- [ ] `CLAUDE.md` reflects current architecture
-- [ ] `README.md` project name updated to Manage-DefenderOffline; repo renamed on GitHub ✓
-- [ ] `conf/config.conf` complete and documented
-- [ ] `.gitignore` excludes `hosts.conf`, `conf/dashboard.status`, `*.xml`, `*.log`
+- [x] `ARCHITECTURE.md` added — Mermaid diagrams cover system overview, update + dashboard lifecycles, credential model, runtime state, event log contract, design decisions
+- [x] `README.md` audited against shipped codebase (v0.0.6 features, all parameter tables, config snippet)
+- [x] `conf/config.conf` complete and documented (all 6 sections; new keys: DisableIPv6, DashboardTheme, ExcludeComputers, full [Credentials] block)
+- [x] `.gitignore` excludes `hosts.conf`, `conf/dashboard.status`, `*.xml`, `*.log`, `CLAUDE.md` (maintainer-local)
 - [ ] No `*.tmp` or debug artifacts in working tree (`git status` clean)
 - [ ] All four scripts parse clean (`Parser::ParseFile` reports 0 errors)
 - [ ] `feat/monitoring-service` merged to `main` with `--no-ff`
