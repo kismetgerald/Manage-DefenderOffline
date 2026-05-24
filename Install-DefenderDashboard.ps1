@@ -212,6 +212,13 @@ if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSec
 if (-not $PSBoundParameters.ContainsKey('TaskName')        -and $cfg['TaskName'])        { $TaskName   = $cfg['TaskName'] }
 if (-not $PSBoundParameters.ContainsKey('TaskFolder')      -and $cfg['TaskFolder'])      { $TaskFolder = $cfg['TaskFolder'] }
 
+# Normalize: Get-ScheduledTask -TaskPath uses CIM WQL exact matching and will
+# return nothing for '\WGSDAC' unless the trailing backslash is present
+# ('\WGSDAC\'). Register-ScheduledTask is more forgiving but the asymmetry
+# breaks the Useful-commands hints printed to the operator. Force trailing
+# slash on every code path.
+if (-not $TaskFolder.EndsWith('\')) { $TaskFolder = "$TaskFolder\" }
+
 # ===================================================================
 # Port Availability Functions
 # ===================================================================
@@ -362,11 +369,10 @@ if ($isGmsa) {
 # ===================================================================
 Write-Step "Creating directories and granting filesystem access…"
 
-$scriptFolder  = Split-Path $DashboardScriptPath -Parent
-$confFolder    = Join-Path $scriptFolder 'conf'
-$configFolder  = Join-Path $scriptFolder 'conf'
+$scriptFolder = Split-Path $DashboardScriptPath -Parent
+$confFolder   = Join-Path $scriptFolder 'conf'
 
-$pathsToCreate = @($LogPath, $scriptFolder, $confFolder, $configFolder)
+$pathsToCreate = @($LogPath, $scriptFolder, $confFolder)
 foreach ($p in $pathsToCreate | Select-Object -Unique) {
     if (-not (Test-Path $p)) {
         New-Item -Path $p -ItemType Directory -Force | Out-Null
@@ -395,9 +401,8 @@ function Grant-FolderAccess {
     }
 }
 
-Grant-FolderAccess -Path $scriptFolder  -Identity $identityLabel -Rights 'ReadAndExecute'
-Grant-FolderAccess -Path $confFolder   -Identity $identityLabel -Rights 'Modify'         # writes dashboard.status
-Grant-FolderAccess -Path $configFolder -Identity $identityLabel -Rights 'Modify'         # reads/writes WinRmCredential.xml
+Grant-FolderAccess -Path $scriptFolder -Identity $identityLabel -Rights 'ReadAndExecute'
+Grant-FolderAccess -Path $confFolder   -Identity $identityLabel -Rights 'Modify'   # writes dashboard.status + reads/writes WinRmCredential.xml
 Grant-FolderAccess -Path $LogPath      -Identity $identityLabel -Rights 'Modify'
 
 # ===================================================================
@@ -652,7 +657,7 @@ Write-Host ""
 # ===================================================================
 # Prerequisites Reminder
 # ===================================================================
-$credFile = Join-Path $configFolder 'WinRmCredential.xml'
+$credFile = Join-Path $confFolder 'WinRmCredential.xml'
 if (-not (Test-Path $credFile)) {
     Write-Host "  WinRM CREDENTIAL NOT CONFIGURED" -ForegroundColor Yellow
     Write-Host "  The dashboard needs a WinRM credential to query endpoints." -ForegroundColor Yellow
