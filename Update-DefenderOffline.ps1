@@ -1,321 +1,757 @@
 <#
 .SYNOPSIS
-    Update-DefenderOffline.ps1 – Fully Automated Offline Microsoft Defender Antivirus Definitions Update
-    Designed for air-gapped, high-security, or segmented networks.
+    Update-DefenderOffline.ps1 – Automated Microsoft Defender Antivirus Definitions Deployment
 
 .DESCRIPTION
-    This script updates Microsoft Defender antivirus definitions on systems without internet access
-    using the official mpam-fe.exe (x64) package. It leverages PowerShell Remoting (WinRM) to copy
-    and silently install the update, verifies success, collects logs, and generates beautiful HTML reports.
+    Deploys Microsoft Defender antivirus definition updates to Windows 10/11 and
+    Windows Server 2016+ endpoints in air-gapped or network-segmented environments
+    using PowerShell Remoting (WinRM).
 
-    Key Features:
-     • PowerShell 7+ = automatic parallel processing (up to 10x faster)
-     • PowerShell 5.1 = safe serial fallback
-     • Real-time progress monitoring in both serial and parallel modes
-     • Automatic hosts.conf creation from Active Directory if missing
-     • Full dual logging: color console + timestamped file
-     • Organized output: .\Logs\ and .\Reports\ (configurable)
-     • Optional remote log collection to network share
-     • Optional HTML email with report attached
-     • Dry-run mode (-WhatIfMode)
-     • Fully compatible with gMSA, service accounts, and scheduled tasks
-     • Administrative privilege validation
+    Source share structure (required):
+        <SourceSharePath>\<YYYYMMDD>\v#.###.###.#\mpam-fe.exe
+    Example:
+        \\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender\20260518\v1.449.681.0\mpam-fe.exe
 
-.HOW TO CREATE SMTP CREDENTIALS (for -SendEmail)
+    The script automatically identifies the highest available version, compares it to
+    each endpoint's installed version, and skips systems that are already current or ahead.
+    PowerShell 7+ enables parallel processing; PS 5.1 falls back to serial.
 
-    Method 1 - Use the built-in helper function:
+.PARAMETER SourceSharePath
+    Base UNC path containing versioned definition subfolders. No trailing slash.
+    Example: \\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender
+
+.PARAMETER ComputerName
+    Manual list of target computers. Bypasses hosts.conf and Active Directory discovery.
+
+.PARAMETER TempFolderOnTarget
+    Temporary directory created on each remote system during update. Removed after completion.
+    Default: C:\Temp\Update-DefenderOffline
+
+.PARAMETER LogSharePath
+    Optional UNC path for centralized install log collection. A per-computer subfolder is created.
+
+.PARAMETER LogPath
+    Local path for script execution logs. Default: C:\Logs
+
+.PARAMETER ReportPath
+    Local path for HTML and CSV reports. Default: .\Reports
+
+.PARAMETER ParallelThreads
+    Maximum concurrent update jobs in PS 7+ parallel mode. Range: 1-32. Default: 16
+
+.PARAMETER WhatIfMode
+    Dry-run. Tests connectivity and compares versions but makes no changes.
+
+.PARAMETER SendEmail
+    Enable email notification with HTML report and CSV attached.
+
+.PARAMETER SmtpServer
+    SMTP server hostname or IP. Required when -SendEmail is used.
+
+.PARAMETER SmtpPort
+    SMTP port. Default: 25
+
+.PARAMETER From
+    Sender email address. Default: DefenderUpdate@contoso.com
+
+.PARAMETER To
+    One or more recipient email addresses. Required when -SendEmail is used.
+
+.PARAMETER SmtpUseSsl
+    Use SSL/TLS for SMTP connection.
+
+.PARAMETER SmtpCredential
+    PSCredential for SMTP authentication. Use -SaveSmtpCredential to create one interactively.
+
+.PARAMETER SaveSmtpCredential
+    Interactive helper that saves encrypted SMTP credentials to .\Config\SmtpCredential.xml.
+    The file is encrypted per-user and per-machine via DPAPI (safe for scheduled tasks / gMSA).
+
+.PARAMETER Credential
+    Single PSCredential used for all WinRM connections. Acts as a fallback when no
+    tier-specific credential is supplied. Auto-loaded from .\Config\WinRmCredential.xml
+    if the file exists and -Credential is not passed explicitly.
+
+.PARAMETER WorkstationCredential
+    PSCredential for workstation-tier endpoints. Takes precedence over -Credential for
+    hosts classified as Workstation. Auto-loaded from .\Config\WorkstationCredential.xml.
+
+.PARAMETER ServerCredential
+    PSCredential for member-server-tier endpoints. Takes precedence over -Credential for
+    hosts classified as MemberServer. Auto-loaded from .\Config\ServerCredential.xml.
+
+.PARAMETER DomainControllerCredential
+    PSCredential for domain controller endpoints. Takes precedence over -Credential for
+    hosts classified as DomainController. Auto-loaded from .\Config\DomainControllerCredential.xml.
+
+.PARAMETER SaveCredential
+    Interactive helper that saves WinRM credentials to .\Config\ (DPAPI-encrypted).
+    Prompts for which tier(s) to save. Exits after saving.
+
+.PARAMETER ClassificationMethod
+    Controls how endpoints are assigned to credential tiers.
+    AD      - Queries Active Directory OperatingSystem attribute and DC flag (default when domain-joined).
+    Pattern - Matches computer names against -WorkstationPattern and -DomainControllerPattern.
+    Single  - All endpoints use one credential; no classification (default when not domain-joined).
+    Auto-detected if omitted.
+
+.PARAMETER WorkstationPattern
+    Regex matched case-insensitively against computer names when ClassificationMethod = Pattern.
+    Hosts that match are classified as Workstation and use -WorkstationCredential.
+    Example: ^(DESKTOP|LAPTOP|WS|WIN10|WIN11)
+    IMPORTANT: This is an example only. Customise it for your naming convention.
+
+.PARAMETER DomainControllerPattern
+    Regex matched case-insensitively against computer names when ClassificationMethod = Pattern.
+    Hosts that match are classified as DomainController and use -DomainControllerCredential.
+    Example: ^DC
+    IMPORTANT: This is an example only. Customise it for your naming convention.
+
+.EXAMPLE
+    # First run – auto-discovers domain computers via AD and creates hosts.conf
+    .\Update-DefenderOffline.ps1 -SourceSharePath "\\NAS01\Share\_AVDefinitions\Microsoft_Defender"
+
+.EXAMPLE
+    # Weekly production run with email
+    $cred = Import-Clixml ".\Config\SmtpCredential.xml"
+    .\Update-DefenderOffline.ps1 `
+        -SourceSharePath "\\NAS01\Share\_AVDefinitions\Microsoft_Defender" `
+        -SendEmail -SmtpServer "smtp.contoso.com" -SmtpPort 587 -SmtpUseSsl `
+        -From "defender@contoso.com" -To "security@contoso.com" `
+        -SmtpCredential $cred
+
+.EXAMPLE
+    # Dry-run against specific computers
+    .\Update-DefenderOffline.ps1 `
+        -SourceSharePath "\\NAS01\Share\_AVDefinitions\Microsoft_Defender" `
+        -ComputerName "WS01","WS02","SRV01" -WhatIfMode
+
+.EXAMPLE
+    # One-time: save SMTP credentials
     .\Update-DefenderOffline.ps1 -SaveSmtpCredential
 
-    Method 2 - Manual credential creation:
-    Run this once interactively to securely save credentials:
-
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $cred = Get-Credential -Message "Enter SMTP username and password (e.g. smtpuser@contoso.com)"
-    $cred | Export-Clixml -Path (Join-Path $scriptDir "Config\SmtpCredential.xml")
-
-    Then use in your script call:
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $smtpCred = Import-Clixml (Join-Path $scriptDir "Config\SmtpCredential.xml")
-    .\Update-DefenderOffline.ps1 ... -SendEmail -SmtpCredential $smtpCred
-
-    The .xml file is encrypted per-user + per-machine and safe for scheduled tasks/gMSA.
-
-.USAGE EXAMPLES
-
-    1. First run (auto-creates hosts.conf from AD):
-       .\Update-DefenderOffline.ps1 -SourceSharePath "\\fileserver\DefenderUpdates" -MpamFileName "mpam-feX64.exe"
-
-    2. Weekly run:
-       .\Update-DefenderOffline.ps1 -SourceSharePath "\\fs\updates" -MpamFileName "mpam-feX64_1.405.9999.0.exe"
-
-    3. Save SMTP credentials (one-time setup):
-       .\Update-DefenderOffline.ps1 -SaveSmtpCredential
-
-    4. With email and secure credentials:
-       $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-       $smtpCred = Import-Clixml (Join-Path $scriptDir "Config\SmtpCredential.xml")
-       .\Update-DefenderOffline.ps1 `
-         -SourceSharePath "\\fs\updates" `
-         -MpamFileName "mpam-feX64.exe" `
-         -SendEmail `
-         -SmtpServer "smtp.contoso.com" -SmtpPort 587 -SmtpUseSsl `
-         -From "defender@contoso.com" -To "security@contoso.com" `
-         -SmtpCredential $smtpCred
-
-    5. Dry-run (no changes):
-       .\Update-DefenderOffline.ps1 ... -WhatIfMode
-
-    6. Max speed on PowerShell 7+:
-       .\Update-DefenderOffline.ps1 ... -ParallelThreads 24
-
 .NOTES
-    File Name      : Update-DefenderOffline.ps1
-    Author         : Kismet Agbasi (GitHub: https://github.com/kismetgerald | Email: KismetG17@gmail.com)
-    Ai Contributors: ClaudeAI, and Grok
-    Prerequisite   : • PowerShell 5.1 or 7+ (7+ strongly recommended for performance)
-                     • WinRM enabled on all target computers (port 5985)
-                     • Administrative privileges on target systems
-                     • Network share containing the latest mpam-fe.exe (x64)
-                     • (Optional) Domain-joined machine or RSAT:ActiveDirectory for auto hosts.conf generation
-    
+    Author         : Kismet Agbasi (GitHub: kismetgerald | Email: KismetG17@gmail.com)
+    AI Contributors: Claude AI, Grok
+    Supported OS   : Windows 10/11, Windows Server 2016/2019/2022/2025
+    Prerequisites  : PowerShell 5.1+ (7+ strongly recommended)
+                     WinRM enabled on all target computers (TCP 5985)
+                     Local administrator privileges on the machine running this script
+                     Administrative rights on all target computers
+                     Read access to SourceSharePath share
     Version        : 0.0.6
     Created        : 2025-11-27
-    Last Updated   : 2026-01-28
-
+    Last Updated   : 2026-05-19
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess)]
 param(
-    [Parameter(Mandatory = $false, ValueFromPipeline = $true)]
-    [string[]]$ComputerName,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateScript({ Test-Path $_ -PathType Container })]
+    [Parameter(Position = 0)]
     [string]$SourceSharePath,
 
-    [Parameter(Mandatory = $true)]
-    [string]$MpamFileName,
+    [Parameter(ValueFromPipeline)]
+    [string[]]$ComputerName,
 
     [string]$TempFolderOnTarget = 'C:\Temp\Update-DefenderOffline',
 
     [string]$LogSharePath,
 
-    # Email Options
+    # Output locations
+    [string]$LogPath,
+    [string]$ReportPath,
+
+    # Performance
+    [ValidateRange(1, 32)]
+    [int]$ParallelThreads = 16,
+
+    # Safety
+    [switch]$WhatIfMode,
+
+    # Email
     [switch]$SendEmail,
     [string]$SmtpServer,
     [int]$SmtpPort = 25,
-    [string]$From = 'DefenderUpdate@contoso.com',
+    [string]$From  = 'DefenderUpdate@contoso.com',
     [string[]]$To,
     [switch]$SmtpUseSsl,
     [pscredential]$SmtpCredential,
 
-    # Safety & Testing
-    [switch]$WhatIfMode,
+    # Credential helper
+    [switch]$SaveSmtpCredential,
 
-    # Output Folders
-    [string]$LogPath,
-    [string]$ReportPath,
+    # WinRM credentials
+    [pscredential]$Credential,
+    [pscredential]$WorkstationCredential,
+    [pscredential]$ServerCredential,
+    [pscredential]$DomainControllerCredential,
 
-    # Performance (PowerShell 7+ only)
-    [ValidateRange(1, 32)]
-    [int]$ParallelThreads = 16,
+    # WinRM credential helper
+    [switch]$SaveCredential,
 
-    # Credential Management Helper
-    [switch]$SaveSmtpCredential
+    # AD discovery credential (used only for the LDAP bind when reading
+    # the computer list; not used for WinRM connections)
+    [pscredential]$ADCredential,
+    [switch]$SaveADCredential,
+
+    # Endpoint classification
+    [ValidateSet('AD','Pattern','Single')]
+    [string]$ClassificationMethod,
+    [string]$WorkstationPattern,
+    [string]$DomainControllerPattern,
+
+    # Skip IPv6 in endpoint reachability tests. See conf/config.conf for details.
+    [bool]$DisableIPv6 = $true,
+
+    # Path to configuration file. Defaults to .\conf\config.conf relative to the script.
+    [string]$ConfigPath
 )
 
 # ===================================================================
-# Script Initialization
+# Constants
 # ===================================================================
-$ScriptVersion = "0.0.1"
+$ScriptVersion   = '0.0.6'
 $ScriptStartTime = Get-Date
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$HostsFile = Join-Path $ScriptDir 'hosts.conf'
+$ScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$HostsFile       = Join-Path $ScriptDir 'hosts.conf'
+$RunAsUser       = "$env:USERDOMAIN\$env:USERNAME"
+$RunFromHost     = $env:COMPUTERNAME
+$RunFromIP       = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                       Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.PrefixOrigin -ne 'WellKnown' } |
+                       Sort-Object InterfaceIndex | Select-Object -First 1 -ExpandProperty IPAddress) ?? 'Unknown'
+$script:SuppressConsoleOutput = $false
 
 # ===================================================================
-# Credential Management Helper Mode
+# Credential Helper Mode  (exits after completion)
 # ===================================================================
 if ($SaveSmtpCredential) {
     Write-Host "`n=== SMTP Credential Setup ===" -ForegroundColor Cyan
-    Write-Host "This will securely save your SMTP credentials for email notifications.`n" -ForegroundColor White
-
-    $configDir = Join-Path $ScriptDir 'Config'
+    $configDir = Join-Path $ScriptDir 'conf'
+    $credPath  = Join-Path $configDir 'SmtpCredential.xml'
     if (-not (Test-Path $configDir)) {
         New-Item -Path $configDir -ItemType Directory -Force | Out-Null
-        Write-Host "Created Config directory: $configDir" -ForegroundColor Green
     }
-
-    $credPath = Join-Path $configDir 'SmtpCredential.xml'
-
     try {
-        $cred = Get-Credential -Message "Enter SMTP username and password (e.g. smtp-user@contoso.com)"
-
+        $cred = Get-Credential -Message 'Enter SMTP username and password (e.g. smtp-user@contoso.com)'
         if ($cred) {
             $cred | Export-Clixml -Path $credPath -Force
-            Write-Host "`nCredentials saved successfully!" -ForegroundColor Green
-            Write-Host "Location: $credPath" -ForegroundColor Cyan
-            Write-Host "`nTo use these credentials, load them in your script:" -ForegroundColor Yellow
-            Write-Host "  `$smtpCred = Import-Clixml '$credPath'" -ForegroundColor White
-            Write-Host "  .\Update-DefenderOffline.ps1 -SendEmail -SmtpCredential `$smtpCred ...`n" -ForegroundColor White
+            Write-Host "Credentials saved to: $credPath" -ForegroundColor Green
+            Write-Host "`nTo use:"
+            Write-Host "  `$cred = Import-Clixml '$credPath'"
+            Write-Host "  .\Update-DefenderOffline.ps1 -SendEmail -SmtpCredential `$cred ..."
+        } else {
+            Write-Host 'Cancelled.' -ForegroundColor Yellow
         }
-        else {
-            Write-Host "`nCredential creation cancelled." -ForegroundColor Yellow
-        }
-    }
-    catch {
-        Write-Host "`nERROR: Failed to save credentials: $($_.Exception.Message)" -ForegroundColor Red
+    } catch {
+        Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
         exit 1
     }
-
     exit 0
 }
 
-# Check for administrative privileges
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Error "ERROR: This script requires administrative privileges. Please run as Administrator."
-    throw "Insufficient privileges. Run PowerShell as Administrator and try again."
+# ===================================================================
+# WinRM Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveCredential) {
+    Write-Host "`n=== WinRM Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Credentials are encrypted per-user per-machine (DPAPI) and stored under' -ForegroundColor Gray
+    Write-Host "  Config\ in the script directory. Run this helper as the account that will" -ForegroundColor Gray
+    Write-Host '  actually execute the script (or the service account for scheduled tasks).' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  Which credential(s) to save?' -ForegroundColor White
+    Write-Host '  [1] Single / management account  (WinRmCredential.xml)          – fallback for all tiers'
+    Write-Host '  [2] Workstation admin             (WorkstationCredential.xml)'
+    Write-Host '  [3] Server / member server admin  (ServerCredential.xml)'
+    Write-Host '  [4] Domain admin / DC credential  (DomainControllerCredential.xml)'
+    Write-Host '  [A] All of the above'
+    Write-Host ''
+    $choice = (Read-Host '  Enter choice [1/2/3/4/A]').ToUpper().Trim()
+
+    $slots = switch ($choice) {
+        '1' { @(@{ File = 'WinRmCredential.xml';           Label = 'Single / management account' }) }
+        '2' { @(@{ File = 'WorkstationCredential.xml';     Label = 'Workstation admin' }) }
+        '3' { @(@{ File = 'ServerCredential.xml';          Label = 'Server / member server admin' }) }
+        '4' { @(@{ File = 'DomainControllerCredential.xml'; Label = 'Domain admin / DC credential' }) }
+        'A' { @(
+                @{ File = 'WinRmCredential.xml';           Label = 'Single / management account' }
+                @{ File = 'WorkstationCredential.xml';     Label = 'Workstation admin' }
+                @{ File = 'ServerCredential.xml';          Label = 'Server / member server admin' }
+                @{ File = 'DomainControllerCredential.xml'; Label = 'Domain admin / DC credential' }
+              ) }
+        default { Write-Host "  Invalid choice '$choice'. Exiting." -ForegroundColor Red; exit 1 }
+    }
+
+    $cfgDir = Join-Path $ScriptDir 'conf'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+
+    foreach ($slot in $slots) {
+        Write-Host ''
+        try {
+            $cred = Get-Credential -Message "Enter credentials for: $($slot.Label)"
+            if ($cred) {
+                $cred | Export-Clixml -Path (Join-Path $cfgDir $slot.File) -Force
+                Write-Host "  Saved: $(Join-Path $cfgDir $slot.File)" -ForegroundColor Green
+            } else {
+                Write-Host "  Cancelled: $($slot.Label)" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  ERROR saving $($slot.File): $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    exit 0
 }
 
-# Default output folders
+# ===================================================================
+# AD Credential Helper Mode  (exits after completion)
+# ===================================================================
+if ($SaveADCredential) {
+    Write-Host "`n=== AD Discovery Credential Setup ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Used ONLY for the LDAP bind that reads the computer list when no' -ForegroundColor Gray
+    Write-Host '  hosts.conf is present and -ComputerName is not used.  This is not the' -ForegroundColor Gray
+    Write-Host '  same as the WinRM credential.  In STIG-hardened environments the' -ForegroundColor Gray
+    Write-Host '  interactive operator often cannot bind to AD; saving a domain account' -ForegroundColor Gray
+    Write-Host '  with read permission here lets auto-discovery succeed.' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  Encrypted per-user per-machine (DPAPI). Saved to conf\ADCredential.xml.' -ForegroundColor Gray
+    Write-Host ''
+    $cfgDir = Join-Path $ScriptDir 'conf'
+    if (-not (Test-Path $cfgDir)) { New-Item -Path $cfgDir -ItemType Directory -Force | Out-Null }
+    try {
+        $cred = Get-Credential -Message 'Enter AD credential (account with read on the domain naming context)'
+        if ($cred) {
+            $cred | Export-Clixml -Path (Join-Path $cfgDir 'ADCredential.xml') -Force
+            Write-Host "  Saved: $(Join-Path $cfgDir 'ADCredential.xml')" -ForegroundColor Green
+        } else {
+            Write-Host '  Cancelled.' -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    exit 0
+}
+
+# ===================================================================
+# Administrative Privilege Check
+# ===================================================================
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    throw 'This script requires administrative privileges. Run PowerShell as Administrator.'
+}
+
+# ===================================================================
+# Configuration File
+# ===================================================================
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+
+function Read-ConfigFile {
+    param([string]$Path)
+    $cfg = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path $Path -ErrorAction SilentlyContinue)) { return $cfg }
+    foreach ($line in Get-Content $Path) {
+        $t = $line.Trim()
+        if (-not $t -or $t -match '^\s*[#\[]') { continue }
+        if ($t -match '^([^=]+?)\s*=\s*(.+)$') {
+            $v = $Matches[2].Trim() -replace '^([''"])(.*)\1$', '$2'
+            $cfg[$Matches[1].Trim()] = $v
+        }
+    }
+    return $cfg
+}
+
+$cfg = Read-ConfigFile $ConfigPath
+
+# Apply config values for parameters not explicitly passed on the command line.
+# Command-line parameters always win; config fills in what was omitted.
+if (-not $PSBoundParameters.ContainsKey('SourceSharePath')    -and $cfg['SourceSharePath'])    { $SourceSharePath    = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('LogPath')            -and $cfg['LogPath'])            { $LogPath            = $cfg['LogPath'] }
+if (-not $PSBoundParameters.ContainsKey('ReportPath')         -and $cfg['ReportPath'])         { $ReportPath         = $cfg['ReportPath'] }
+if (-not $PSBoundParameters.ContainsKey('TempFolderOnTarget') -and $cfg['TempFolderOnTarget']) { $TempFolderOnTarget = $cfg['TempFolderOnTarget'] }
+if (-not $PSBoundParameters.ContainsKey('LogSharePath')       -and $cfg['LogSharePath'])       { $LogSharePath       = $cfg['LogSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ParallelThreads')    -and $cfg['ParallelThreads'])    { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('SendEmail')          -and $cfg['SendEmail'] -eq 'true')  { $SendEmail   = $true }
+if (-not $PSBoundParameters.ContainsKey('SmtpServer')         -and $cfg['SmtpServer'])         { $SmtpServer         = $cfg['SmtpServer'] }
+if (-not $PSBoundParameters.ContainsKey('SmtpPort')           -and $cfg['SmtpPort'])           { try { $SmtpPort = [int]$cfg['SmtpPort'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('SmtpUseSsl')         -and $cfg['SmtpUseSsl'] -eq 'true') { $SmtpUseSsl = $true }
+if (-not $PSBoundParameters.ContainsKey('From')               -and $cfg['EmailFrom'])          { $From               = $cfg['EmailFrom'] }
+if (-not $PSBoundParameters.ContainsKey('To')                 -and $cfg['EmailTo'])            {
+    $To = $cfg['EmailTo'] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['ClassificationMethod'])    { $ClassificationMethod    = $cfg['ClassificationMethod'] }
+$ExcludeList = @()
+if ($cfg['ExcludeComputers']) {
+    $ExcludeList = $cfg['ExcludeComputers'] -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
+}
+if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
+if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
+if (-not $PSBoundParameters.ContainsKey('DisableIPv6')              -and $cfg['DisableIPv6'])              { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
+
+# ===================================================================
+# WinRM Credential Auto-Load
+# Loads DPAPI-encrypted XMLs from Config\ if not passed on the CLI.
+# ===================================================================
+$configDir = Join-Path $ScriptDir 'conf'
+
+function Import-SavedCredential ([string]$FileName) {
+    $p = Join-Path $configDir $FileName
+    if (Test-Path $p -ErrorAction SilentlyContinue) {
+        try { return Import-Clixml $p }
+        catch { Write-Warning "Could not load credential from '$p': $($_.Exception.Message)" }
+    }
+    return $null
+}
+
+if (-not $PSBoundParameters.ContainsKey('Credential'))                 { $Credential                = Import-SavedCredential 'WinRmCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('WorkstationCredential'))      { $WorkstationCredential     = Import-SavedCredential 'WorkstationCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('ServerCredential'))           { $ServerCredential          = Import-SavedCredential 'ServerCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('DomainControllerCredential')) { $DomainControllerCredential = Import-SavedCredential 'DomainControllerCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('SmtpCredential'))             { $SmtpCredential            = Import-SavedCredential 'SmtpCredential.xml' }
+if (-not $PSBoundParameters.ContainsKey('ADCredential'))               { $ADCredential              = Import-SavedCredential 'ADCredential.xml' }
+
+# ===================================================================
+# Classification Method Resolution
+# ===================================================================
+if (-not $ClassificationMethod) {
+    $partOfDomain = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).PartOfDomain
+    $ClassificationMethod = if ($partOfDomain) { 'AD' } else { 'Single' }
+}
+
+# ===================================================================
+# Output Folders and Log File
+# ===================================================================
 if (-not $LogPath)    { $LogPath    = Join-Path $env:SystemDrive 'Logs' }
 if (-not $ReportPath) { $ReportPath = Join-Path $ScriptDir 'Reports' }
-foreach ($p in $LogPath, $ReportPath) {
-    if (-not (Test-Path $p)) { New-Item -Path $p -ItemType Directory -Force | Out-Null }
+
+foreach ($folder in $LogPath, $ReportPath) {
+    if (-not (Test-Path $folder)) {
+        New-Item -Path $folder -ItemType Directory -Force | Out-Null
+    }
 }
 
-$LogFile = Join-Path $LogPath "Update-DefenderOffline_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$LogFile        = Join-Path $LogPath "Update-DefenderOffline_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$Global:LogMutex = [System.Threading.Mutex]::new($false, 'DefenderUpdateLogMutex')
 
-# Thread-safe logging mutex
-$Global:LogMutex = [System.Threading.Mutex]::new($false, "DefenderUpdateLogMutex")
-
+# ===================================================================
+# Write-Log
+# ===================================================================
 function Write-Log {
     param(
         [string]$Message,
-        [ValidateSet('INFO','WARN','ERROR','SUCCESS','HEADER')]$Level = 'INFO'
+        [ValidateSet('INFO','WARN','ERROR','SUCCESS','HEADER')]
+        [string]$Level = 'INFO'
     )
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "$timestamp [$Level] $Message"
-
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
     try {
         $Global:LogMutex.WaitOne() | Out-Null
         $line | Out-File -FilePath $LogFile -Append -Encoding UTF8
-    }
-    finally {
+    } finally {
         $Global:LogMutex.ReleaseMutex()
     }
 
-    if (-not $SuppressConsoleOutput -and [System.Threading.Thread]::CurrentThread.ManagedThreadId -eq 1) {
-    switch ($Level) {
-        'INFO'    { Write-Host $line -ForegroundColor Cyan }
-        'WARN'    { Write-Host $line -ForegroundColor Yellow }
-        'ERROR'   { Write-Host $line -ForegroundColor Red }
-        'SUCCESS' { Write-Host $line -ForegroundColor Green }
-        'HEADER'  { Write-Host $line -ForegroundColor Magenta }
-        default   { Write-Host $line }
+    if (-not $script:SuppressConsoleOutput -and
+        [System.Threading.Thread]::CurrentThread.ManagedThreadId -eq 1) {
+        $color = switch ($Level) {
+            'INFO'    { 'Cyan'    }
+            'WARN'    { 'Yellow'  }
+            'ERROR'   { 'Red'     }
+            'SUCCESS' { 'Green'   }
+            'HEADER'  { 'Magenta' }
+            default   { 'White'   }
+        }
+        Write-Host $line -ForegroundColor $color
     }
 }
 
-}
-
+# ===================================================================
+# Startup Banner
+# ===================================================================
 Write-Log "=== Microsoft Defender Offline Update v$ScriptVersion ===" 'HEADER'
-Write-Log "Started          : $(Get-Date)"
-Write-Log "PowerShell       : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
-Write-Log "Parallel Mode    : $(if ($PSVersionTable.PSVersion.Major -ge 7) { "ENABLED ($ParallelThreads threads)" } else { "DISABLED (PS 5.1)" })"
-Write-Log "Log File         : $LogFile"
-Write-Log "Report Folder    : $ReportPath"
-Write-Log "WhatIf Mode      : $WhatIfMode"
-if ($SendEmail) { Write-Log "Email enabled    : Yes$(if ($SmtpCredential) { ' (credentials provided)' } else { '' })" }
+Write-Log "Started       : $(Get-Date)"
+Write-Log "PowerShell    : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+Write-Log "Parallel Mode : $(if ($PSVersionTable.PSVersion.Major -ge 7) { "ENABLED ($ParallelThreads threads)" } else { 'DISABLED (PS 5.1 serial)' })"
+Write-Log "Log File      : $LogFile"
+Write-Log "Report Folder : $ReportPath"
+Write-Log "WhatIf Mode   : $WhatIfMode"
+if ($SendEmail) { Write-Log "Email         : $SmtpServer → $($To -join ', ')" }
+$credParts = @()
+if ($DomainControllerCredential) { $credParts += "DC=$($DomainControllerCredential.UserName)" }
+if ($ServerCredential)           { $credParts += "Server=$($ServerCredential.UserName)" }
+if ($WorkstationCredential)      { $credParts += "WS=$($WorkstationCredential.UserName)" }
+if ($Credential)                 { $credParts += "Single=$($Credential.UserName)" }
+Write-Log "WinRM Auth    : $(if ($credParts) { $credParts -join ' | ' } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+Write-Log "Classification: $ClassificationMethod"
 
 # ===================================================================
-# Resolve Target Computers
+# Target Computer Resolution
 # ===================================================================
 function Resolve-TargetComputers {
+    # 1. Manual list via parameter
     if ($ComputerName) {
-        Write-Log "Using manually provided list ($($ComputerName.Count) computers)" 'INFO'
-        return $ComputerName | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim().ToUpper() }
+        $list = $ComputerName |
+            Where-Object { $_ -match '\S' } |
+            ForEach-Object { $_.Trim().ToUpper() }
+        Write-Log "Using manually provided list ($($list.Count) computers)" 'INFO'
+        return $list
     }
 
+    # 2. hosts.conf in script directory
     if (Test-Path $HostsFile) {
-        $list = Get-Content $HostsFile | Where-Object { $_ -notmatch '^\s*#|^\s*$' } | ForEach-Object { $_.Trim().ToUpper() }
+        $list = Get-Content $HostsFile |
+            Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\S' } |
+            ForEach-Object { $_.Trim().ToUpper() }
         Write-Log "Loaded $($list.Count) computers from hosts.conf" 'SUCCESS'
         return $list
     }
 
-    Write-Log "hosts.conf not found → querying Active Directory..." 'WARN'
-
+    # 3. Active Directory auto-discovery
+    Write-Log 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
+    $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
+    if (-not $hasAdModule) {
+        Write-Log 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' 'INFO'
+    }
+    if ($ADCredential) {
+        Write-Log "Using -ADCredential for LDAP bind: $($ADCredential.UserName)" 'INFO'
+    }
     try {
-        if (Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue) {
-            Import-Module ActiveDirectory
-            $computers = Get-ADComputer -Filter 'OperatingSystem -like "*Windows*" -and Enabled -eq $true' -Properties Name |
-                         Sort-Object Name | Select-Object -ExpandProperty Name
+        if ($hasAdModule) {
+            Import-Module ActiveDirectory -ErrorAction Stop
+            $adParams = @{
+                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
+                Properties = 'Name'
+            }
+            if ($ADCredential) { $adParams.Credential = $ADCredential }
+            $computers = Get-ADComputer @adParams |
+                Sort-Object Name |
+                Select-Object -ExpandProperty Name
         } else {
-            $domain = (Get-CimInstance Win32_ComputerSystem).Domain
-            $searcher = [adsisearcher]"(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
-            $searcher.SearchRoot = "LDAP://$domain"
-            $computers = $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
+            # ADSI fallback.  When -ADCredential is supplied we bind via
+            # DirectoryEntry with explicit credentials; otherwise we use
+            # [adsisearcher] which binds as the current process identity.
+            $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
+            $filter   = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
+            if ($ADCredential) {
+                $de = [System.DirectoryServices.DirectoryEntry]::new(
+                    "LDAP://$domain",
+                    $ADCredential.UserName,
+                    $ADCredential.GetNetworkCredential().Password)
+                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
+                $searcher.Filter = $filter
+            } else {
+                $searcher = [adsisearcher]$filter
+                $searcher.SearchRoot = "LDAP://$domain"
+            }
+            $computers = $searcher.FindAll() |
+                ForEach-Object { $_.Properties.name[0] } |
+                Sort-Object
+            if ($ADCredential) { $de.Dispose() }
         }
 
         $header = @"
 # =============================================================================
 # hosts.conf – AUTO-GENERATED by Update-DefenderOffline.ps1 v$ScriptVersion
-# Generated      : $(Get-Date)
-# Domain         : $((Get-CimInstance Win32_ComputerSystem).Domain)
-# Total Systems  : $($computers.Count)
-# Edit this file to exclude lab/test machines if needed
+# Generated  : $(Get-Date)
+# Domain     : $((Get-CimInstance Win32_ComputerSystem).Domain)
+# Systems    : $($computers.Count)
+# Edit this file to exclude lab/test machines or add workgroup systems.
+# Lines beginning with # are ignored. One hostname or FQDN per line.
 # =============================================================================
 
 "@
-        ($header + ($computers -join "`r`n")) | Out-File -FilePath $HostsFile -Encoding UTF8 -Force
-        Write-Log "Created hosts.conf with $($computers.Count) computers" 'SUCCESS'
+        ($header + ($computers -join "`r`n")) |
+            Out-File -FilePath $HostsFile -Encoding UTF8 -Force
+        Write-Log "Auto-generated hosts.conf with $($computers.Count) computers" 'SUCCESS'
         return $computers
-    }
-    catch {
-        Write-Log "Failed to query AD: $($_.Exception.Message)" 'ERROR'
-        throw "Cannot proceed without target list. Create hosts.conf manually."
+
+    } catch {
+        $adErr = $_.Exception.Message
+        Write-Log "AD auto-discovery failed: $adErr" 'ERROR'
+        $help = @"
+
+==============================================================================
+ Active Directory auto-discovery failed.
+ Reason: $adErr
+==============================================================================
+
+Auto-discovery uses the credentials of the user running this script.  A
+common cause is running under a local or workstation-admin account that
+cannot bind to AD (e.g. STIG-hardened environments where Workstation Admin
+is local-only).
+
+You have four ways to proceed:
+
+  1. Save a domain account with AD read permission and re-run (the
+     recommended path for STIG environments where the interactive
+     operator cannot bind to AD):
+
+       .\Update-DefenderOffline.ps1 -SaveADCredential
+       .\Update-DefenderOffline.ps1                # auto-loads it next run
+
+  2. Create hosts.conf manually next to the script (one hostname per
+     line, '#' lines are ignored):
+
+       notepad "$HostsFile"
+
+  3. Pass the targets explicitly on the command line:
+
+       .\Update-DefenderOffline.ps1 -ComputerName SRV01,WS02
+
+  4. Re-run from a session whose user already has AD read permission.
+     To use Get-ADComputer instead of the ADSI fallback, install the
+     RSAT ActiveDirectory PowerShell module:
+
+       # Windows 10/11 client:
+       Add-WindowsCapability -Online ``
+         -Name 'Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'
+
+       # Windows Server:
+       Install-WindowsFeature RSAT-AD-PowerShell
+
+==============================================================================
+"@
+        Write-Host $help -ForegroundColor Yellow
+        throw 'Cannot proceed without a target list.'
     }
 }
 
-$TargetComputers = Resolve-TargetComputers
-if (-not $TargetComputers) { Write-Log "No target computers found!" 'ERROR'; return }
-Write-Log "Will process $($TargetComputers.Count) computers" 'HEADER'
-
 # ===================================================================
-# Detect Latest mpam-fe.exe File
+# Source File Discovery
+# Expects: <SourceSharePath>\<YYYYMMDD>\v#.###.###.#\mpam-fe.exe
 # ===================================================================
-
 function Get-LatestMpamFile {
     param([string]$Root)
 
-    $files = Get-ChildItem -Path $Root -Recurse -Filter "mpam-fe*.exe" -ErrorAction SilentlyContinue
+    $files = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' }
 
     if (-not $files) {
-        throw "No mpam-fe*.exe files found under $Root"
+        throw "No mpam-fe.exe files found under '$Root'. " +
+              "Expected folder structure: <base>\<YYYYMMDD>\v#.#.#.#\mpam-fe.exe"
     }
 
-    # Pick the newest file by LastWriteTime
-    $latest = $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-
-    return [pscustomobject]@{
-        File    = $latest.FullName
-        Version = 'Unknown'  # We will detect version after install
+    $versioned = foreach ($f in $files) {
+        if ($f.Directory.Name -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+            [pscustomobject]@{
+                File    = $f.FullName
+                Version = [version]$Matches[1]
+            }
+        }
     }
+
+    if (-not $versioned) {
+        throw "mpam-fe.exe files were found but none reside in a 'v#.#.#.#' versioned folder. " +
+              "Rename the containing folder to match the pattern (e.g. v1.449.681.0)."
+    }
+
+    return $versioned | Sort-Object Version -Descending | Select-Object -First 1
 }
 
 # ===================================================================
-# Defender Update Function
+# Endpoint Classification
+# ===================================================================
+function Get-EndpointClassification {
+    param(
+        [string[]]$Computers,
+        [string]$Method,
+        [string]$WsPattern,
+        [string]$DcPattern,
+        [System.Management.Automation.PSCredential]$ADCredential
+    )
+
+    $tiers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($c in $Computers) { $tiers[$c] = 'MemberServer' }
+
+    if ($Method -eq 'Single') { return $tiers }
+
+    if ($Method -eq 'AD') {
+        try {
+            $adMap = [System.Collections.Generic.Dictionary[string,pscustomobject]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            if (Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue) {
+                Import-Module ActiveDirectory -ErrorAction Stop
+                $adParams = @{
+                    Filter      = 'Enabled -eq $true'
+                    Properties  = 'Name','OperatingSystem','userAccountControl'
+                    ErrorAction = 'SilentlyContinue'
+                }
+                if ($ADCredential) { $adParams.Credential = $ADCredential }
+                Get-ADComputer @adParams | ForEach-Object {
+                    $adMap[$_.Name] = [pscustomobject]@{
+                        OS   = $_.OperatingSystem
+                        IsDC = ($_.userAccountControl -band 0x2000) -ne 0
+                    }
+                }
+            } else {
+                # ADSI fallback.  Use DirectoryEntry with explicit creds when
+                # ADCredential is set, mirroring Resolve-TargetComputers.
+                $domain = (Get-CimInstance Win32_ComputerSystem).Domain
+                if ($ADCredential) {
+                    $de = [System.DirectoryServices.DirectoryEntry]::new(
+                        "LDAP://$domain",
+                        $ADCredential.UserName,
+                        $ADCredential.GetNetworkCredential().Password)
+                    $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
+                    $searcher.Filter = '(objectCategory=computer)'
+                } else {
+                    $searcher = [adsisearcher]'(objectCategory=computer)'
+                    $searcher.SearchRoot = "LDAP://$domain"
+                }
+                $searcher.PropertiesToLoad.AddRange(@('name','operatingsystem','useraccountcontrol'))
+                $searcher.PageSize = 1000
+                $searcher.FindAll() | ForEach-Object {
+                    $n   = $_.Properties['name'][0]
+                    $os  = $_.Properties['operatingsystem'][0]
+                    $uac = [int]($_.Properties['useraccountcontrol'][0])
+                    if ($n) {
+                        $adMap[$n] = [pscustomobject]@{ OS = $os; IsDC = ($uac -band 0x2000) -ne 0 }
+                    }
+                }
+                if ($ADCredential) { $de.Dispose() }
+            }
+            foreach ($c in $Computers) {
+                if ($adMap.ContainsKey($c)) {
+                    $info = $adMap[$c]
+                    if ($info.IsDC) { $tiers[$c] = 'DomainController' }
+                    elseif ($info.OS -match 'Windows (10|11|7|8|Vista|XP)') { $tiers[$c] = 'Workstation' }
+                }
+            }
+        } catch {
+            Write-Log "AD classification failed: $($_.Exception.Message). All hosts treated as MemberServer." 'WARN'
+        }
+        return $tiers
+    }
+
+    # Pattern method
+    foreach ($c in $Computers) {
+        if ($DcPattern -and $c -imatch $DcPattern)     { $tiers[$c] = 'DomainController' }
+        elseif ($WsPattern -and $c -imatch $WsPattern) { $tiers[$c] = 'Workstation' }
+    }
+    return $tiers
+}
+
+function Resolve-WinRmCredential ([string]$Tier) {
+    switch ($Tier) {
+        'Workstation'      { if ($WorkstationCredential)       { return $WorkstationCredential }       }
+        'DomainController' { if ($DomainControllerCredential)  { return $DomainControllerCredential }  }
+    }
+    if ($ServerCredential) { return $ServerCredential }
+    return $Credential   # $null = run as calling user
+}
+
+# ===================================================================
+# Core Update Function  (single implementation used by both modes)
 # ===================================================================
 function Invoke-DefenderUpdate {
     param(
         [string]$Computer,
         [string]$SourceFile,
         [string]$TempFolderOnTarget,
-        [string]$MpamFileName,
-        [switch]$WhatIfMode,
-        [string]$LogSharePath
+        [string]$AvailableVersionStr,
+        [bool]$WhatIfMode,
+        [string]$LogSharePath,
+        [System.Management.Automation.PSCredential]$WinRmCredential,
+        [bool]$DisableIPv6 = $true
     )
 
-    # PATCH 3 — suppress reconnect warnings inside job runspace
     $WarningPreference = 'SilentlyContinue'
 
     $result = [pscustomobject]@{
@@ -332,693 +768,682 @@ function Invoke-DefenderUpdate {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
+        # --- Dry-run ---
         if ($WhatIfMode) {
-            $result.Status = 'WhatIf'
+            $result.Status  = 'WhatIf'
             $result.Details = 'Dry-run mode – no changes made'
             return $result
         }
 
-        if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-            throw "WinRM (5985) not reachable"
-        }
+        # --- Connectivity ---
+        $pingOk = Test-Connection -ComputerName $Computer -Count 1 -Quiet `
+            -TimeoutSeconds 2 -ErrorAction SilentlyContinue
 
-        $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
-
-        $currentVer = Invoke-Command -Session $session -ScriptBlock {
-            try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion } catch { $null }
-        }
-        $result.OldVersion = $currentVer
-
-        # No filename-based version parsing.
-        # We always install the package and determine the version afterward.
-
-        Invoke-Command -Session $session -ScriptBlock {
-            New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null
-        }
-
-        $remoteFile = Invoke-Command -Session $session -ScriptBlock {
-            Join-Path $using:TempFolderOnTarget $using:MpamFileName
-        }
-
-        Copy-Item -Path $SourceFile -Destination $remoteFile -ToSession $session -Force
-
-        $install = Invoke-Command -Session $session -ScriptBlock {
-            $log = Join-Path $using:TempFolderOnTarget "install_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
-            $p = Start-Process -FilePath $using:remoteFile -ArgumentList '/q' -Wait -PassThru -NoNewWindow `
-                -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
-            [pscustomobject]@{ ExitCode = $p.ExitCode; Log = $log }
-        }
-
-        $finalVer = Invoke-Command -Session $session -ScriptBlock {
-            try { (Get-MpComputerStatus).AntivirusSignatureVersion } catch { $null }
-        }
-        $result.NewVersion = $finalVer
-
-        if ($LogSharePath -and (Test-Path $LogSharePath -ErrorAction SilentlyContinue)) {
+        # WinRM TCP test.  When DisableIPv6 is set (LAN default), resolve to
+        # IPv4 only and connect directly — avoids the ~21s Test-NetConnection
+        # timeout on DNS AAAA records whose IPv6 routes aren't actually live.
+        $winrmOk = $false
+        if ($DisableIPv6) {
             try {
-                $targetLogDir = Join-Path $LogSharePath $Computer
-                if (-not (Test-Path $targetLogDir)) {
-                    New-Item -Path $targetLogDir -ItemType Directory -Force | Out-Null
+                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
+                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
+                if ($addrs) {
+                    $client = [System.Net.Sockets.TcpClient]::new()
+                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $winrmOk = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
+                    try { $client.Close() } catch {}
                 }
-                Copy-Item -Path "$remoteFile.*" -Destination $targetLogDir -FromSession $session -Force -ErrorAction SilentlyContinue
-            }
-            catch {}
-        }
-
-        Invoke-Command -Session $session -ScriptBlock {
-            Remove-Item (Split-Path $using:remoteFile -Parent) -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        Remove-PSSession $session
-
-        if ($install.ExitCode -eq 0 -and $finalVer) {
-            $result.Status = 'Success'
-            $result.Details = "$currentVer → $finalVer"
+            } catch { $winrmOk = $false }
         } else {
-            $result.Status = 'Failed'
-            $result.Details = ($_.Exception.Message -replace "`r`n", " " -replace "\s+", " ").Trim()
+            $winrmOk = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
+                -InformationLevel Quiet -WarningAction SilentlyContinue)
         }
-    }
-    catch {
-        $result.Status = 'Failed'
-        $result.Details = $_.Exception.Message -replace "`r`n", " "
-    }
-    finally {
+
+        if (-not $winrmOk) {
+            throw $(if ($pingOk) { 'Online but WinRM (5985) not reachable — may be blocked or disabled' }
+                    else          { 'Host offline (no ping response; WinRM 5985 not reachable)' })
+        }
+
+        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
+        $session = New-PSSession @sessionParams
+
+        try {
+            # --- Pre-update health check ---
+            $svcStatus = Invoke-Command -Session $session -ScriptBlock {
+                $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+                if ($svc) { $svc.Status.ToString() } else { 'NotFound' }
+            }
+            if ($svcStatus -ne 'Running') {
+                throw "Windows Defender service is not running (Status: $svcStatus)"
+            }
+
+            # --- Current version check (pre-transfer) ---
+            $currentVerStr = Invoke-Command -Session $session -ScriptBlock {
+                try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion }
+                catch { $null }
+            }
+            $result.OldVersion = $currentVerStr
+
+            if ($currentVerStr -and $AvailableVersionStr) {
+                try {
+                    if ([version]$currentVerStr -ge [version]$AvailableVersionStr) {
+                        $result.Status     = 'No Update Needed'
+                        $result.NewVersion = $currentVerStr
+                        $result.Details    = "Already at v$currentVerStr (available: v$AvailableVersionStr)"
+                        return $result
+                    }
+                } catch {
+                    # Version parse failed – proceed with install and let it determine the outcome
+                }
+            }
+
+            # --- File transfer ---
+            $mpamFileName = Split-Path $SourceFile -Leaf
+            Invoke-Command -Session $session -ScriptBlock {
+                New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null
+            }
+            $remoteFile = Join-Path $TempFolderOnTarget $mpamFileName
+            Copy-Item -Path $SourceFile -Destination $remoteFile -ToSession $session -Force
+
+            # --- Silent install ---
+            $install = Invoke-Command -Session $session -ScriptBlock {
+                $logFile = Join-Path $using:TempFolderOnTarget "install_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
+                $errFile = $logFile + '.err'
+                $p = Start-Process `
+                    -FilePath    $using:remoteFile `
+                    -ArgumentList '/q' `
+                    -Wait -PassThru -NoNewWindow `
+                    -RedirectStandardOutput $logFile `
+                    -RedirectStandardError  $errFile
+                [pscustomobject]@{
+                    ExitCode = $p.ExitCode
+                    LogFile  = $logFile
+                    ErrFile  = $errFile
+                }
+            }
+
+            # --- Post-install version ---
+            $newVerStr = Invoke-Command -Session $session -ScriptBlock {
+                try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion }
+                catch { $null }
+            }
+            $result.NewVersion = $newVerStr
+
+            # --- Optional log collection ---
+            if ($LogSharePath -and (Test-Path $LogSharePath -ErrorAction SilentlyContinue)) {
+                try {
+                    $hostLogDir = Join-Path $LogSharePath $Computer
+                    if (-not (Test-Path $hostLogDir)) {
+                        New-Item -Path $hostLogDir -ItemType Directory -Force | Out-Null
+                    }
+                    foreach ($lf in @($install.LogFile, $install.ErrFile)) {
+                        Copy-Item -Path $lf -Destination $hostLogDir `
+                            -FromSession $session -Force -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+            }
+
+            # --- Cleanup remote temp ---
+            Invoke-Command -Session $session -ScriptBlock {
+                Remove-Item $using:TempFolderOnTarget -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+            # --- Determine outcome ---
+            if ($install.ExitCode -eq 0 -and $newVerStr -and $newVerStr -ne $currentVerStr) {
+                $result.Status  = 'Success'
+                $result.Details = "$currentVerStr → $newVerStr"
+            } elseif ($install.ExitCode -eq 0) {
+                $result.Status     = 'No Update Needed'
+                $result.NewVersion = $currentVerStr
+                $result.Details    = 'Installer confirmed: already current'
+            } else {
+                $result.Status  = 'Failed'
+                $result.Details = "Installer exit code: $($install.ExitCode)"
+            }
+
+        } finally {
+            if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+        }
+
+    } catch {
+        $result.Status  = 'Failed'
+        $result.Details = ($_.Exception.Message -replace "`r`n", ' ').Trim()
+    } finally {
         $sw.Stop()
         $result.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
     }
+
     return $result
 }
 
 # ===================================================================
-# Core Update Logic (used in both serial and parallel)
+# Resolve Targets and Source
 # ===================================================================
-$latest = Get-LatestMpamFile -Root $SourceSharePath
-$SourceFile = $latest.File
-$MpamFileName = Split-Path $SourceFile -Leaf
+$TargetComputers = Resolve-TargetComputers
+if (-not $TargetComputers -or $TargetComputers.Count -eq 0) {
+    Write-Log 'No target computers found. Exiting.' 'ERROR'
+    return
+}
+Write-Log "Will process $($TargetComputers.Count) computers" 'HEADER'
 
-Write-Log "Latest mpam-fe package detected: $MpamFileName (version $($latest.Version))" "INFO"
+$Results = [System.Collections.Generic.List[pscustomobject]]::new()
+
+# ===================================================================
+# Apply administrative exclusions
+# ===================================================================
+if ($ExcludeList.Count -gt 0) {
+    foreach ($ex in $ExcludeList) {
+        if ($TargetComputers -contains $ex) {
+            Write-Log "EXCLUDED (administrative): $ex — listed in ExcludeComputers in config.conf" 'WARN'
+            $Results.Add([pscustomobject]@{
+                ComputerName = $ex
+                Status       = 'Excluded'
+                OldVersion   = ''
+                NewVersion   = ''
+                DurationSec  = 0
+                Details      = 'Administrative exclusion (ExcludeComputers in config.conf)'
+                Attempt      = 0
+                Timeout      = $false
+            })
+        }
+    }
+    $TargetComputers = $TargetComputers | Where-Object { $ExcludeList -notcontains $_ }
+    if ($ExcludeList.Count -gt 0) {
+        Write-Log "After exclusions: $($TargetComputers.Count) computers to process" 'INFO'
+    }
+}
+
+# ===================================================================
+# Classify endpoints and pre-compute per-host credentials
+# ===================================================================
+Write-Log "Classifying endpoints (method: $ClassificationMethod)..." 'INFO'
+$EndpointTiers = Get-EndpointClassification `
+    -Computers    $TargetComputers `
+    -Method       $ClassificationMethod `
+    -WsPattern    $WorkstationPattern `
+    -DcPattern    $DomainControllerPattern `
+    -ADCredential $ADCredential
+
+$tierGroups = $EndpointTiers.Values | Group-Object | ForEach-Object { "$($_.Count) $($_.Name)" }
+Write-Log "Tier breakdown : $($tierGroups -join ' | ')" 'INFO'
+
+$HostCredentials = [System.Collections.Generic.Dictionary[string,System.Management.Automation.PSCredential]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($c in $TargetComputers) {
+    $HostCredentials[$c] = Resolve-WinRmCredential -Tier ($EndpointTiers.ContainsKey($c) ? $EndpointTiers[$c] : 'MemberServer')
+}
+
+if (-not $SourceSharePath) {
+    throw '-SourceSharePath is required. Pass it as a parameter or set SourceSharePath in conf\config.conf.'
+}
+if (-not (Test-Path $SourceSharePath -PathType Container)) {
+    throw "SourceSharePath not found or inaccessible: $SourceSharePath"
+}
+
+$latest = Get-LatestMpamFile -Root $SourceSharePath
+$SourceFile          = $latest.File
+$AvailableVersionStr = $latest.Version.ToString()
+Write-Log "Latest definition version: v$AvailableVersionStr" 'SUCCESS'
+Write-Log "Source file              : $SourceFile" 'INFO'
 
 if (-not (Test-Path $SourceFile)) {
-    Write-Log "CRITICAL: Source file not found: $SourceFile" 'ERROR'
-    throw "mpam-fe.exe file missing!"
-}
-
-$UpdateScriptBlock = {
-    param($Computer, $SourceFile, $TempFolderOnTarget, $MpamFileName, $WhatIfMode, $LogSharePath)
-
-    $result = [pscustomobject]@{
-        ComputerName = $Computer
-        Status       = 'Unknown'
-        OldVersion   = ''
-        NewVersion   = ''
-        DurationSec  = 0
-        Details      = ''
-    }
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-
-    try {
-        if ($WhatIfMode) {
-            $result.Status = 'WhatIf'
-            $result.Details = 'Dry-run mode – no changes made'
-            return $result
-        }
-
-        if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-            throw "WinRM (5985) not reachable"
-        }
-
-        $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
-
-        # Add Pre-Update Health Check
-        $defenderStatus = Invoke-Command -Session $session -ScriptBlock {
-            Get-Service -Name WinDefend | Select-Object Status
-        }
-        if ($defenderStatus.Status -ne 'Running') {
-            throw "Windows Defender service not running"
-        }
-
-        $currentVer = Invoke-Command -Session $session -ScriptBlock {
-            try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion } catch { $null }
-        }
-        $result.OldVersion = $currentVer
-
-        # No filename-based version parsing.
-        # We always install the package and determine the version afterward.
-
-        Invoke-Command -Session $session -ScriptBlock { New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null }
-        $remoteFile = Invoke-Command -Session $session -ScriptBlock { Join-Path $using:TempFolderOnTarget $using:MpamFileName }
-        Copy-Item -Path $SourceFile -Destination $remoteFile -ToSession $session -Force
-
-        $install = Invoke-Command -Session $session -ScriptBlock {
-            $log = Join-Path $using:TempFolderOnTarget "install_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
-            $p = Start-Process -FilePath $using:remoteFile -ArgumentList '/q' -Wait -PassThru -NoNewWindow `
-                       -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
-            [pscustomobject]@{ ExitCode = $p.ExitCode; Log = $log }
-        }
-
-        $finalVer = Invoke-Command -Session $session -ScriptBlock {
-            try { (Get-MpComputerStatus).AntivirusSignatureVersion } catch { $null }
-        }
-        $result.NewVersion = $finalVer
-
-        # Detect "No Update Needed"
-        if ($install.ExitCode -eq 0 -and $finalVer -eq $currentVer) {
-            $result.Status  = 'No Update Needed'
-            $result.Details = 'Already current'
-        }
-
-        # Collect remote logs if LogSharePath is provided and accessible
-        if ($LogSharePath -and (Test-Path $LogSharePath -ErrorAction SilentlyContinue)) {
-            try {
-                $targetLogDir = Join-Path $LogSharePath $Computer
-                if (-not (Test-Path $targetLogDir)) { New-Item -Path $targetLogDir -ItemType Directory -Force | Out-Null }
-                Copy-Item -Path "$remoteFile.*" -Destination $targetLogDir -FromSession $session -Force -ErrorAction SilentlyContinue
-            }
-            catch {
-                # Silently skip log collection if it fails - don't fail the entire update
-            }
-        }
-
-        Invoke-Command -Session $session -ScriptBlock { Remove-Item (Split-Path $using:remoteFile -Parent) -Recurse -Force -ErrorAction SilentlyContinue }
-        Remove-PSSession $session
-
-        if ($install.ExitCode -eq 0 -and $finalVer) {
-            $result.Status = 'Success'
-            $result.Details = ("$currentVer → $finalVer").Trim()
-        } else {
-            $result.Status = 'Failed'
-            $result.Details = ("Installer exit code: $($install.ExitCode)").Trim()
-        }
-    }
-    catch {
-        $result.Status = 'Failed'
-        $result.Details = $_.Exception.Message -replace "`r`n", " "
-    }
-    finally {
-        $sw.Stop()
-        $result.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
-        $result
-    }
+    Write-Log "CRITICAL: Source file is not accessible: $SourceFile" 'ERROR'
+    throw 'Source file missing or share not reachable.'
 }
 
 # ===================================================================
-# Execution: Start-ThreadJob Parallel Engine (PS7+) or Serial (PS5.1)
+# Execution Engine
 # ===================================================================
-
-$Results = @()
-
 if ($PSVersionTable.PSVersion.Major -ge 7) {
+    # -----------------------------------------------------------
+    # PARALLEL MODE  (PS 7+)
+    # -----------------------------------------------------------
     $MaxConcurrent  = $ParallelThreads
-    $TimeoutSeconds = 300  # 5 minutes
+    $TimeoutSeconds = 300   # 5 minutes per computer
     $RetryLimit     = 3
 
-    # Prepare per-host log directory
-    $PerHostLogDir = Join-Path $LogPath "PerHost"
+    $PerHostLogDir = Join-Path $LogPath 'PerHost'
     if (-not (Test-Path $PerHostLogDir)) {
         New-Item -Path $PerHostLogDir -ItemType Directory -Force | Out-Null
     }
 
-    # Build job queue
-    $Queue = foreach ($comp in $TargetComputers) {
-        [pscustomobject]@{
-            Computer = $comp
-            Attempt  = 1
-            Status   = 'Pending'
-        }
+    # Queue as a generic Queue for O(1) Dequeue
+    $Queue = [System.Collections.Generic.Queue[pscustomobject]]::new()
+    foreach ($comp in $TargetComputers) {
+        $Queue.Enqueue([pscustomobject]@{ Computer = $comp; Attempt = 1; Credential = $HostCredentials[$comp] })
     }
 
-    $ActiveJobs  = @()
-    $Completed   = @()
-    $StartTimes  = @{}
-    $JobMeta     = @{}  # Key: Job.Id, Value: @{ Computer = <string>; Attempt = <int> }
+    # Active jobs: keyed by Job.Id
+    $ActiveJobs = [System.Collections.Generic.Dictionary[int, hashtable]]::new()
 
-    Write-Log "Executing in THREADJOB mode ($MaxConcurrent concurrent jobs)" 'HEADER'
+    Write-Log "Executing in PARALLEL mode ($MaxConcurrent concurrent threads)" 'HEADER'
 
-    $DashboardTimer = [System.Diagnostics.Stopwatch]::StartNew()
-    $DashboardAnchor = $null
-
-    # Suppress console output during dashboard loop to prevent scrolling
-    $SuppressConsoleOutput = $true
-
+    $script:SuppressConsoleOutput = $true
+    $savedWarningPref = $WarningPreference
+    $WarningPreference = 'SilentlyContinue'
+    $DashTimer  = [System.Diagnostics.Stopwatch]::StartNew()
+    $DashAnchor = $null
 
     while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
-        # ============================================================
-        # DASHBOARD (TOP-OF-LOOP REFRESH — PREVENTS SCROLLING)
-        # ============================================================
+        # Dashboard refresh every 5 seconds
+        if (-not $DashAnchor) { $DashAnchor = $Host.UI.RawUI.CursorPosition }
 
-        # Capture anchor once
-        if (-not $DashboardAnchor) {
-            $DashboardAnchor = $Host.UI.RawUI.CursorPosition
-        }
+        if ($DashTimer.Elapsed.TotalSeconds -ge 5) {
+            $DashTimer.Restart()
+            $Host.UI.RawUI.CursorPosition = $DashAnchor
 
-        # Refresh dashboard BEFORE any job processing
-        if ($DashboardTimer.Elapsed.TotalSeconds -ge 5) {
-            $DashboardTimer.Restart()
-
-            # Reset cursor to anchor
-            $Host.UI.RawUI.CursorPosition = $DashboardAnchor
-
-            $running = $ActiveJobs.Count
-            $pending = $Queue.Count
-            $done    = $Completed.Count
-
-            # Build active host list
-            $activeHosts = if ($ActiveJobs.Count -gt 0) {
-                ($ActiveJobs | ForEach-Object { $JobMeta[$_.Id].Computer }) -join ', '
-            } else {
-                'None'
-            }
+            $activeNames = if ($ActiveJobs.Count -gt 0) {
+                ($ActiveJobs.Values | ForEach-Object { $_.Computer } | Select-Object -First 8) -join ', '
+            } else { 'None' }
 
             $elapsed = [string]::Format('{0:hh\:mm\:ss}', (Get-Date) - $ScriptStartTime)
 
-            # Overwrite dashboard frame
-            Write-Host "=== Defender Update Dashboard ===" -ForegroundColor Cyan
-            Write-Host "Running:     $running"
-            Write-Host "Pending:     $pending"
-            Write-Host "Completed:   $done"
-            Write-Host "Active:      $activeHosts"
-            Write-Host "Elapsed:     $elapsed"
-
-            # Clear leftover characters from previous frames
-            Write-Host (" " * 80)
-            Write-Host (" " * 80)
+            Write-Host ('=== Defender Update Dashboard ' + ('=' * 24)) -ForegroundColor Cyan
+            Write-Host "Running:    $($ActiveJobs.Count)                    "
+            Write-Host "Pending:    $($Queue.Count)                    "
+            Write-Host "Completed:  $($Results.Count)                    "
+            Write-Host "Active:     $activeNames                    "
+            Write-Host "Elapsed:    $elapsed                    "
+            Write-Host (' ' * 80)
         }
 
-        # Launch new jobs if capacity available
+        # Launch jobs up to capacity
         while ($ActiveJobs.Count -lt $MaxConcurrent -and $Queue.Count -gt 0) {
-            $item  = $Queue[0]
-            $Queue = if ($Queue.Count -gt 1) { $Queue[1..($Queue.Count - 1)] } else { @() }
-
-            # Extract values into simple variables for Start-ThreadJob
-            $comp    = $item.Computer
-            $attempt = $item.Attempt
-
-            $job = Start-ThreadJob -ScriptBlock ${function:Invoke-DefenderUpdate} -ArgumentList @(
-                $comp,
+            $item = $Queue.Dequeue()
+            $job  = Start-ThreadJob -ScriptBlock ${function:Invoke-DefenderUpdate} -ArgumentList @(
+                $item.Computer,
                 $SourceFile,
                 $TempFolderOnTarget,
-                $MpamFileName,
-                $WhatIfMode,
-                $LogSharePath
+                $AvailableVersionStr,
+                [bool]$WhatIfMode,
+                $LogSharePath,
+                $item.Credential,
+                [bool]$DisableIPv6
             )
-
-            # Track start time and metadata (do NOT use Add-Member on the job)
-            $StartTimes[$job.Id] = Get-Date
-            $JobMeta[$job.Id] = @{
-                Computer = $comp
-                Attempt  = $attempt
+            $ActiveJobs[$job.Id] = @{
+                Job        = $job
+                Computer   = $item.Computer
+                Attempt    = $item.Attempt
+                Credential = $item.Credential
+                StartTime  = [datetime]::UtcNow
             }
-
-            $ActiveJobs = @($ActiveJobs) + $job
         }
 
-        # Check for completed jobs
-        foreach ($job in @($ActiveJobs)) {
-            if ($job.State -in 'Completed','Failed','Stopped') {
+        # Collect finished jobs
+        foreach ($id in @($ActiveJobs.Keys)) {
+            $meta = $ActiveJobs[$id]
+            $job  = $meta.Job
 
-                # Look up metadata for this job
-                $meta     = $JobMeta[$job.Id]
-                $computer = $meta.Computer
-                $attempt  = $meta.Attempt
+            if ($job.State -notin 'Running','NotStarted') {
+                $r = Receive-Job $job -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
 
-                $result = Receive-Job $job -ErrorAction SilentlyContinue
-
-                # Normalize result: handle null or arrays
-                if (-not $result) {
-                    $result = [pscustomobject]@{
-                        ComputerName = $computer
-                        Status       = 'Failed'
-                        OldVersion   = ''
-                        NewVersion   = ''
-                        DurationSec  = 0
-                        Details      = 'Job produced no output'
-                        Attempt      = $attempt
-                        Timeout      = $false
+                if (-not $r) {
+                    $r = [pscustomobject]@{
+                        ComputerName = $meta.Computer; Status = 'Failed'
+                        OldVersion = ''; NewVersion = ''; DurationSec = 0
+                        Details = 'Job produced no output'; Attempt = $meta.Attempt; Timeout = $false
                     }
-                }
-                elseif ($result -is [array]) {
-                    $result = $result[-1]
+                } elseif ($r -is [array]) {
+                    $r = $r[-1]
                 }
 
-                # Ensure Attempt is present and aligned with metadata
-                if ($result.PSObject.Properties.Name -contains 'Attempt') {
-                    $result.Attempt = $attempt
+                $r.Attempt = $meta.Attempt
+                Add-Content -Path (Join-Path $PerHostLogDir "$($meta.Computer).log") `
+                    -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Attempt $($meta.Attempt): $($r.Status) – $($r.Details)"
+
+                # Classify failure: hard (no retry) vs soft (retryable)
+                $det = ($r.Details ?? '').ToLower()
+                $isHardFail = $det -match 'winrm|not reachable|offline|unreachable|no ping|access.{0,10}denied|authentication|cannot.?find|dns' `
+                    -or $r.Timeout
+
+                if ($r.Status -eq 'Failed' -and -not $isHardFail -and $meta.Attempt -lt $RetryLimit) {
+                    Write-Log "Retry scheduled: $($meta.Computer) (attempt $($meta.Attempt) → $($meta.Attempt + 1))" 'WARN'
+                    $Queue.Enqueue([pscustomobject]@{
+                        Computer   = $meta.Computer
+                        Attempt    = $meta.Attempt + 1
+                        Credential = $meta.Credential
+                    })
                 } else {
-                    $result | Add-Member -NotePropertyName Attempt -NotePropertyValue $attempt -Force
+                    $Results.Add($r)
                 }
 
-                # Write per-host log
-                $hostLog = Join-Path $PerHostLogDir "$computer.log"
-                Add-Content -Path $hostLog -Value "$(Get-Date) Attempt ${attempt}: $($result.Status) - $($result.Details)"
-
-                # -------------------------------
-                # FAILURE CLASSIFICATION LOGIC
-                # -------------------------------
-
-                $details = ($result.Details ?? '').ToString().ToLower()
-
-                $isHardFail =
-                    $details -match 'winrm' -or
-                    $details -match 'not reachable' -or
-                    $details -match 'offline' -or
-                    $details -match 'unreachable' -or
-                    $details -match 'access denied' -or
-                    $details -match 'authentication' -or
-                    $details -match 'cannot find' -or
-                    $details -match 'dns' -or
-                    $result.Timeout
-
-                if ($result.Status -eq 'Failed' -and -not $isHardFail -and $attempt -lt $RetryLimit) {
-                    # Retryable failure
-                    Write-Log "Retry scheduled for $computer (attempt $attempt → $($attempt + 1))" 'WARN'
-                    $Queue = @($Queue) + [pscustomobject]@{
-                        Computer = $computer
-                        Attempt  = $attempt + 1
-                        Status   = 'Pending'
-                    }
-                }
-                else {
-                    # Hard fail OR retry limit reached OR success
-                    $Completed += $result
-                }
-
-                # Cleanup
-                Remove-Job $job -Force
-                $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
-                $JobMeta.Remove($job.Id)     | Out-Null
-                $StartTimes.Remove($job.Id)  | Out-Null
+                Remove-Job $job -Force -ErrorAction SilentlyContinue
+                [void]$ActiveJobs.Remove($id)
             }
         }
 
-        # Timeout handling
-        foreach ($job in @($ActiveJobs)) {
-            $elapsed = (Get-Date) - $StartTimes[$job.Id]
+        # Timeout enforcement
+        foreach ($id in @($ActiveJobs.Keys)) {
+            $meta    = $ActiveJobs[$id]
+            $elapsed = ([datetime]::UtcNow - $meta.StartTime).TotalSeconds
 
-            if ($elapsed.TotalSeconds -gt $TimeoutSeconds) {
-                $meta     = $JobMeta[$job.Id]
-                $computer = $meta.Computer
-                $attempt  = $meta.Attempt
-
-                Write-Log "TIMEOUT: $computer exceeded $TimeoutSeconds seconds (attempt $attempt)" 'ERROR'
-                Stop-Job $job -Force
-
-                $Completed += [pscustomobject]@{
-                    ComputerName = $computer
-                    Status       = 'Failed'
-                    OldVersion   = ''
-                    NewVersion   = ''
-                    DurationSec  = [math]::Round($elapsed.TotalSeconds,2)
-                    Details      = 'Timeout'
-                    Attempt      = $attempt
-                    Timeout      = $true
-                }
-
-                Remove-Job $job -Force
-                $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
-                $JobMeta.Remove($job.Id)     | Out-Null
-                $StartTimes.Remove($job.Id)  | Out-Null
+            if ($elapsed -gt $TimeoutSeconds) {
+                Write-Log "TIMEOUT: $($meta.Computer) exceeded ${TimeoutSeconds}s (attempt $($meta.Attempt))" 'ERROR'
+                Stop-Job $meta.Job -Force -ErrorAction SilentlyContinue
+                $Results.Add([pscustomobject]@{
+                    ComputerName = $meta.Computer; Status = 'Failed'
+                    OldVersion = ''; NewVersion = ''
+                    DurationSec = [math]::Round($elapsed, 2)
+                    Details = 'Timeout'; Attempt = $meta.Attempt; Timeout = $true
+                })
+                Remove-Job $meta.Job -Force -ErrorAction SilentlyContinue
+                [void]$ActiveJobs.Remove($id)
             }
         }
 
         Start-Sleep -Milliseconds 500
     }
 
-    $Results = $Completed
-    # Re-enable console output now that dashboard is finished
-    $SuppressConsoleOutput = $false
-
-    Write-Host ""
-    Write-Host "=== Final Results ===" -ForegroundColor Magenta
-
-    $Results |
-        Sort-Object ComputerName |
-        Select-Object `
-            ComputerName,
-            Status,
-            OldVersion,
-            NewVersion,
-            DurationSec,
-            @{n='Attempt#'; e={$_.Attempt}},
-            @{n='Timeout?'; e={$_.Timeout}},
+    $script:SuppressConsoleOutput = $false
+    $WarningPreference = $savedWarningPref
+    Write-Host ''
+    Write-Host '=== Final Results ===' -ForegroundColor Magenta
+    $Results | Sort-Object ComputerName |
+        Select-Object ComputerName, Status, OldVersion, NewVersion, DurationSec,
+            @{n='Attempt#'; e={ $_.Attempt }},
+            @{n='Timeout?'; e={ $_.Timeout }},
             Details |
-        Format-Table -Wrap -AutoSize
-}
-else {
-    # SERIAL MODE (PowerShell 5.1)
-    Write-Log "Executing in SERIAL mode (PowerShell 5.1)" 'WARN'
+        Format-Table -AutoSize -Wrap
+
+} else {
+    # -----------------------------------------------------------
+    # SERIAL MODE  (PS 5.1)
+    # -----------------------------------------------------------
+    Write-Log 'Executing in SERIAL mode (PowerShell 5.1 detected; upgrade to PS 7+ for parallel)' 'WARN'
     $i = 0
     foreach ($comp in $TargetComputers) {
         $i++
         $pct = [math]::Round(($i / $TargetComputers.Count) * 100, 1)
-        Write-Progress -Activity "Updating Defender Definitions" -Status "Processing $i of $($TargetComputers.Count)" -CurrentOperation $comp -PercentComplete $pct
-        $Results += & $UpdateScriptBlock $comp $SourceFile $TempFolderOnTarget $MpamFileName $WhatIfMode $LogSharePath
+        Write-Progress -Activity 'Updating Defender Definitions' `
+            -Status "Processing $i of $($TargetComputers.Count): $comp" `
+            -PercentComplete $pct
+
+        $r = Invoke-DefenderUpdate `
+            -Computer            $comp `
+            -SourceFile          $SourceFile `
+            -TempFolderOnTarget  $TempFolderOnTarget `
+            -AvailableVersionStr $AvailableVersionStr `
+            -WhatIfMode          ([bool]$WhatIfMode) `
+            -LogSharePath        $LogSharePath `
+            -WinRmCredential     $HostCredentials[$comp] `
+            -DisableIPv6         $DisableIPv6
+        $Results.Add($r)
     }
-    Write-Progress -Completed -Activity "Done"
+    Write-Progress -Activity 'Done' -Completed
 }
 
 # ===================================================================
-# Generate Beautiful HTML Report (with readable multi-line CSS)
+# Version Analytics
+# ===================================================================
+foreach ($r in $Results) {
+    $delta = 'Unknown'
+    if ($r.OldVersion -and $r.NewVersion) {
+        try {
+            $vOld = [version]$r.OldVersion
+            $vNew = [version]$r.NewVersion
+            # Build delta is only meaningful when the minor version did not change;
+            # a minor-version advance resets the build number, making the difference negative and misleading.
+            if ($vOld.Minor -eq $vNew.Minor) {
+                $delta = $vNew.Build - $vOld.Build
+            } else {
+                $delta = 'N/A'
+            }
+        } catch {}
+    }
+    $r | Add-Member -NotePropertyName Delta -NotePropertyValue $delta -Force
+    Write-Log "VersionHistory: $($r.ComputerName) | Old=$($r.OldVersion) | New=$($r.NewVersion) | Delta=$delta" 'INFO'
+}
+
+$OldestVersion = ($Results | Where-Object OldVersion |
+    Sort-Object { try { [version]$_.OldVersion } catch { [version]'0.0.0.0' } } |
+    Select-Object -First 1).OldVersion
+$NewestVersion = ($Results | Where-Object NewVersion |
+    Sort-Object { try { [version]$_.NewVersion } catch { [version]'0.0.0.0' } } -Descending |
+    Select-Object -First 1).NewVersion
+$HostsUpdated  = @($Results | Where-Object Status -eq 'Success').Count
+
+# ===================================================================
+# HTML Report Generation
 # ===================================================================
 function New-HtmlReport {
-    param($Data, $RunTime)
+    param(
+        [System.Collections.Generic.List[pscustomobject]]$Data,
+        [timespan]$RunTime
+    )
 
-    $css = @"
+    $successCount  = @($Data | Where-Object Status -eq 'Success').Count
+    $failCount     = @($Data | Where-Object Status -eq 'Failed').Count
+    $skipCount     = @($Data | Where-Object Status -eq 'No Update Needed').Count
+    $whatifCount   = @($Data | Where-Object Status -eq 'WhatIf').Count
+    $excludedCount = @($Data | Where-Object Status -eq 'Excluded').Count
+
+    $css = @'
 <style>
-    body {
-        font-family: 'Segoe UI', Arial, sans-serif;
-        margin: 40px;
-        background: #f5f7fa;
-        color: #333;
-    }
-    h1 {
-        color: #0078d4;
-        border-bottom: 3px solid #0078d4;
-        padding-bottom: 10px;
-    }
-    h2 {
-        color: #005a9e;
-    }
-    table {
-        width: 100%;
-        border-collapse: collapse;
-        margin: 25px 0;
-        background: white;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-        border-radius: 8px;
-        overflow: hidden;
-    }
-    th {
-        background: #0078d4;
-        color: white;
-        padding: 14px 12px;
-        text-align: left;
-        font-weight: 600;
-    }
-    td {
-        padding: 12px;
-        border-bottom: 1px solid #ddd;
-    }
-    tr:nth-child(even) {
-        background: #f9f9f9;
-    }
-    .success { color: #107c10; font-weight: bold; }
-    .failed  { color: #d13438; font-weight: bold; }
-    .skipped { color: #9c5100; font-weight: bold; }
-    .footer {
-        margin-top: 50px;
-        color: #666;
-        font-size: 0.9em;
-        text-align: center;
-    }
-    p {
-        font-size: 1.1em;
-        line-height: 1.6;
-    }
+  *   { box-sizing: border-box; }
+  body{ font-family: "Segoe UI", Arial, sans-serif; margin: 40px; background: #f5f7fa; color: #333; }
+  h1  { color: #0078d4; border-bottom: 3px solid #0078d4; padding-bottom: 10px; margin-bottom: 4px; }
+  h2  { color: #005a9e; margin-top: 32px; }
+  p   { line-height: 1.6; }
+  table          { width: 100%; border-collapse: collapse; margin: 16px 0; background: #fff;
+                   box-shadow: 0 4px 12px rgba(0,0,0,.1); border-radius: 8px; overflow: hidden; }
+  th             { background: #0078d4; color: #fff; padding: 13px 12px; text-align: left; font-weight: 600; }
+  td             { padding: 11px 12px; border-bottom: 1px solid #e8e8e8; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:nth-child(even) td { background: #f9f9f9; }
+  .tag           { display: inline-block; padding: 2px 10px; border-radius: 12px;
+                   font-size: .85em; font-weight: 600; color: #fff; }
+  .success       { background: #107c10; }
+  .failed        { background: #d13438; }
+  .skipped       { background: #9c5100; }
+  .whatif        { background: #0078d4; }
+  .excluded      { background: #6b7280; }
+  .stat-card     { display: inline-block; padding: 14px 28px; border-radius: 10px; margin: 6px 8px 6px 0;
+                   font-size: 1.1em; font-weight: 700; color: #fff; min-width: 120px; text-align: center;
+                   cursor: pointer; user-select: none; }
+  .stat-card.active-filter { outline: 3px solid rgba(255,255,255,.85); outline-offset: -3px; }
+  .sc-ok         { background: #107c10; }
+  .sc-fail       { background: #d13438; }
+  .sc-skip       { background: #9c5100; }
+  .sc-info       { background: #0078d4; }
+  /* Use <table> for the version summary layout, not CSS Grid — Gmail's
+     CSS sanitizer strips 'display: grid' so the cards stack vertically
+     when the report is sent as the email body. */
+  .version-table  { width: 100%; border-collapse: separate; border-spacing: 8px 0; margin: 16px 0; }
+  .version-table td { width: 33.33%; padding: 0; vertical-align: top; }
+  .vcard          { background: #fff; border-radius: 8px; padding: 16px 20px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+                    border-top: 4px solid #0078d4; }
+  .vcard .label   { font-size: .85em; color: #666; margin-bottom: 4px; }
+  .vcard .value   { font-size: 1.4em; font-weight: 700; color: #0078d4; }
+  .vcard-oldest        { border-top-color: #b45309; }
+  .vcard-oldest .value { color: #b45309; }
+  .vcard-newest        { border-top-color: #107c10; }
+  .vcard-newest .value { color: #107c10; }
+  .vcard-hosts         { border-top-color: #0078d4; }
+  .vcard-hosts  .value { color: #0078d4; }
+  .footer        { margin-top: 48px; color: #888; font-size: .85em; text-align: center;
+                   border-top: 1px solid #ddd; padding-top: 16px; }
+  a              { color: #0078d4; }
 </style>
-"@
+'@
 
-    $body = $Data |
-    Sort-Object ComputerName |
-    ConvertTo-Html -Fragment -Property `
-        ComputerName,
-        Status,
-        OldVersion,
-        NewVersion,
-        DurationSec,
-        RetrySuccess,
-        FailureType,
-        Details
+    # Build table rows and inject status badges
+    $rows = $Data | Sort-Object ComputerName |
+        ConvertTo-Html -Fragment -Property ComputerName, Status, OldVersion, NewVersion, DurationSec, Delta, Attempt, Timeout, Details
 
-    foreach ($i in 0..($body.Count-1)) {
-        $body[$i] = $body[$i] -replace '<td>Success</td>', '<td class="success">Success</td>'
-        $body[$i] = $body[$i] -replace '<td>Failed</td>', '<td class="failed">Failed</td>'
-        $body[$i] = $body[$i] -replace '<td>No Update Needed</td>', '<td class="skipped">No Update Needed</td>'
+    # Add table id for the JS badge filter
+    if ($rows.Count -gt 0) { $rows[0] = $rows[0] -replace '<table>', '<table id="resultsTable">' }
+
+    foreach ($i in 0..($rows.Count - 1)) {
+        $rows[$i] = $rows[$i] `
+            -replace '<td>Success</td>',          '<td><span class="tag success">Success</span></td>' `
+            -replace '<td>Failed</td>',           '<td><span class="tag failed">Failed</span></td>' `
+            -replace '<td>No Update Needed</td>', '<td><span class="tag skipped">No Update Needed</span></td>' `
+            -replace '<td>WhatIf</td>',           '<td><span class="tag whatif">WhatIf</span></td>' `
+            -replace '<td>Excluded</td>',         '<td><span class="tag excluded">Excluded</span></td>' `
+            -replace '<td>True</td>',             '<td><strong style="color:#d13438">Yes</strong></td>' `
+            -replace '<td>False</td>',            '<td>No</td>'
     }
 
-    $summary = @"
-Success: $($Data.Where{$_.Status -eq 'Success'}.Count)
-Failed: $($Data.Where{$_.Status -eq 'Failed'}.Count)
-Skipped (Already Current): $($Data.Where{$_.Status -eq 'No Update Needed'}.Count)
-"@
-
-    return @"
+    @"
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <meta charset='utf-8'>
-    <title>Microsoft Defender Definitions Update Report – $(Get-Date -f 'yyyy-MM-dd')</title>
-    $css
+  <meta charset="utf-8">
+  <title>Defender Update Report – $(Get-Date -f 'yyyy-MM-dd')</title>
+  $css
 </head>
 <body>
-    <h1>Microsoft Defender Antivirus Definitions Update</h1>
-    <p><strong>Run Date:</strong> $ScriptStartTime<br>
-       <strong>Source File:</strong> $MpamFileName<br>
-       <strong>Total Duration:</strong> $($RunTime.TotalMinutes.ToString('N2')) minutes</p>
-       <h2>Version History Summary</h2>
-    <p>
-    <strong>Oldest Version Found:</strong> $OldestVersion<br>
-    <strong>Newest Version Applied:</strong> $NewestVersion<br>
-    <strong>Average Delta:</strong> $AverageDelta versions<br>
-    <strong>Hosts Already Current:</strong> $($Data.Where{$_.Status -eq 'No Update Needed'}.Count)<br>
-    <strong>Hosts Updated:</strong> $($Data.Where{$_.Status -eq 'Success'}.Count)<br>
-    <strong>Hosts Failed:</strong> $($Data.Where{$_.Status -eq 'Failed'}.Count)
-    </p>
+  <h1>Microsoft Defender Antivirus – Definitions Update Report</h1>
+  <p>
+    <strong>Run Date:</strong> $ScriptStartTime &nbsp;|&nbsp;
+    <strong>Available Version:</strong> v$AvailableVersionStr &nbsp;|&nbsp;
+    <strong>Total Duration:</strong> $($RunTime.ToString('hh\:mm\:ss')) &nbsp;|&nbsp;
+    <strong>Run By:</strong> $RunAsUser @ $RunFromHost ($RunFromIP)
+  </p>
+  <p style="font-size:.9em; color:#555; margin-top:-6px;">
+    <strong>Source File:</strong> $SourceFile
+  </p>
 
-    <h2>Version History Details</h2>
-    <table>
-        <tr>
-            <th>Computer</th>
-            <th>Old Version</th>
-            <th>New Version</th>
-            <th>Delta</th>
-        </tr>
-        $(
-            ($Data | ForEach-Object {
-                "<tr>
-                    <td>$($_.ComputerName)</td>
-                    <td>$($_.OldVersion)</td>
-                    <td>$($_.NewVersion)</td>
-                    <td>$($_.Delta)</td>
-                </tr>"
-            }) -join "`n"
-        )
+  <div id="statusCards">
+    <span class="stat-card sc-ok"    data-filter="Success"        onclick="filterByStatus(this)">Success<br>$successCount</span>
+    <span class="stat-card sc-fail"  data-filter="Failed"         onclick="filterByStatus(this)">Failed<br>$failCount</span>
+    <span class="stat-card sc-skip"  data-filter="No Update Needed" onclick="filterByStatus(this)">Skipped<br>$skipCount</span>$(if ($whatifCount   -gt 0) { "`n    <span class='stat-card sc-info'  data-filter='WhatIf'   onclick='filterByStatus(this)'>WhatIf<br>$whatifCount</span>" })$(if ($excludedCount -gt 0) { "`n    <span class='stat-card' style='background:#6b7280' data-filter='Excluded'  onclick='filterByStatus(this)'>Excluded<br>$excludedCount</span>" })
+  </div>
+  <p style="font-size:.8em; color:#888; margin-top:4px;">Click a badge to filter the results table. Click again to clear.</p>
 
-    </table>
+  <h2>Fleet Version Summary</h2>
+  <table class="version-table" role="presentation">
+    <tr>
+      <td><div class="vcard vcard-oldest"><div class="label">Oldest Version Found</div><div class="value">$OldestVersion</div></div></td>
+      <td><div class="vcard vcard-newest"><div class="label">Newest Version Applied</div><div class="value">$NewestVersion</div></div></td>
+      <td><div class="vcard vcard-hosts"><div class="label">Hosts Updated</div><div class="value">$HostsUpdated</div></div></td>
+    </tr>
+  </table>
 
-    <h2>Summary: $summary</h2>
+  <h2>Detailed Results ($($Data.Count) computers)</h2>
+  $($rows -join "`n")
 
-    <table>
-        $($body -join "`n")
-    </table>
+  <div class="footer">
+    Generated by Update-DefenderOffline.ps1 v$ScriptVersion &nbsp;|&nbsp;
+    Run by <strong>$RunAsUser</strong> from <strong>$RunFromHost</strong> ($RunFromIP) &nbsp;|&nbsp;
+    <a href="file:///$([uri]::EscapeUriString($LogFile.Replace('\','/')))">View Full Log</a>
+  </div>
 
-    <div class="footer">
-        Generated by Update-DefenderOffline.ps1 v$ScriptVersion<br>
-        <a href="file://$LogFile">View Full Log</a>
-    </div>
+  <script>
+    var _activeFilter = null;
+    function filterByStatus(el) {
+      var status = el.dataset.filter;
+      var rows   = document.querySelectorAll('#resultsTable tbody tr');
+      if (_activeFilter === status) {
+        _activeFilter = null;
+        rows.forEach(function(r) { r.style.display = ''; });
+        document.querySelectorAll('.stat-card').forEach(function(c) { c.classList.remove('active-filter'); });
+      } else {
+        _activeFilter = status;
+        rows.forEach(function(r) {
+          var badge = r.querySelector('.tag');
+          // ConvertTo-Html -Fragment emits header <tr> and data <tr>s as
+          // siblings (no <thead>/<tbody>); browsers auto-wrap all of them
+          // in an implicit <tbody>, so this selector matches the header
+          // row too.  Skip rows without a .tag (header / non-data rows).
+          if (!badge) return;
+          r.style.display = badge.textContent.trim() === status ? '' : 'none';
+        });
+        document.querySelectorAll('.stat-card').forEach(function(c) { c.classList.remove('active-filter'); });
+        el.classList.add('active-filter');
+      }
+    }
+  </script>
 </body>
 </html>
 "@
 }
 
+# ===================================================================
+# Write Reports
+# ===================================================================
 $TotalDuration = (Get-Date) - $ScriptStartTime
-# ===================================================================
-# Version History Calculations
-# ===================================================================
-foreach ($r in $Results) {
-    if ($r.OldVersion -and $r.NewVersion) {
-        try {
-            $r | Add-Member -NotePropertyName Delta -NotePropertyValue ([version]$r.NewVersion - [version]$r.OldVersion).Build -Force
-        } catch {
-            $r | Add-Member -NotePropertyName Delta -NotePropertyValue 'Unknown' -Force
-        }
-    } else {
-        $r | Add-Member -NotePropertyName Delta -NotePropertyValue 'Unknown' -Force
-    }
+$Stamp         = Get-Date -Format 'yyyyMMdd_HHmmss'
+$ReportFile    = Join-Path $ReportPath "DefenderUpdateReport_$Stamp.html"
+$CsvFile       = Join-Path $ReportPath "DefenderUpdateReport_$Stamp.csv"
 
-    # Log raw version history
-    Write-Log "VersionHistory: $($r.ComputerName) Old=$($r.OldVersion) New=$($r.NewVersion) Delta=$($r.Delta)" 'INFO'
-}
-
-# Fleet-wide analytics
-$validDeltas = $Results | Where-Object { $_.Delta -is [int] }
-$OldestVersion = ($Results | Where-Object OldVersion | Sort-Object OldVersion | Select-Object -First 1).OldVersion
-$NewestVersion = ($Results | Where-Object NewVersion | Sort-Object NewVersion -Descending | Select-Object -First 1).NewVersion
-$AverageDelta  = if ($validDeltas) { [math]::Round(($validDeltas.Delta | Measure-Object -Average).Average, 1) } else { 'Unknown' }
-
-$HtmlReport = New-HtmlReport -Data $Results -RunTime $TotalDuration
-$ReportFile = Join-Path $ReportPath "DefenderUpdateReport_$(Get-Date -f 'yyyyMMdd_HHmmss').html"
-$HtmlReport | Out-File -FilePath $ReportFile -Encoding utf8
-
-$CsvFile = Join-Path $ReportPath "DefenderUpdateReport_$(Get-Date -f 'yyyyMMdd_HHmmss').csv"
+(New-HtmlReport -Data $Results -RunTime $TotalDuration) | Out-File -FilePath $ReportFile -Encoding utf8
 $Results | Export-Csv -Path $CsvFile -NoTypeInformation
-Write-Log "CSV export saved: $CsvFile" 'SUCCESS'
+
+Write-Log "HTML report   : $ReportFile" 'SUCCESS'
+Write-Log "CSV export    : $CsvFile"    'SUCCESS'
+
+# ===================================================================
+# Final Summary
+# ===================================================================
+$successCount  = @($Results | Where-Object Status -eq 'Success').Count
+$failCount     = @($Results | Where-Object Status -eq 'Failed').Count
+$skipCount     = @($Results | Where-Object Status -eq 'No Update Needed').Count
+$excludedCount = @($Results | Where-Object Status -eq 'Excluded').Count
 
 Write-Log "UPDATE COMPLETE in $($TotalDuration.ToString('hh\:mm\:ss'))" 'HEADER'
-Write-Log "Success: $($Results.Where{$_.Status -eq 'Success'}.Count) | Failed: $($Results.Where{$_.Status -eq 'Failed'}.Count) | Skipped: $($Results.Where{$_.Status -eq 'No Update Needed'}.Count)" 'HEADER'
-Write-Log "Report saved: $ReportFile" 'SUCCESS'
-Write-Host ""
-Write-Host ""
-Write-Host "=== Version Summary ===" -ForegroundColor Magenta
+Write-Log "Success: $successCount  |  Failed: $failCount  |  Skipped: $skipCount  |  Excluded: $excludedCount  |  Total: $($Results.Count)" 'HEADER'
 
-# Only consider successful updates for version statistics
-$success = $Results | Where-Object { $_.Status -eq 'Success' }
-
-if ($success.Count -eq 0) {
-    Write-Host "No successful updates — version summary unavailable." -ForegroundColor Yellow
+if ($successCount -gt 0) {
+    Write-Log "Oldest version found   : $OldestVersion" 'INFO'
+    Write-Log "Newest version applied : $NewestVersion" 'INFO'
+    Write-Log "Hosts updated          : $HostsUpdated"  'INFO'
 }
-else {
-    # Extract versions safely
-    $validOld = $success | Where-Object { $_.OldVersion } | Select-Object -ExpandProperty OldVersion
-    $validNew = $success | Where-Object { $_.NewVersion } | Select-Object -ExpandProperty NewVersion
-
-    $oldest = ($validOld | Sort-Object)[0]
-    $newest = ($validNew | Sort-Object)[-1]
-
-    # Compute deltas only when versions differ and are parseable
-    $deltas = @()
-    foreach ($r in $success) {
-        if ($r.OldVersion -and $r.NewVersion -and $r.OldVersion -ne $r.NewVersion) {
-            try {
-                $deltas += ([version]$r.NewVersion - [version]$r.OldVersion).Build
-            } catch {}
-        }
-    }
-
-    $avgDelta = if ($deltas.Count -gt 0) {
-        [math]::Round(($deltas | Measure-Object -Average).Average, 2)
-    } else {
-        '0'
-    }
-
-    Write-Host "Oldest version found : $oldest"
-    Write-Host "Newest version applied: $newest"
-    Write-Host "Average delta        : $avgDelta"
-}
-
 
 # ===================================================================
 # Optional Email Notification
 # ===================================================================
-if ($SendEmail -and $To -and $SmtpServer) {
-    $mailParams = @{
-        From       = $From
-        To         = $To
-        Subject    = "Defender Update $(Get-Date -f 'yyyy-MM-dd') – $($Results.Where{$_.Status -eq 'Success'}.Count)/$($Results.Count) OK"
-        Body       = $HtmlReport
-        BodyAsHtml = $true
-        SmtpServer = $SmtpServer
-        Port       = $SmtpPort
-        UseSsl     = $SmtpUseSsl
-        Attachments= $ReportFile
-    }
-    if ($SmtpCredential) { $mailParams.Credential = $SmtpCredential }
+if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
+    $subject = "Defender Update $(Get-Date -f 'yyyy-MM-dd') - $successCount/$($Results.Count) OK | v$AvailableVersionStr"
 
+    # Use System.Net.Mail.SmtpClient directly instead of Send-MailMessage.
+    # Send-MailMessage was marked [Obsolete] in PowerShell 7 and emits a
+    # WARNING during command resolution — i.e., every script run, even
+    # ones that don't actually send email.  SmtpClient ships in .NET and
+    # does not emit any such warning at runtime.
+    $smtp = $null
+    $msg  = $null
     try {
-        Send-MailMessage @mailParams
-        Write-Log "Email notification sent successfully" 'SUCCESS'
-    }
-    catch {
-        Write-Log "Failed to send email: $($_.Exception.Message)" 'ERROR'
+        $smtp = [System.Net.Mail.SmtpClient]::new($SmtpServer, $SmtpPort)
+        $smtp.EnableSsl = [bool]$SmtpUseSsl
+        if ($SmtpCredential) {
+            $smtp.Credentials = $SmtpCredential.GetNetworkCredential()
+        }
+
+        # Resolve $ReportFile / $CsvFile to absolute paths BEFORE handing
+        # them to .NET.  System.Net.Mail.Attachment::new() resolves relative
+        # paths against the .NET process CurrentDirectory (which is the
+        # PowerShell launch directory, often C:\WINDOWS\system32 when
+        # elevated) — not PowerShell's $PWD.  Send-MailMessage used to
+        # handle this internally; SmtpClient does not.
+        $reportFull = (Resolve-Path -LiteralPath $ReportFile).ProviderPath
+        $csvFull    = (Resolve-Path -LiteralPath $CsvFile).ProviderPath
+
+        $msg = [System.Net.Mail.MailMessage]::new()
+        $msg.From = [System.Net.Mail.MailAddress]::new($From)
+        foreach ($recipient in $To) { [void]$msg.To.Add($recipient) }
+        # MailMessage defaults Body/Subject/Headers encoding to ASCII, which
+        # mangles non-ASCII chars (en-dash, em-dash, arrows) in the HTML
+        # report to '?'.  Pin everything to UTF-8 to match the report file
+        # on disk and the <meta charset="utf-8"> in its <head>.
+        $msg.SubjectEncoding = [System.Text.Encoding]::UTF8
+        $msg.BodyEncoding    = [System.Text.Encoding]::UTF8
+        $msg.HeadersEncoding = [System.Text.Encoding]::UTF8
+        $msg.Subject     = $subject
+        $msg.Body        = (Get-Content -LiteralPath $reportFull -Raw -Encoding UTF8)
+        $msg.IsBodyHtml  = $true
+        foreach ($a in @($reportFull, $csvFull)) {
+            [void]$msg.Attachments.Add([System.Net.Mail.Attachment]::new($a))
+        }
+
+        $smtp.Send($msg)
+        Write-Log 'Email notification sent successfully' 'SUCCESS'
+    } catch {
+        Write-Log "Email failed: $($_.Exception.Message)" 'ERROR'
+    } finally {
+        if ($msg)  { $msg.Dispose() }
+        if ($smtp) { $smtp.Dispose() }
     }
 }

@@ -1,10 +1,17 @@
-# Claude Code documentation (project-specific)
-claude.md
+# Release packaging folder and its output (local build tooling, not part of the project)
+.dist/
 
-# Runtime directories
+# Runtime directories (created automatically at first run; not part of the project)
 Config/
 Logs/
 Reports/
+
+# Runtime files (written by the scripts during execution)
+hosts.conf
+conf/dashboard.status
+
+# AI assistant working notes (local to the maintainer; not part of the public project)
+CLAUDE.md
 
 # IDE settings
 .vscode/
@@ -22,9 +29,8 @@ $RECYCLE.BIN/
 # PowerShell
 *.ps1xml
 
-# Credentials and secrets
+# Credentials and secrets (never commit encrypted credential files)
 *.xml
-!Config/.gitkeep
 
 # Log files
 *.log

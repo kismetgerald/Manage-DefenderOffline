@@ -1,201 +1,257 @@
-# Update-DefenderOffline
+# Manage-DefenderOffline
 
-> Automate Microsoft Defender antivirus definition updates for air-gapped and offline Windows systems
+> Deploy, verify, and monitor Microsoft Defender antivirus definitions across air-gapped and offline Windows environments
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.6-orange.svg)](https://github.com/kismetgerald/Update-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.6-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 ## Overview
 
-**Update-DefenderOffline** is a PowerShell script that updates Microsoft Defender definitions on systems without internet access using PowerShell Remoting (WinRM). Perfect for air-gapped networks, SCADA systems, and high-security environments.
+**Manage-DefenderOffline** is a PowerShell toolkit for managing Microsoft Defender antivirus definitions on Windows 10/11 and Windows Server 2016+ endpoints that cannot reach the internet directly. It covers the full lifecycle: deploying updates, monitoring fleet health, and reporting — without requiring MECM, Intune, or any commercial AV management platform.
 
 **Key Features:**
 - 🚀 **10x faster** with PowerShell 7+ parallel processing (up to 32 threads)
-- 📊 **Real-time dashboard** with live progress tracking
+- 📊 **Real-time update dashboard** with live progress tracking during deployments
+- 🖥️ **Fleet monitor GUI** — interactive Windows Forms status dashboard
+- 🌐 **Persistent web dashboard** — headless HTTP service for continuous fleet visibility
 - 🔄 **Auto-discovery** of computers from Active Directory
-- 🔧 **Email notifications** with detailed HTML reports
+- 🔧 **Email notifications** with HTML reports and CSV attachments
 - 🛡️ **Safe & tested** with dry-run mode and automatic retry logic
-- ⚙️ **Enterprise-ready** for scheduled tasks and service accounts
+- ⚙️ **Enterprise-ready** for scheduled tasks, service accounts, and gMSA
 - 📈 **Version analytics** with fleet-wide statistics and CSV exports
+
+## Scripts
+
+| Script | Purpose | Run by |
+|---|---|---|
+| `Update-DefenderOffline.ps1` | Deploys definition updates to all endpoints | Admin (manual or scheduled task) |
+| `Show-DefenderStatus.ps1` | Interactive Windows Forms fleet health monitor | Admin, interactively |
+| `Start-DefenderDashboard.ps1` | Headless HTTP dashboard service | Scheduled task (service account / gMSA) |
+| `Install-DefenderDashboard.ps1` | One-time installer for the dashboard service | Admin, once |
 
 ## Prerequisites Checklist
 
 **Before running, ensure you have:**
 
 - ☐ **PowerShell 5.1 or higher** (7+ strongly recommended for parallel performance)
-- ☐ **Administrator privileges** on the machine running the script
+- ☐ **Administrator privileges** on the machine running the scripts
 - ☐ **Administrative rights** on all target computers
 - ☐ **WinRM enabled** on target computers (TCP port 5985)
-- ☐ **Network share** accessible from all target systems
-- ☐ **Firewall rules** allow TCP 5985 between systems
-- ☐ **Latest mpam-fe.exe** (x64 version) on network share
+- ☐ **Network share** with definitions in the required folder structure (see below)
+- ☐ **Firewall rules** allow TCP 5985 between the admin machine and all targets
 - ☐ **Domain membership** OR ActiveDirectory PowerShell module (for auto-discovery)
 
 ### Quick Environment Test
 
-Run this on target computers to verify readiness:
-
 ```powershell
-# Test WinRM connectivity
-Test-WSMan -ComputerName localhost
-
-# Enable WinRM if needed
+# Test WinRM on a target computer (run on the target)
 Enable-PSRemoting -Force
 
-# Verify Defender service
-Get-Service WinDefend | Select-Object Status, StartType
+# Verify WinRM is reachable from admin machine
+Test-NetConnection -ComputerName TARGETPC -Port 5985
+
+# Verify Defender service is running on a target
+Invoke-Command -ComputerName TARGETPC -ScriptBlock {
+    Get-Service WinDefend | Select-Object Status, StartType
+}
 ```
 
-## Quick Start Guide
+---
+
+## Quick Start: Update-DefenderOffline.ps1
 
 ### Step 1: Download Latest Definitions
 
-On an **internet-connected** machine:
+On an **internet-connected** machine, download from Microsoft:
 
-1. Visit [Microsoft Malware Protection Center](https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64)
-2. Download `mpam-fe.exe` (x64 version) - usually 150-250 MB
-3. Copy to your network share (e.g., `\\fileserver\DefenderUpdates\`)
+| Architecture | URL |
+|---|---|
+| x64 (most common) | https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64 |
+| x86 | https://go.microsoft.com/fwlink/?LinkID=121721&arch=x86 |
+| ARM64 | https://go.microsoft.com/fwlink/?LinkID=121721&arch=arm64 |
 
-**Note:** The script automatically detects the newest mpam-fe file by modification date, so you don't need to rename files with version numbers.
+The downloaded file is always named `mpam-fe.exe`.
 
-### Step 2: First Run
+### Step 2: Place the File on the Network Share
 
-Open **PowerShell as Administrator** and navigate to the script directory:
+The share **must** follow this folder structure:
+
+```
+<SourceSharePath>\<YYYYMMDD>\v#.###.###.#\mpam-fe.exe
+```
+
+**Example:**
+```
+\\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender\
+    20260520\
+        v1.449.681.0\
+            mpam-fe.exe
+```
+
+The script discovers the available version by parsing the `v#.###.###.#` folder name — not by file modification date. Creating a new date/version subfolder for each download keeps the history clean and makes rollback straightforward.
+
+### Step 3: Configure
+
+Edit `conf\config.conf` and set `SourceSharePath` to your base share path:
+
+```
+SourceSharePath = \\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender
+```
+
+All other settings are optional with sensible defaults. See [Configuration](#configuration) below.
+
+### Step 4: First Run
+
+Open **PowerShell 7 as Administrator** in the script directory:
 
 ```powershell
-# Auto-discover domain computers and create hosts.conf
-.\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\DefenderUpdates" `
-    -MpamFileName "mpam-feX64.exe"
+# WhatIf mode first — tests everything without making changes
+.\Update-DefenderOffline.ps1 -WhatIfMode
+
+# Live run once WhatIf looks good
+.\Update-DefenderOffline.ps1
 ```
 
-**What happens during first run:**
-1. ✓ Script validates you're running as Administrator
-2. ✓ Creates `C:\Logs\` and `.\Reports\` folders
-3. ✓ Queries Active Directory for all Windows computers
-4. ✓ Auto-generates `hosts.conf` with discovered systems
-5. ✓ Tests WinRM connectivity to each computer
-6. ✓ Copies definition file and installs silently
-7. ✓ Verifies new version installed successfully
-8. ✓ Generates HTML report with detailed results
+**What happens:**
+1. Loads settings from `conf\config.conf`
+2. Validates admin privileges
+3. Resolves target computers (see [Target Discovery](#target-computer-discovery))
+4. Discovers the latest available version from the share
+5. For each endpoint: tests WinRM, checks Defender service, compares versions — skips if already current
+6. Transfers and silently installs only on endpoints that need updating
+7. Generates HTML report and CSV in `.\Reports\`
 
-### Step 3: Review and Customize
+---
 
-After the first run, review `hosts.conf` in the script directory:
+## Target Computer Discovery
+
+Scripts resolve targets in this priority order:
+
+1. **`-ComputerName` parameter** — explicit list, bypasses everything else
+2. **`hosts.conf`** — plain-text file in the script directory (auto-generated on first run, then manually maintained)
+3. **Active Directory** — queries AD for all enabled Windows computers, auto-creates `hosts.conf`
+
+### hosts.conf Format
 
 ```
-# =============================================================================
-# hosts.conf – AUTO-GENERATED by Update-DefenderOffline.ps1 v0.0.6
-# Generated      : 2026-01-28 10:30:45
-# Domain         : contoso.com
-# Total Systems  : 250
-# Edit this file to exclude lab/test machines if needed
-# =============================================================================
+# One computer name per line. Lines starting with # are ignored.
 
 WORKSTATION01
 WORKSTATION02
 SERVER01
-# TESTLAB-PC01  # Comment out systems to exclude
+# TESTLAB-PC01   ← commented out; will be skipped
 ```
 
-**Edit this file** to exclude test/lab machines or add systems not in AD.
+After the first run generates `hosts.conf` from AD, edit it to exclude test/lab machines.
 
-## Target Computer Discovery Options
-
-### Option 1: Auto-Discovery from Active Directory (Recommended)
-
-**Requirements:**
-- Domain-joined machine OR ActiveDirectory PowerShell module installed
-- Read access to Active Directory
-
-Just run the script without `-ComputerName` parameter. The script will:
-- Query AD for all enabled Windows computers
-- Create `hosts.conf` automatically
-- Use this file for future runs
-
+**Install RSAT if AD query fails:**
 ```powershell
-.\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\DefenderUpdates" `
-    -MpamFileName "mpam-feX64.exe"
+# Windows 10/11
+Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
+
+# Windows Server
+Install-WindowsFeature -Name RSAT-AD-PowerShell
 ```
 
-**If AD query fails:** The script will throw an error asking you to create `hosts.conf` manually (see Option 3).
+---
 
-### Option 2: Manual Computer List
+## Configuration
 
-Provide specific computers via parameter (bypasses hosts.conf):
+All scripts read `conf\config.conf` at startup. **Command-line parameters always override config values.** The file is a template — fill in your environment values, leave anything you don't need blank.
 
+```
+# conf\config.conf — example values
+
+[Common]
+SourceSharePath  = \\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender
+ExcludeComputers =                      ← comma-separated; skip these endpoints entirely
+ParallelThreads  = 16
+TimeoutSeconds   = 30
+LogPath          = C:\Logs
+DisableIPv6      = true                 ← drops unreachable-host detection from ~21s to ~3s
+
+[Update]
+TempFolderOnTarget = C:\Temp\Update-DefenderOffline
+LogSharePath       =                    ← leave blank to disable centralised log collection
+ReportPath         = .\Reports
+
+[Dashboard]
+Port            = 8080
+FallbackPort    = 8090                  ← 8443 is commonly taken (Tomcat, Splunk); 8090 is safer
+RefreshInterval = 300                   ← seconds
+DashboardTheme  = Dark                  ← Dark | Light (per-browser toggle overrides this default)
+
+[Install]
+TaskName   = DefenderDashboard
+TaskFolder = \                          ← e.g. \Security to keep tasks organised
+
+[Credentials]
+ClassificationMethod    =               ← AD | Pattern | Single (auto-detected if blank)
+WorkstationPattern      = ^(DESKTOP|LAPTOP|WS|WIN10|WIN11)
+DomainControllerPattern = ^DC
+
+[Email]
+SendEmail  = false
+SmtpServer =
+SmtpPort   = 25
+SmtpUseSsl = false
+EmailFrom  = DefenderUpdate@contoso.com
+EmailTo    =
+```
+
+See `conf\config.conf` for full documentation of every setting.
+
+---
+
+## Update-DefenderOffline.ps1 — Reference
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-SourceSharePath` | *(config or required)* | Base UNC path containing versioned definition subfolders |
+| `-ComputerName` | *(auto-discover)* | Manual list of target computers |
+| `-TempFolderOnTarget` | `C:\Temp\Update-DefenderOffline` | Temp directory created on each remote system during update |
+| `-LogSharePath` | *(disabled)* | UNC path for centralised remote log collection |
+| `-LogPath` | `C:\Logs` | Local log directory |
+| `-ReportPath` | `.\Reports` | HTML and CSV report output directory |
+| `-ParallelThreads` | `16` | Max concurrent threads (PS 7+ only, range 1–32) |
+| `-DisableIPv6` | `$true` | Skip IPv6 in reachability tests (drops unreachable-host detection from ~21s to ~3s on LANs that advertise AAAA but don't route IPv6) |
+| `-WhatIfMode` | `$false` | Dry-run — no changes made |
+| `-Credential` | *(caller context)* | Single WinRM credential for all endpoints when classification isn't needed |
+| `-WorkstationCredential` | — | Tier-specific WinRM credential for workstations (used with classification) |
+| `-ServerCredential` | — | Tier-specific WinRM credential for member servers |
+| `-DomainControllerCredential` | — | Tier-specific WinRM credential for domain controllers |
+| `-SaveCredential` | — | Interactive helper; saves WinRM credentials to `conf\*.xml` (DPAPI per-user + per-machine) |
+| `-ADCredential` | *(caller context)* | Credential for AD auto-discovery — required in STIG-hardened environments where the running account lacks AD read rights |
+| `-SaveADCredential` | — | Interactive helper; saves AD credential to `conf\ADCredential.xml` |
+| `-ClassificationMethod` | `AD` *(or `Single` off-domain)* | How to classify endpoints into credential tiers: `AD`, `Pattern`, or `Single` |
+| `-WorkstationPattern` | *(see config)* | Regex for workstation hostnames (used with `-ClassificationMethod Pattern`) |
+| `-DomainControllerPattern` | `^DC` | Regex for DC hostnames (used with `-ClassificationMethod Pattern`) |
+| `-SendEmail` | `$false` | Enable email notification after each run |
+| `-SmtpServer` | *(required if -SendEmail)* | SMTP server address |
+| `-SmtpPort` | `25` | SMTP port |
+| `-SmtpUseSsl` | `$false` | Use SSL/TLS for SMTP |
+| `-From` | `DefenderUpdate@contoso.com` | Sender address |
+| `-To` | *(required if -SendEmail)* | Recipient address(es) |
+| `-SmtpCredential` | *(optional)* | PSCredential for SMTP authentication |
+| `-SaveSmtpCredential` | — | Interactive helper; saves encrypted SMTP credentials to `.\conf\SmtpCredential.xml` |
+| `-ConfigPath` | `.\conf\config.conf` | Override config file location |
+
+### Email Setup
+
+**Save credentials once (interactive):**
 ```powershell
-.\Update-DefenderOffline.ps1 `
-    -ComputerName "PC01","PC02","SERVER01" `
-    -SourceSharePath "\\fileserver\DefenderUpdates" `
-    -MpamFileName "mpam-feX64.exe"
-```
-
-**Use cases:**
-- Workgroup environments (no Active Directory)
-- Testing on specific systems
-- Updating a subset of computers
-
-### Option 3: Create hosts.conf Manually
-
-Create a file named `hosts.conf` in the script directory:
-
-```
-# One computer name per line
-# Lines starting with # are comments and will be ignored
-# Computer names are case-insensitive
-
-WORKSTATION01
-WORKSTATION02
-SERVER01
-# TESTLAB-PC01  # Commented out - will be skipped
-```
-
-**Format rules:**
-- One computer name per line
-- Lines starting with `#` are ignored
-- Blank lines are ignored
-- Names are automatically converted to uppercase
-- Supports NetBIOS names or FQDNs
-
-## Common Scenarios
-
-### Weekly Scheduled Updates
-
-Create a scheduled task to run weekly:
-
-```powershell
-# Run via Task Scheduler
-.\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\updates" `
-    -MpamFileName "mpam-feX64.exe"
-```
-
-**Tip:** The script automatically picks the newest `mpam-fe*.exe` file by LastWriteTime, so you can just drop new files in the share.
-
-### With Email Notifications
-
-#### One-Time Setup: Save SMTP Credentials
-
-```powershell
-# Interactive credential prompt
 .\Update-DefenderOffline.ps1 -SaveSmtpCredential
 ```
+This creates `.\conf\SmtpCredential.xml` encrypted per-user + per-machine via DPAPI. Safe for scheduled tasks running as the same account.
 
-This creates `.\Config\SmtpCredential.xml` with encrypted credentials (per-user + per-machine encryption via DPAPI).
-
-#### Production Run with Email
-
+**Production run with email:**
 ```powershell
-# Load saved credentials
-$cred = Import-Clixml ".\Config\SmtpCredential.xml"
+$cred = Import-Clixml ".\conf\SmtpCredential.xml"
 
-# Run with email enabled
 .\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\updates" `
-    -MpamFileName "mpam-feX64.exe" `
     -SendEmail `
     -SmtpServer "smtp.company.com" `
     -SmtpPort 587 `
@@ -205,427 +261,227 @@ $cred = Import-Clixml ".\Config\SmtpCredential.xml"
     -SmtpCredential $cred
 ```
 
-**Email includes:**
-- HTML-formatted summary
-- Success/failure statistics
-- Attached full HTML report
-- Version history analytics
-
-### Dry-Run Testing
-
-Test the script without making any changes:
+### Common Usage Examples
 
 ```powershell
-.\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\updates" `
-    -MpamFileName "mpam-feX64.exe" `
-    -WhatIfMode
+# Dry-run (no changes)
+.\Update-DefenderOffline.ps1 -WhatIfMode
+
+# Specific computers
+.\Update-DefenderOffline.ps1 -ComputerName "PC01","PC02","SRV01"
+
+# Centralised log collection
+.\Update-DefenderOffline.ps1 -LogSharePath "\\NAS01\DefenderLogs"
+
+# Maximum parallel threads
+.\Update-DefenderOffline.ps1 -ParallelThreads 32
 ```
 
-**What happens in dry-run:**
-- ✓ All connectivity tests performed
-- ✓ Computer list validated
-- ✓ Source file verified
-- ✗ No files copied
-- ✗ No installations performed
-- ✓ Report generated showing what would happen
+### Execution Flow
 
-### High-Performance Mode (PowerShell 7+)
+| Phase | What happens |
+|---|---|
+| Initialization | Load config, validate admin rights, create output folders |
+| Target discovery | CLI → hosts.conf → AD auto-discovery |
+| Source discovery | Recurse share, parse `v#.###.###.#` folder names, select highest version |
+| Per-endpoint loop | WinRM check → Defender service check → **version compare (skip if current)** → file transfer → silent install → verify → log collection → cleanup |
+| Reporting | HTML report, CSV export, email (if configured) |
 
-For large environments (500+ computers), use PowerShell 7 with maximum threads:
+### Output
+
+**Logs:** `C:\Logs\Update-DefenderOffline_YYYYMMDD_HHmmss.log`
+
+```
+2026-05-20 09:15:00 [HEADER] === Microsoft Defender Offline Update v0.0.6 ===
+2026-05-20 09:15:00 [INFO]   Parallel Mode : ENABLED (16 threads)
+2026-05-20 09:15:01 [SUCCESS] Latest definition version: v1.449.681.0
+2026-05-20 09:15:01 [INFO]   Source file   : \\NAS01\...\20260520\v1.449.681.0\mpam-fe.exe
+2026-05-20 09:15:30 [INFO]   VersionHistory: WS01 | Old=1.405.233.0 | New=1.449.681.0 | Delta=1012
+2026-05-20 09:20:00 [HEADER] UPDATE COMPLETE in 00:05:00
+2026-05-20 09:20:00 [HEADER] Success: 48 | Failed: 1 | Skipped: 1 | Total: 50
+```
+
+**Per-host logs:** `C:\Logs\PerHost\COMPUTERNAME.log`
+
+**Reports:** `.\Reports\DefenderUpdateReport_YYYYMMDD_HHmmss.html` and `.csv`
+
+---
+
+## Show-DefenderStatus.ps1 — Reference
+
+Opens a live Windows Forms dashboard showing the Defender health status of all endpoints. Requires an interactive desktop session.
 
 ```powershell
-# Install PowerShell 7 if needed
-winget install Microsoft.PowerShell
-
-# Run with 32 concurrent threads
-pwsh.exe -File .\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\updates" `
-    -MpamFileName "mpam-feX64.exe" `
-    -ParallelThreads 32
+.\Show-DefenderStatus.ps1
 ```
 
-**Performance tip:** The script includes a real-time dashboard that updates every 5 seconds showing:
-- Running jobs
-- Pending queue
-- Completed count
-- Active computers
-- Elapsed time
+**Features:** Fluent-style dark theme matching the HTML report · Colour-coded badges (Healthy / Outdated / Degraded / Offline) · **Clickable stat cards** filter the grid (Online / Offline / Outdated / RT Prot Off) · Name filter · Live query-progress counter (`12/33`) · Manual refresh + auto-refresh with countdown timer · Export CSV · Export HTML
 
-### With Remote Log Collection
+| Parameter | Default | Description |
+|---|---|---|
+| `-SourceSharePath` | *(config)* | Enables version currency comparison (green/amber colouring) |
+| `-ComputerName` | *(auto-discover)* | Query specific computers only |
+| `-ParallelThreads` | `16` | Concurrent WinRM queries (PS 7+) |
+| `-TimeoutSeconds` | `30` | Per-host query timeout |
+| `-DisableIPv6` | `$true` | Skip IPv6 in reachability tests (see Update reference) |
+| `-Credential` / `-WorkstationCredential` / `-ServerCredential` / `-DomainControllerCredential` | — | Same tiered WinRM credential model as `Update-DefenderOffline.ps1` |
+| `-SaveCredential` | — | Interactive helper; saves WinRM credentials to `conf\*.xml` |
+| `-ADCredential` | *(caller context)* | AD-bind credential for hosts.conf auto-discovery in STIG environments |
+| `-SaveADCredential` | — | Interactive helper; saves AD credential to `conf\ADCredential.xml` |
+| `-ClassificationMethod` / `-WorkstationPattern` / `-DomainControllerPattern` | — | Same classification model as `Update-DefenderOffline.ps1` |
+| `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
-Collect installation logs from all computers to a central share:
+---
+
+## Start-DefenderDashboard.ps1 — Reference
+
+Headless HTTP server that serves a self-refreshing browser dashboard. Designed to run continuously as a Windows Scheduled Task under a service account or gMSA. Use `Install-DefenderDashboard.ps1` to register it as a service.
+
+**Endpoints:**
+
+| Path | Response |
+|---|---|
+| `/defender` | HTML dashboard with **clickable stat cards** (Online / Offline / Outdated / RT Prot Off filter the table), **light/dark theme toggle** (☀/☾) persisted per-browser via `localStorage`, and meta-refresh aligned with the data-refresh countdown |
+| `/status` | JSON snapshot of current fleet data |
+| `/health` | Plain-text `OK` liveness probe |
+| `/refresh` | Forces immediate background data refresh; redirects to `/defender` |
+
+**Port fallback:** If the configured port is in use at startup, the script automatically tries `FallbackPort` and up to 9 sequential candidates. The actual bound port is written to `conf\dashboard.status` so admins and monitoring tools can always discover it. A Windows Event Log Warning (EventId 101) is also written when a fallback fires.
+
+**Theme priority:** Browser `localStorage` (per-user, persists across visits) > `DashboardTheme` in config.conf (server-supplied default) > script default `Dark`.
 
 ```powershell
-.\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\updates" `
-    -MpamFileName "mpam-feX64.exe" `
-    -LogSharePath "\\fileserver\DefenderLogs"
+# Run interactively for testing
+.\Start-DefenderDashboard.ps1 -Port 8080
+
+# Then open: http://localhost:8080/defender
 ```
 
-**Creates structure:**
-```
-\\fileserver\DefenderLogs\
-├── WORKSTATION01\
-│   ├── install_20260128_103045.log
-│   └── install_20260128_103045.log.err
-├── WORKSTATION02\
-│   └── install_20260128_103112.log
-└── SERVER01\
-    └── install_20260128_103201.log
-```
+| Parameter | Default | Description |
+|---|---|---|
+| `-Port` | `8080` | Primary HTTP port |
+| `-FallbackPort` | `8443` | First fallback candidate if primary is in use (config.conf ships `8090` because 8443 collides with Tomcat/Splunk/etc.) |
+| `-RefreshInterval` | `300` | Data refresh interval in seconds |
+| `-LogPath` | `C:\Logs\DefenderDashboard` | Service log directory |
+| `-SourceSharePath` | *(config)* | Enables version currency comparison |
+| `-ComputerName` | *(auto-discover)* | Query specific computers only |
+| `-ParallelThreads` | `16` | Concurrent WinRM queries per refresh cycle |
+| `-TimeoutSeconds` | `30` | Per-host query timeout |
+| `-DisableIPv6` | `$true` | Skip IPv6 in reachability tests |
+| `-DashboardTheme` | `Dark` | Default theme served to first-time visitors: `Dark` or `Light` |
+| `-Credential` | *(caller context)* | WinRM credential for endpoint queries |
+| `-SaveCredential` | — | Interactive helper; saves WinRM credential to `conf\WinRmCredential.xml` (run once under the service identity) |
+| `-ADCredential` | *(caller context)* | AD-bind credential for hosts.conf auto-discovery in STIG environments |
+| `-SaveADCredential` | — | Interactive helper; saves AD credential to `conf\ADCredential.xml` |
+| `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
-## What Actually Happens During Execution
+---
 
-Understanding the workflow helps troubleshoot issues:
+## Install-DefenderDashboard.ps1 — Reference
 
-### Phase 1: Initialization (5-10 seconds)
-1. Validates administrative privileges → exits if not admin
-2. Creates output folders (`C:\Logs\`, `.\Reports\`)
-3. Initializes thread-safe logging
-4. Detects PowerShell version (7+ = parallel, 5.1 = serial)
+One-time installer. Run as Administrator.
 
-### Phase 2: Target Discovery (10-30 seconds)
-1. Checks for `-ComputerName` parameter → use if provided
-2. Else checks for `hosts.conf` → load if exists
-3. Else queries Active Directory → auto-create hosts.conf
-4. Validates at least one target found
+**What it does:**
+1. Validates prerequisites (pwsh.exe, Task Scheduler)
+2. Validates the service account or gMSA in Active Directory
+3. Registers the `Manage-DefenderOffline` Windows Event Log source
+4. Creates directories and grants filesystem permissions to the service identity
+5. Checks port availability; selects fallback automatically if needed
+6. Registers a Windows Scheduled Task (AtStartup, no time limit, restart-on-failure)
+7. Optionally creates an inbound Windows Firewall rule
+8. Optionally starts the task immediately and reads `conf\dashboard.status` to confirm the actual port
 
-### Phase 3: Source Validation (1-2 seconds)
-1. Scans `-SourceSharePath` for `mpam-fe*.exe` files
-2. Selects newest file by LastWriteTime
-3. Verifies file exists and is accessible
-
-### Phase 4: Update Execution (varies by computer count)
-
-**For each computer:**
-
-1. **Connectivity Test** (2-5 sec)
-   - Test-NetConnection on port 5985
-   - If fails → mark as "Failed: WinRM not reachable"
-
-2. **Session Creation** (1-2 sec)
-   - New-PSSession to target computer
-   - If fails → mark as "Failed: Authentication/Access Denied"
-
-3. **Pre-Check** (1-2 sec)
-   - Verify Windows Defender service is running
-   - Get current definition version
-
-4. **File Transfer** (5-15 sec, depends on network speed)
-   - Create temp folder on target: `C:\Temp\Update-DefenderOffline\`
-   - Copy mpam-fe.exe (~200 MB) via PSSession
-
-5. **Installation** (10-30 sec)
-   - Execute: `mpam-fe.exe /q` (silent install)
-   - Wait for process completion
-   - Capture exit code and logs
-
-6. **Verification** (1-2 sec)
-   - Query new definition version
-   - Compare with pre-install version
-   - Determine status: Success / Failed / No Update Needed
-
-7. **Log Collection** (2-5 sec, if configured)
-   - Copy installation logs to network share
-   - Create per-computer subdirectory
-
-8. **Cleanup** (1-2 sec)
-   - Remove temp folder on target
-   - Close PSSession
-
-**Retry Logic (v0.0.6 feature):**
-- Soft failures (network glitches, timeouts) → retry up to 3 times
-- Hard failures (WinRM disabled, access denied) → fail immediately
-- 5-minute timeout per computer
-
-### Phase 5: Reporting (5-10 seconds)
-1. Generate HTML report with version analytics
-2. Export CSV with detailed results
-3. Calculate fleet-wide statistics:
-   - Oldest version found
-   - Newest version applied
-   - Average version delta
-4. Send email notification (if configured)
-
-### Phase 6: Summary Display
-- Console output with color-coded results
-- Total execution time
-- Success/failure/skipped counts
-- Link to HTML report
-
-## Output & Logs
-
-### Console Output (Color-Coded)
-
-```
-2026-01-28 10:30:45 [HEADER] === Microsoft Defender Offline Update v0.0.6 ===
-2026-01-28 10:30:45 [INFO] Started          : 1/28/2026 10:30:45 AM
-2026-01-28 10:30:45 [INFO] PowerShell       : 7.4.0 (Core)
-2026-01-28 10:30:45 [INFO] Parallel Mode    : ENABLED (16 threads)
-2026-01-28 10:30:46 [SUCCESS] Loaded 250 computers from hosts.conf
-2026-01-28 10:35:12 [HEADER] UPDATE COMPLETE in 00:04:27
-2026-01-28 10:35:12 [HEADER] Success: 245 | Failed: 3 | Skipped: 2
-2026-01-28 10:35:12 [SUCCESS] Report saved: .\Reports\DefenderUpdateReport_20260128_103045.html
-```
-
-**Color Legend:**
-- 🟣 **HEADER** (Magenta): Section headers and major milestones
-- 🔵 **INFO** (Cyan): Informational messages and progress
-- 🟢 **SUCCESS** (Green): Successful operations
-- 🟡 **WARN** (Yellow): Warnings and fallback operations
-- 🔴 **ERROR** (Red): Failures and critical issues
-
-### Real-Time Dashboard (PowerShell 7+)
-
-```
-=== Defender Update Dashboard ===
-Running:     16
-Pending:     234
-Completed:   0
-Active:      WS01, WS02, WS03, WS04, SRV01, ...
-Elapsed:     00:02:15
-```
-
-Updates every 5 seconds without scrolling.
-
-### Log Files
-
-**Primary log:** `C:\Logs\Update-DefenderOffline_YYYYMMDD_HHmmss.log`
-
-```
-2026-01-28 10:30:45 [HEADER] === Microsoft Defender Offline Update v0.0.6 ===
-2026-01-28 10:30:45 [INFO] Started          : 1/28/2026 10:30:45 AM
-2026-01-28 10:30:45 [INFO] PowerShell       : 7.4.0 (Core)
-2026-01-28 10:30:45 [INFO] Parallel Mode    : ENABLED (16 threads)
-2026-01-28 10:30:46 [SUCCESS] Loaded 250 computers from hosts.conf
-2026-01-28 10:30:47 [INFO] Latest mpam-fe package detected: mpam-feX64.exe
-2026-01-28 10:32:15 [INFO] VersionHistory: WORKSTATION01 Old=1.405.233.0 New=1.405.1245.0 Delta=1012
-2026-01-28 10:32:18 [INFO] VersionHistory: WORKSTATION02 Old=1.405.1245.0 New=1.405.1245.0 Delta=0
-2026-01-28 10:35:12 [HEADER] UPDATE COMPLETE in 00:04:27
-```
-
-**Per-host logs:** `C:\Logs\PerHost\COMPUTERNAME.log` (v0.0.6 feature)
-
-```
-1/28/2026 10:32:15 AM Attempt 1: Success - 1.405.233.0 → 1.405.1245.0
-```
-
-**Remote logs:** `\\fileserver\DefenderLogs\COMPUTERNAME\install_*.log` (if `-LogSharePath` configured)
-
-### HTML Reports
-
-**Location:** `.\Reports\DefenderUpdateReport_YYYYMMDD_HHmmss.html`
-
-**Includes:**
-- Run date, source file, total duration
-- Version history summary:
-  - Oldest version found
-  - Newest version applied
-  - Average version delta
-  - Hosts already current/updated/failed counts
-- Detailed results table (sortable):
-  - Computer name
-  - Status (color-coded: Success/Failed/No Update Needed)
-  - Old version
-  - New version
-  - Duration in seconds
-  - Retry attempts
-  - Timeout status
-  - Details/error messages
-- Link to full log file
-
-**Professional styling:**
-- Modern responsive design
-- Color-coded status indicators
-- Alternating row colors for readability
-- Embedded CSS (no external dependencies)
-
-### CSV Export (v0.0.6 feature)
-
-**Location:** `.\Reports\DefenderUpdateReport_YYYYMMDD_HHmmss.csv`
-
-```csv
-ComputerName,Status,OldVersion,NewVersion,DurationSec,Delta,Details
-WORKSTATION01,Success,1.405.233.0,1.405.1245.0,12.34,1012,1.405.233.0 → 1.405.1245.0
-WORKSTATION02,No Update Needed,1.405.1245.0,1.405.1245.0,8.21,0,Already current
-SERVER01,Failed,1.405.100.0,,45.67,Unknown,WinRM (5985) not reachable
-```
-
-**Use cases:**
-- Import into Excel for analysis
-- Create pivot tables
-- Track version compliance over time
-- Generate custom reports
-
-## Requirements
-
-| Component | Requirement | Notes |
-|-----------|-------------|-------|
-| PowerShell | 5.1 minimum (7+ recommended) | PS 7+ enables parallel processing |
-| Privileges | Administrator on local machine | Script validates on startup |
-| Remote Access | Administrator on target systems | Required for WinRM |
-| Network | WinRM enabled on targets (port 5985) | Use `Enable-PSRemoting -Force` |
-| Source File | mpam-fe.exe (x64) on accessible share | ~150-250 MB download from Microsoft |
-| Optional | ActiveDirectory module OR domain membership | For auto-discovery from AD |
-| Optional | SMTP server access | For email notifications |
-
-### Network Requirements
-
-**Firewall ports:**
-- TCP 5985 (WinRM HTTP) - required for PowerShell Remoting
-- TCP 445 (SMB) - required for file transfer to/from network shares
-
-**Network share permissions:**
-- Source share: READ access for service account
-- Log share: WRITE access for service account (if using `-LogSharePath`)
-
-## Configuration Options
-
-### Required Parameters
-
-| Parameter | Type | Description | Example |
-|-----------|------|-------------|---------|
-| `-SourceSharePath` | string | Network path containing mpam-fe.exe | `\\fileserver\updates` |
-| `-MpamFileName` | string | Exact filename of update package | `mpam-feX64.exe` |
-
-### Optional Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `-ComputerName` | string[] | *(auto-discover)* | Manual list of target computers |
-| `-TempFolderOnTarget` | string | `C:\Temp\Update-DefenderOffline` | Temp directory on remote systems |
-| `-LogPath` | string | `C:\Logs` | Local log storage directory |
-| `-ReportPath` | string | `.\Reports` | HTML report output directory |
-| `-LogSharePath` | string | *(disabled)* | Network share for remote log collection |
-| `-ParallelThreads` | int | `16` | Max concurrent threads (PS 7+ only, range: 1-32) |
-| `-WhatIfMode` | switch | `false` | Dry-run mode (no changes made) |
-
-### Email Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `-SendEmail` | switch | `false` | Enable email notifications |
-| `-SmtpServer` | string | *(required if -SendEmail)* | SMTP server address |
-| `-SmtpPort` | int | `25` | SMTP port number |
-| `-SmtpUseSsl` | switch | `false` | Use SSL/TLS for SMTP |
-| `-From` | string | `DefenderUpdate@contoso.com` | Email sender address |
-| `-To` | string[] | *(required if -SendEmail)* | Email recipient(s) - supports multiple |
-| `-SmtpCredential` | PSCredential | *(optional)* | SMTP authentication credentials |
-
-### Special Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `-SaveSmtpCredential` | switch | Interactive helper to save encrypted SMTP credentials |
-
-**Get full help:**
+**gMSA installation (recommended):**
 ```powershell
-Get-Help .\Update-DefenderOffline.ps1 -Full
+.\Install-DefenderDashboard.ps1 `
+    -GmsaName "CONTOSO\svc-defender$" `
+    -SourceSharePath "\\NAS01\DataShare\...\Microsoft_Defender" `
+    -AddFirewallRule `
+    -StartImmediately
 ```
+
+**Traditional service account:**
+```powershell
+$cred = Get-Credential -UserName "CONTOSO\svc-defender" -Message "Service account password"
+.\Install-DefenderDashboard.ps1 `
+    -ServiceAccount "CONTOSO\svc-defender" `
+    -Credential $cred `
+    -AddFirewallRule `
+    -StartImmediately
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-GmsaName` | — | gMSA in `DOMAIN\name$` format. No password required. |
+| `-ServiceAccount` | — | Traditional account in `DOMAIN\user` format. Requires `-Credential`. |
+| `-Credential` | — | PSCredential for the service account. Not used with gMSA. |
+| `-Port` | `8080` | Primary port (checked for availability at install time) |
+| `-FallbackPort` | `8443` | Fallback if primary is in use |
+| `-RefreshInterval` | `300` | Passed to Start-DefenderDashboard.ps1 |
+| `-TaskName` | `DefenderDashboard` | Scheduled task name |
+| `-TaskFolder` | `\` | Task Scheduler folder |
+| `-AddFirewallRule` | — | Create inbound TCP rule for the dashboard port |
+| `-StartImmediately` | — | Start task after registration and verify via status file |
+| `-Force` | — | Overwrite existing task without prompting; replaces existing firewall rule if `-AddFirewallRule` is supplied |
+| `-SaveCredential` | — | Pass-through to `Start-DefenderDashboard.ps1`; saves WinRM credential under the running identity |
+| `-ConfigPath` | `.\conf\config.conf` | Override config file location |
+
+The installer prints a tailored "Useful commands" block at the end of every run. If `TaskFolder` is non-root, those commands include `-TaskPath` because `Get-ScheduledTask -TaskPath` requires the **trailing backslash** (`'\WGSDAC\'`, not `'\WGSDAC'`).
+
+**Manage the installed service** (substitute the `-TaskPath` value the installer printed):
+```powershell
+# Root folder (TaskFolder = '\') — no -TaskPath required
+Start-ScheduledTask  -TaskName 'DefenderDashboard'
+Stop-ScheduledTask   -TaskName 'DefenderDashboard'
+Get-ScheduledTask    -TaskName 'DefenderDashboard' | Select-Object State, LastRunTime, LastTaskResult
+Unregister-ScheduledTask -TaskName 'DefenderDashboard' -Confirm:$false
+
+# Non-root folder (e.g. TaskFolder = '\Security') — trailing backslash required
+Get-ScheduledTask -TaskName 'DefenderDashboard' -TaskPath '\Security\' |
+    Select-Object State, LastRunTime, LastTaskResult
+```
+
+**Initial collection delay:** The dashboard runs its first fleet collection synchronously after `HttpListener.Start()` and before entering the request loop, so `/health` won't respond until that pass finishes (~0.5s per host). The installer's `-StartImmediately` probe retries up to 6× / 10s each to accommodate large fleets.
+
+---
 
 ## Troubleshooting
 
-### Common Issues
+### ❌ "This script requires administrative privileges"
 
-#### ❌ "This script requires administrative privileges"
+Run PowerShell as Administrator (right-click → Run as Administrator).
 
-**Cause:** Script is not running with elevated permissions.
-
-**Solution:**
 ```powershell
-# Right-click PowerShell → "Run as Administrator"
-# Or from elevated prompt:
-Start-Process powershell -Verb RunAs
-```
-
-**Verification:**
-```powershell
-# Check if running as admin:
-([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-# Should return: True
+# Verify elevation
+([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+# Must return: True
 ```
 
 ---
 
-#### ❌ "WinRM (5985) not reachable"
+### ❌ "WinRM (5985) not reachable"
 
-**Cause:** Target computer doesn't have PowerShell Remoting enabled.
+Enable PowerShell Remoting on the target:
 
-**Solution - On Each Target Computer:**
 ```powershell
-# Enable WinRM (requires admin rights)
+# On the target computer
 Enable-PSRemoting -Force
 
-# Verify WinRM is running
-Get-Service WinRM | Select-Object Status, StartType
-# Status should be: Running
-# StartType should be: Automatic
-
-# Test locally
-Test-WSMan -ComputerName localhost
-```
-
-**Solution - Via Group Policy (Domain Environments):**
-1. Open Group Policy Management Console
-2. Edit appropriate GPO
-3. Navigate to: `Computer Configuration → Policies → Administrative Templates → Windows Components → Windows Remote Management (WinRM) → WinRM Service`
-4. Enable: "Allow remote server management through WinRM"
-5. Set IPv4/IPv6 filters: `*` (or specific ranges)
-6. Run `gpupdate /force` on target computers
-
-**Network Troubleshooting:**
-```powershell
-# Test TCP connectivity to port 5985
+# Verify from admin machine
 Test-NetConnection -ComputerName TARGETPC -Port 5985
-
-# Check Windows Firewall rules
-Get-NetFirewallRule -DisplayName "Windows Remote Management*" | Select-Object DisplayName, Enabled
 ```
+
+**Via Group Policy:**
+`Computer Configuration → Policies → Administrative Templates → Windows Components → Windows Remote Management (WinRM) → WinRM Service → Allow remote server management through WinRM`
 
 ---
 
-#### ❌ "Cannot find path '\\fileserver\updates'"
+### ❌ "Cannot proceed without target list"
 
-**Cause:** Network share is not accessible or permissions are insufficient.
+AD query failed and no `hosts.conf` exists. Create `hosts.conf` manually:
 
-**Solution:**
 ```powershell
-# Test share accessibility
-Test-Path "\\fileserver\updates"
-
-# List files in share
-Get-ChildItem "\\fileserver\updates"
-
-# Check current user context
-whoami
-
-# Map share temporarily to test permissions
-New-PSDrive -Name Z -PSProvider FileSystem -Root "\\fileserver\updates"
-Get-ChildItem Z:\
-```
-
-**Permissions Checklist:**
-- ☐ Share permissions: READ for service account
-- ☐ NTFS permissions: READ & EXECUTE for service account
-- ☐ Network path uses UNC format (not mapped drives)
-- ☐ Service account is not a local account (use domain account)
-
----
-
-#### ❌ "Cannot proceed without target list. Create hosts.conf manually."
-
-**Cause:** Auto-discovery from Active Directory failed, and no hosts.conf exists.
-
-**Possible reasons:**
-1. Machine is not domain-joined
-2. ActiveDirectory PowerShell module not installed
-3. Insufficient AD permissions
-4. Domain controller unreachable
-
-**Solution 1 - Manual hosts.conf:**
-```powershell
-# Create hosts.conf in script directory
 @"
 WORKSTATION01
 WORKSTATION02
@@ -633,197 +489,110 @@ SERVER01
 "@ | Out-File -FilePath ".\hosts.conf" -Encoding UTF8
 ```
 
-**Solution 2 - Install ActiveDirectory Module (Windows 10/11/Server):**
-```powershell
-# Windows 10/11 (requires RSAT)
-Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
+Or use `-ComputerName` to bypass discovery entirely.
 
-# Windows Server
-Install-WindowsFeature -Name RSAT-AD-PowerShell
+---
+
+### ❌ Source file not found / no versioned folder detected
+
+Verify the share structure matches the required pattern:
+```
+<SourceSharePath>\<YYYYMMDD>\v#.###.###.#\mpam-fe.exe
 ```
 
-**Solution 3 - Use -ComputerName Parameter:**
 ```powershell
-.\Update-DefenderOffline.ps1 `
-    -ComputerName "PC01","PC02","SERVER01" `
-    -SourceSharePath "\\fileserver\updates" `
-    -MpamFileName "mpam-feX64.exe"
+# Check what the script will find
+Get-ChildItem "\\NAS01\YourShare" -Recurse -Filter mpam-fe.exe |
+    Select-Object FullName, @{n='VersionFolder'; e={ $_.Directory.Name }}
+# VersionFolder must match: v#.###.###.#
 ```
 
 ---
 
-#### ❌ "Access is denied" / Authentication Failures
+### ❌ "Access is denied" on target
 
-**Cause:** Insufficient permissions on target systems.
-
-**Solution:**
 ```powershell
-# Verify you have admin rights on target
-Invoke-Command -ComputerName TARGETPC -ScriptBlock { 
-    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# Verify admin rights reach the target
+Invoke-Command -ComputerName TARGETPC -ScriptBlock {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-# Should return: True
+# Must return: True
 
-# Check if target is in TrustedHosts (workgroup environments)
-Get-Item WSMan:\localhost\Client\TrustedHosts
-
-# Add target to TrustedHosts if needed
+# Workgroup environments — add to TrustedHosts
 Set-Item WSMan:\localhost\Client\TrustedHosts -Value "TARGETPC" -Concatenate -Force
 ```
 
-**Domain Environment:**
-- Use domain admin account or delegated credentials
-- Verify service account is in "Administrators" group on targets
-
-**Workgroup Environment:**
-- Configure TrustedHosts on both sides
-- Use explicit credentials: `-Credential (Get-Credential)`
-
 ---
 
-#### ⚠️ No progress updates in parallel mode
+### ❌ "Windows Defender service not running"
 
-**Cause:** Running PowerShell 5.1 instead of PowerShell 7+.
-
-**Check Version:**
 ```powershell
-$PSVersionTable.PSVersion
-# Should show: 7.x.x for parallel support
-```
-
-**Solution - Install PowerShell 7:**
-```powershell
-# Using winget (Windows 10/11)
-winget install Microsoft.PowerShell
-
-# Using MSI installer
-# Download from: https://github.com/PowerShell/PowerShell/releases
-
-# Verify installation
-pwsh -Version
-```
-
-**Run Script with PowerShell 7:**
-```powershell
-pwsh.exe -File .\Update-DefenderOffline.ps1 `
-    -SourceSharePath "\\fileserver\updates" `
-    -MpamFileName "mpam-feX64.exe"
-```
-
----
-
-#### ⚠️ "Windows Defender service not running"
-
-**Cause:** Defender service is stopped or disabled on target.
-
-**Solution - On Target Computer:**
-```powershell
-# Check service status
-Get-Service WinDefend | Select-Object Status, StartType
-
-# Start service
+# On the target computer
 Start-Service WinDefend
-
-# Set to automatic startup
 Set-Service WinDefend -StartupType Automatic
-```
-
-**Verify Defender is Enabled:**
-```powershell
 Get-MpComputerStatus | Select-Object AntivirusEnabled, RealTimeProtectionEnabled
 ```
 
 ---
 
-#### ⚠️ Email not sending
+### ❌ Dashboard not responding / wrong port
 
-**Causes:**
-- SMTP server not reachable
-- Authentication failure
-- SSL/TLS configuration mismatch
-- Firewall blocking SMTP port
+Check the runtime status file for the actual bound port:
 
-**Troubleshooting:**
+```powershell
+Get-Content ".\conf\dashboard.status"
+# Port=8443  ← if fallback was used
+```
+
+Check the Windows Event Log:
+```powershell
+Get-EventLog -LogName Application -Source 'Manage-DefenderOffline' -Newest 5 |
+    Select-Object EventID, EntryType, Message
+# EventId 101 = started on fallback port (Warning)
+# EventId 100 = started on primary port
+# EventId 102 = stopped
+```
+
+Check the dashboard service log:
+```powershell
+Get-Content "C:\Logs\DefenderDashboard\DefenderDashboard_$(Get-Date -f yyyyMMdd).log" -Tail 20
+```
+
+---
+
+### ⚠️ Email not sending
+
 ```powershell
 # Test SMTP connectivity
 Test-NetConnection -ComputerName smtp.company.com -Port 587
 
-# Test without credentials first
-Send-MailMessage -From "test@company.com" -To "test@company.com" `
-    -Subject "Test" -Body "Test" -SmtpServer "smtp.company.com" -Port 25
-
-# Check saved credentials
-$cred = Import-Clixml ".\Config\SmtpCredential.xml"
-$cred.UserName
-# Verify username is correct
-
-# Re-save credentials if needed
+# Re-save credentials if authentication is failing
 .\Update-DefenderOffline.ps1 -SaveSmtpCredential
 ```
 
-**Common SMTP Ports:**
-- Port 25: Unencrypted (use `-SmtpUseSsl:$false`)
-- Port 587: STARTTLS (use `-SmtpUseSsl`)
-- Port 465: SSL (use `-SmtpUseSsl`)
+**Common SMTP ports:** 25 (relay, no SSL) · 587 (STARTTLS, use `-SmtpUseSsl`) · 465 (SSL, use `-SmtpUseSsl`)
 
 ---
 
-#### ⚠️ Slow performance even with PowerShell 7
+### ⚠️ Slow performance
 
-**Possible Causes:**
-1. Network bandwidth limitations
-2. Too many concurrent threads
-3. Slow target computers
-4. Large mpam-fe.exe file
-
-**Optimization Tips:**
 ```powershell
 # Reduce threads if network is saturated
-.\Update-DefenderOffline.ps1 ... -ParallelThreads 8
+.\Update-DefenderOffline.ps1 -ParallelThreads 8
 
-# Increase threads if network has capacity
-.\Update-DefenderOffline.ps1 ... -ParallelThreads 24
-
-# Monitor network utilization
-Get-NetAdapterStatistics | Select-Object Name, ReceivedBytes, SentBytes
+# Or set in conf\config.conf:
+# ParallelThreads = 8
 ```
-
-**Expected Performance:**
-- File transfer: ~5-15 seconds per computer (depends on network speed)
-- Installation: ~10-30 seconds per computer
-- Total per computer: ~15-45 seconds on average
 
 ---
-
-### Getting Additional Help
-
-**View detailed examples:**
-```powershell
-Get-Help .\Update-DefenderOffline.ps1 -Examples
-```
-
-**View all parameters:**
-```powershell
-Get-Help .\Update-DefenderOffline.ps1 -Parameter *
-```
-
-**Check script version:**
-```powershell
-# Look for version in log header
-Get-Content "C:\Logs\Update-DefenderOffline_*.log" -First 5
-```
-
-**Enable verbose logging:**
-```powershell
-.\Update-DefenderOffline.ps1 ... -Verbose
-```
 
 ## Performance Benchmarks
 
-Real-world performance based on testing with ~200 MB mpam-fe.exe file:
+Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition file:
 
 | Computers | PS 5.1 (Serial) | PS 7+ (8 threads) | PS 7+ (16 threads) | PS 7+ (32 threads) |
-|-----------|-----------------|-------------------|--------------------|--------------------|
+|---|---|---|---|---|
 | 10 | ~3 min | ~2 min | ~1 min | ~1 min |
 | 50 | ~15 min | ~8 min | ~4 min | ~3 min |
 | 100 | ~30 min | ~15 min | ~8 min | ~5 min |
@@ -831,221 +600,129 @@ Real-world performance based on testing with ~200 MB mpam-fe.exe file:
 | 500 | ~150 min | ~80 min | ~40 min | ~25 min |
 | 1000 | ~300 min | ~160 min | ~80 min | ~50 min |
 
-**Assumptions:**
-- Average 15-20 seconds per computer
-- 1 Gbps network
-- No connectivity failures
-- Includes retry logic overhead
+*Assumes 15–20 seconds per computer on a 1 Gbps network with no connectivity failures.*
 
-**Variables affecting performance:**
-- Network speed between script host and targets
-- Network speed between targets and file share
-- Target computer CPU/disk speed
-- Number of simultaneous updates running
-- File size of mpam-fe.exe (~150-250 MB)
+**Recommendations:**
+- **< 50 computers:** PS 5.1 or PS 7+ with 8 threads
+- **50–250 computers:** PS 7+ with 16 threads (default)
+- **250–500 computers:** PS 7+ with 24 threads
+- **500+ computers:** PS 7+ with 32 threads; consider splitting by site
 
-**Optimization recommendations:**
-- **<50 computers:** PS 5.1 is fine, or PS 7+ with 8 threads
-- **50-250 computers:** PS 7+ with 16 threads (default)
-- **250-500 computers:** PS 7+ with 24 threads
-- **500+ computers:** PS 7+ with 32 threads
-- **1000+ computers:** Consider breaking into batches or using separate script instances
-
-## New Features in v0.0.6
-
-### 🎯 Automatic Retry Logic
-- Soft failures (network glitches, timeouts) automatically retry up to 3 times
-- Hard failures (WinRM disabled, access denied) fail immediately without retries
-- Per-computer retry tracking in reports
-
-### 📊 Real-Time Dashboard (PowerShell 7+)
-- Live dashboard updates every 5 seconds
-- Shows: Running jobs, Pending queue, Completed count, Active computers, Elapsed time
-- Non-scrolling display for clean monitoring
-
-### ⏱️ Timeout Protection
-- 5-minute timeout per computer prevents hung jobs
-- Automatic cleanup of timed-out sessions
-- Timeout status tracked in reports
-
-### 📈 Version Analytics
-- Fleet-wide version statistics (oldest, newest, average delta)
-- Per-computer version history logging
-- CSV export for trend analysis
-
-### 🔍 Enhanced Failure Classification
-- Distinguishes between retryable and hard failures
-- Detailed failure reasons (WinRM, authentication, timeout, etc.)
-- Per-host log files track retry attempts
-
-### 🛡️ Pre-Update Health Checks
-- Verifies Windows Defender service is running before attempting updates
-- Prevents unnecessary file transfers to unhealthy systems
-
-### 📁 Per-Host Logging
-- Individual log files: `C:\Logs\PerHost\COMPUTERNAME.log`
-- Tracks all retry attempts and outcomes
-- Easier troubleshooting for specific computers
-
-### 📧 Improved Email Reports
-- Includes version analytics in email body
-- Retry and timeout information in attached report
-- CSV export attached for detailed analysis
+---
 
 ## Version History
 
-### v0.0.6 (2026-01-28) - Current
-- ✨ Added automatic retry logic with smart failure classification
-- ✨ Implemented real-time dashboard for parallel mode (PowerShell 7+)
-- ✨ Added 5-minute timeout protection per computer
-- ✨ Added fleet-wide version analytics and statistics
-- ✨ Added per-host logging in `C:\Logs\PerHost\`
-- ✨ Added CSV export for detailed analysis
-- ✨ Added pre-update health check for Defender service
-- 🐛 Fixed scoping issues with parallel execution
-- 🐛 Fixed progress tracking in parallel mode
-- 📝 Improved error messages and troubleshooting guidance
+### v0.0.6 (2026-05-24) — Current
 
-### v0.0.1 (2025-12-18) - Initial Release
+**New scripts:**
+- ✨ `Show-DefenderStatus.ps1` — interactive Windows Forms fleet monitor with Fluent-style theme, clickable stat cards that filter the grid, live query-progress counter, and auto-refresh countdown
+- ✨ `Start-DefenderDashboard.ps1` — headless HTTP dashboard with auto-refresh, JSON endpoint, port fallback, light/dark theme toggle (config-supplied default + per-browser localStorage override), and clickable stat-card filtering
+- ✨ `Install-DefenderDashboard.ps1` — scheduled task installer supporting gMSA and traditional service accounts; registers Windows Event Log source, sets ACLs, optional firewall rule, optional immediate start with `/health` retry probe
+
+**Configuration system (`conf/config.conf`):**
+- ✨ Central configuration with `[Common]`, `[Update]`, `[Dashboard]`, `[Install]`, `[Credentials]`, `[Email]` sections
+- ✨ `DisableIPv6` — drops unreachable-host detection from ~21s to ~3s on LANs that advertise AAAA records but don't route IPv6
+- ✨ `DashboardTheme` — server-supplied default theme for first-time visitors
+- ✨ `ExcludeComputers` — comma-separated list to bypass entirely (e.g. third-party AV endpoints)
+
+**Update script (`Update-DefenderOffline.ps1`):**
+- ✨ Version discovery now parses `v#.###.###.#` folder name (removed `-MpamFileName` parameter)
+- ✨ Pre-transfer version check — endpoints already current are skipped without file transfer
+- ✨ Unified execution path for parallel and serial modes
+- ✨ Tiered WinRM credentials (`-Credential` / `-WorkstationCredential` / `-ServerCredential` / `-DomainControllerCredential`) with AD-, Pattern-, or Single-based classification
+- ✨ `-ADCredential` / `-SaveADCredential` — DPAPI-encrypted AD-bind credential for STIG-hardened environments where the running account lacks AD read rights
+- ✨ Email backend rewritten on top of `System.Net.Mail.SmtpClient` (Send-MailMessage deprecated in PS7); UTF-8 pinned for Subject/Body/Headers; attachment paths resolved to absolute before passing to `MailMessage`
+- ✨ HTML report uses semantic table-based Fleet Version Summary that renders correctly in Gmail (CSS Grid was stripped)
+- 🐛 Fixed version delta calculation (was always `Unknown`)
+- 🐛 Fixed version sorting (was string-based, not version-based)
+- 🐛 Fixed log collection copying wrong files
+- 🐛 Fixed HTML report referencing unpopulated columns
+- 🐛 Fixed `$ScriptVersion` hardcoded as `0.0.1`
+- 🐛 Fixed HTML report badge-filter hiding the column header row
+
+**Dashboard service (`Start-DefenderDashboard.ps1`):**
+- ✨ Async `BeginGetContext` request loop (HttpListener has no `Pending()` method)
+- ✨ Port availability check with automatic fallback; `conf/dashboard.status` runtime file
+- ✨ Windows Event Log integration (EventId 100 = started normally, 101 = fallback port, 102 = stopped)
+- ✨ Meta-refresh aligned with countdown so the page reload always fires shortly after "Next refresh in: 0s"
+
+**Installer (`Install-DefenderDashboard.ps1`):**
+- ✨ `Manage-DefenderOffline` event log source registration
+- ✨ ACL grants to the service identity (script folder + conf + log path)
+- ✨ Optional `-AddFirewallRule` (Inbound TCP, Domain+Private profiles); `-Force` replaces an existing rule
+- ✨ `-StartImmediately` waits up to 45s for `dashboard.status`, then probes `/health` with retries
+- ✨ Normalizes `TaskFolder` with trailing backslash so `Get-ScheduledTask -TaskPath` matches
+
+### v0.0.1 (2025-12-18) — Initial Release
+
 - Initial alpha release
-- Fixed $LogSharePath scoping and default value issues
-- Added administrative privilege validation
-- Implemented parallel mode progress tracking
-- Made remote log collection optional
-- Updated documentation
+- Administrative privilege validation
+- Parallel mode with PS 7+ thread jobs
+- HTML reports and optional email notification
 
 ### Planned Features
+
 - Integration with Windows Update Service API
 - Support for multiple definition file formats (FEP, NIS)
 - Rollback capability for failed updates
-- Integration with monitoring systems (SCOM, Splunk, etc.)
-- Differential update support (only update outdated systems)
-- Web-based dashboard for monitoring
+- Integration with monitoring systems (SCOM, Splunk)
+
+---
 
 ## Best Practices
 
-### For Production Deployments
+### Production Deployments
 
-1. **Test in a Lab First**
-   - Run in `-WhatIfMode` to validate configuration
-   - Test on 2-3 computers before full deployment
-   - Verify email notifications work correctly
+1. **Test with `-WhatIfMode` first** — validates connectivity and version detection without touching endpoints
+2. **Use a dedicated service account or gMSA** — never run scheduled tasks as a personal admin account
+3. **Set `SourceSharePath` in `conf\config.conf`** — eliminates the need to repeat it on every command line
+4. **Schedule for off-peak hours** (e.g., 2 AM) to avoid impacting users
+5. **Monitor the HTML reports** for failure trends; investigate hard failures promptly
 
-2. **Scheduled Task Configuration**
-   ```powershell
-   # Use a dedicated service account
-   # Set "Run whether user is logged on or not"
-   # Set "Run with highest privileges"
-   # Schedule for off-peak hours (e.g., 2 AM)
-   ```
+### Network Share Management
 
-3. **Network Share Management**
-   - Keep only the 2-3 most recent definition files
-   - Archive older files to prevent accidental use
-   - Monitor share disk space (definitions are ~200 MB each)
+- Keep the 2–3 most recent definition versions; archive or delete older ones
+- Use the `<YYYYMMDD>\v#.###.###.#\` folder structure consistently for every download
+- Monitor share disk space (~200 MB per version)
 
-4. **Monitoring & Alerting**
-   - Enable email notifications for all production runs
-   - Monitor HTML reports for failure trends
-   - Set up alerts for >5% failure rate
-   - Review CSV exports weekly for version compliance
+### Security
 
-5. **Documentation**
-   - Document your hosts.conf exclusions
-   - Keep a changelog of when you update definitions
-   - Document any custom configurations or exclusions
+- Use Group Managed Service Accounts (gMSA) where possible — no password rotation required
+- SMTP credentials stored via `Export-Clixml` use DPAPI (per-user + per-machine) — never commit `conf\SmtpCredential.xml` to version control (`.gitignore` excludes `*.xml`)
+- Restrict `-LogSharePath` write access to the service account only
 
-### For Large Environments (500+ Computers)
-
-1. **Batch Processing**
-   - Consider breaking into geographical batches
-   - Run different sites at different times
-   - Prevents overwhelming file share or network
-
-2. **Network Optimization**
-   - Place file share close to target systems (DFS)
-   - Monitor network utilization during runs
-   - Adjust `-ParallelThreads` based on bandwidth
-
-3. **Error Handling**
-   - Review per-host logs for persistent failures
-   - Create separate hosts.conf for problematic systems
-   - Investigate hard failures immediately
-
-4. **Reporting**
-   - Archive HTML reports for compliance
-   - Export CSV to database for trending
-   - Create dashboards showing version compliance over time
-
-### Security Considerations
-
-1. **Credential Management**
-   - Use Group Managed Service Accounts (gMSA) when possible
-   - Store SMTP credentials securely (script uses DPAPI)
-   - Rotate service account passwords regularly
-   - Never commit credential files to version control
-
-2. **Network Isolation**
-   - Run from management VLAN if available
-   - Ensure WinRM traffic is encrypted (default)
-   - Limit `-LogSharePath` access to admins only
-
-3. **Audit Trail**
-   - Preserve log files for compliance (30+ days)
-   - Include script runs in change management process
-   - Document emergency update procedures
+---
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues, feature requests, or pull requests.
-
-**How to Contribute:**
+Contributions welcome. Please open an issue before submitting a large pull request.
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+3. Commit your changes
+4. Push and open a Pull Request
 
-**Areas for Contribution:**
-- Additional output formats (JSON, XML)
-- Integration with monitoring systems
-- Support for other antivirus products
-- Localization/internationalization
-- Additional reporting features
+---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE.txt](LICENSE.txt) file for details.
+MIT — see [LICENSE.txt](LICENSE.txt)
 
 ## Author
 
-**Kismet Agbasi**
-- GitHub: [@kismetgerald](https://github.com/kismetgerald)
-- Email: KismetG17@gmail.com
+**Kismet Agbasi** · [GitHub](https://github.com/kismetgerald) · KismetG17@gmail.com
 
-*AI Contributors: ClaudeAI, Grok*
+*AI Contributors: Claude AI, Grok*
 
-## Support
+## Documentation
 
-**Documentation:**
-- [Quick Reference](README.md) - This file
-- [Detailed Technical Documentation](claude.md) - Deep dive into architecture and internals
+- [Quick Reference](README.md) — this file
+- [Architecture](ARCHITECTURE.md) — system overview, lifecycles, runtime state, design decisions
 
 **Getting Help:**
-- [GitHub Issues](https://github.com/kismetgerald/Update-DefenderOffline/issues) - Bug reports and feature requests
-- [Discussions](https://github.com/kismetgerald/Update-DefenderOffline/discussions) - Questions and community support
-
-**Before Opening an Issue:**
-1. Check the [Troubleshooting](#troubleshooting) section
-2. Review existing issues to avoid duplicates
-3. Include log file excerpts when reporting bugs
-4. Specify PowerShell version and environment details
+- [GitHub Issues](https://github.com/kismetgerald/Manage-DefenderOffline/issues) — bug reports and feature requests
+- [Discussions](https://github.com/kismetgerald/Manage-DefenderOffline/discussions) — questions and community support
 
 ---
 
 **⭐ If this project helps you, please consider giving it a star!**
-
-**💬 Questions? Open a [discussion](https://github.com/kismetgerald/Update-DefenderOffline/discussions)**
-
-**🐛 Found a bug? [Report it](https://github.com/kismetgerald/Update-DefenderOffline/issues)**
