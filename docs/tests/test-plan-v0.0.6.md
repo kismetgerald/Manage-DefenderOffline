@@ -618,7 +618,13 @@ Get-NetFirewallRule -DisplayName 'DefenderDashboard-TCP-8080' |
 - [ ] Dashboard accessible at `/defender`, `/status`, `/health` after install
 - [ ] Dashboard starts automatically after system reboot
 
-**Result:** PENDING
+**Result:** PASS (Attempt 4) — Install ran cleanly with traditional service account (`WGSDAC\xxSecurityMonitor`), `-AddFirewallRule`, and `-StartImmediately`. Task registered at `\WGSDAC\DefenderDashboard`, principal verified (`LogonType=Password`, `RunLevel=Highest`). Firewall rule created on Domain+Private profiles. `/health` probe passed after 15s (matches expected initial-collection time for 33-host fleet). Conf ACL clean: one explicit `Modify` plus one inherited `ReadAndExecute` from script folder. After reboot, the AtStartup trigger fired without manual login; dashboard reachable from a remote workstation at `http://<host>:8080/defender`, loading Light theme on first visit (confirms `DashboardTheme` config default propagates to fresh clients). Surfaced and fixed during this test:
+- `New-ScheduledTaskSettingsSet -StartWhenAvailable $true` was parsed as positional arg → switched to presence-only form
+- `New-ScheduledTaskRule -Force` parameter does not exist → removed; existing-rule replacement now uses `Remove-NetFirewallRule` first when `-Force` is supplied to the installer
+- Task path display concatenated `$TaskFolder + $TaskName` without separator (`\WGSDACDefenderDashboard`) → added separator-aware join helper
+- `/health` probe used a 5s timeout but dashboard runs initial collection synchronously before serving requests → replaced with 6 retries × 10s with backoff
+- `$confFolder` and `$configFolder` aliased to same path causing duplicate ACL grant on conf → deduplicated
+- `Get-ScheduledTask -TaskPath '\WGSDAC'` returned nothing (requires trailing `\`) → normalized `$TaskFolder` at input to always end with `\`
 
 ---
 
@@ -770,7 +776,7 @@ Select-String -Path (Get-ChildItem C:\Logs\Update-DefenderOffline_*.log | Sort-O
 - [x] v0.0.6c PASS (offline hard fail; retry behaviour; correct error messages; No Update Needed validated)
 - [x] v0.0.6d PASS (Forms GUI opens; data loads; colour coding; filter; manual + auto refresh; CSV + HTML export; full UI redesign matching HTML report; card-click filter; live progress counter; auto-refresh countdown)
 - [x] v0.0.6e PASS (port fallback; status file written/deleted; all HTTP endpoints respond; 38h stability; theme system; card-click filter. EventLog 101/100/102 deferred to v0.0.6f)
-- [ ] v0.0.6f PASS (installer prereqs; service identity; scheduled task; ACLs; firewall rule; status file read; reboot persistence)
+- [x] v0.0.6f PASS (installer prereqs; service identity; scheduled task; ACLs; firewall rule; status file read; health probe with retries; reboot persistence + remote access; 6 bugs surfaced and fixed)
 - [x] v0.0.6g PASS (Gmail SMTP via app password; surfaced + fixed: AD-discovery UX, -ADCredential pattern, Send-MailMessage deprecation, attachment-path resolution, UTF-8 mangling, Fleet Version Summary layout)
 - [x] v0.0.6h PASS (delta integer; version sort; columns populated; version string; archive folder excluded. Log-filenames + no-transfer-for-current marked N/A — covered by prior v0.0.6b run)
 - [ ] `CLAUDE.md` reflects current architecture
