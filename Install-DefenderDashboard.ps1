@@ -547,8 +547,29 @@ if ($UseHttps) {
 }
 
 # ===================================================================
-# STEP 3 – Build the scheduled task action arguments
+# STEP 3 – Stop any existing dashboard task, then check port availability
 # ===================================================================
+# Stop any prior instance of our scheduled task BEFORE the port check.
+# Re-installs (especially -RenewCertificate) would otherwise fail here:
+# the still-running dashboard owns the port we're about to verify is free.
+$existingTaskPre = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
+if ($existingTaskPre -and $existingTaskPre.State -eq 'Running') {
+    Write-Step "Stopping previously installed dashboard task…"
+    try {
+        Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction Stop
+        # Wait briefly for the OS to release the bound port. HttpListener
+        # sometimes lingers in TIME_WAIT for a second or two.
+        for ($wait = 0; $wait -lt 10; $wait++) {
+            if (Test-PortFree $Port) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        Write-Ok "Previous instance stopped"
+    } catch {
+        Write-Warn "Could not stop existing task: $($_.Exception.Message)"
+        Write-Info "If install fails at port check, stop the task manually and re-run."
+    }
+}
+
 Write-Step "Checking port availability…"
 
 # HTTPS does NOT use fallback (cert is bound to a specific port). HTTP keeps the
