@@ -40,6 +40,7 @@ $RECYCLE.BIN/
 
 # Temporary files
 *.tmp
+*.tmp.*           # Pester writes atomic temp files like Foo.Tests.ps1.tmp.<pid>.<hash>
 *.temp
 ~$*
 
