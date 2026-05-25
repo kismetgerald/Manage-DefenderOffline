@@ -50,25 +50,28 @@ function New-DefenderRemoteSession {
 
         [pscredential]$Credential,
 
+        # Opt-in. If omitted, no -SessionOption is applied (system default timeouts).
+        # If supplied, builds a SessionOption with OperationTimeout/OpenTimeout set to
+        # this value (seconds) and a fixed 5s CancelTimeout.
         [ValidateRange(5, 600)]
-        [int]$TimeoutSeconds = 30,
+        [int]$TimeoutSeconds,
 
         [ValidateSet('Default', 'Basic', 'Credssp', 'Digest', 'Kerberos', 'Negotiate', 'NegotiateWithImplicitCredential')]
         [string]$Authentication = 'Default'
     )
 
-    $opts = New-PSSessionOption `
-        -OperationTimeout ($TimeoutSeconds * 1000) `
-        -OpenTimeout      ($TimeoutSeconds * 1000) `
-        -CancelTimeout    5000
-
     $params = @{
-        ComputerName  = $ComputerName
-        SessionOption = $opts
-        ErrorAction   = 'Stop'
+        ComputerName = $ComputerName
+        ErrorAction  = 'Stop'
     }
     if ($Credential)                   { $params.Credential     = $Credential }
     if ($Authentication -ne 'Default') { $params.Authentication = $Authentication }
+    if ($PSBoundParameters.ContainsKey('TimeoutSeconds')) {
+        $params.SessionOption = New-PSSessionOption `
+            -OperationTimeout ($TimeoutSeconds * 1000) `
+            -OpenTimeout      ($TimeoutSeconds * 1000) `
+            -CancelTimeout    5000
+    }
 
     New-PSSession @params
 }
@@ -116,8 +119,10 @@ function Invoke-DefenderRemote {
 
         [pscredential]$Credential,
 
+        # Opt-in. Only honored with -ComputerName. If omitted, system default
+        # timeouts apply.
         [ValidateRange(5, 600)]
-        [int]$TimeoutSeconds = 30,
+        [int]$TimeoutSeconds,
 
         [object[]]$ArgumentList,
 
@@ -134,14 +139,15 @@ function Invoke-DefenderRemote {
     if ($PSCmdlet.ParameterSetName -eq 'Session') {
         $params.Session = $Session
     } else {
-        $opts = New-PSSessionOption `
-            -OperationTimeout ($TimeoutSeconds * 1000) `
-            -OpenTimeout      ($TimeoutSeconds * 1000) `
-            -CancelTimeout    5000
-        $params.ComputerName  = $ComputerName
-        $params.SessionOption = $opts
+        $params.ComputerName = $ComputerName
         if ($Credential)                   { $params.Credential     = $Credential }
         if ($Authentication -ne 'Default') { $params.Authentication = $Authentication }
+        if ($PSBoundParameters.ContainsKey('TimeoutSeconds')) {
+            $params.SessionOption = New-PSSessionOption `
+                -OperationTimeout ($TimeoutSeconds * 1000) `
+                -OpenTimeout      ($TimeoutSeconds * 1000) `
+                -CancelTimeout    5000
+        }
     }
 
     Invoke-Command @params
