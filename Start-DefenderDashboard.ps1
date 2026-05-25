@@ -100,6 +100,22 @@ param(
     [ValidateSet('Dark','Light')]
     [string]$DashboardTheme = 'Dark',
 
+    # HTTPS support.  When true, Port refers to the HTTPS port.  A certificate
+    # must be present in Cert:\LocalMachine\My and bound to the listener URL
+    # (the installer handles both with -UseHttps).
+    [bool]$UseHttps = $false,
+
+    # Thumbprint of the cert in Cert:\LocalMachine\My to bind.  Required when
+    # -UseHttps is set.
+    [string]$CertificateThumbprint,
+
+    # Bind a secondary HTTP listener on -RedirectHttpPort that 301s every
+    # request to the HTTPS URL.  Only honored when -UseHttps is also true.
+    [bool]$RedirectHttpToHttps = $true,
+
+    [ValidateRange(1024, 65535)]
+    [int]$RedirectHttpPort = 8080,
+
     [string]$ConfigPath
 )
 
@@ -205,6 +221,10 @@ if (-not $PSBoundParameters.ContainsKey('DashboardTheme')  -and $cfg['DashboardT
     $t = $cfg['DashboardTheme'].Trim()
     if ($t -match '^(?i)light$|^(?i)dark$') { $DashboardTheme = (Get-Culture).TextInfo.ToTitleCase($t.ToLower()) }
 }
+if (-not $PSBoundParameters.ContainsKey('UseHttps')              -and $cfg['UseHttps'])              { $UseHttps              = ($cfg['UseHttps']              -match '^(?i)true|1|yes$') }
+if (-not $PSBoundParameters.ContainsKey('CertificateThumbprint') -and $cfg['CertificateThumbprint']) { $CertificateThumbprint = $cfg['CertificateThumbprint'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('RedirectHttpToHttps')   -and $cfg['RedirectHttpToHttps'])   { $RedirectHttpToHttps   = ($cfg['RedirectHttpToHttps']   -match '^(?i)true|1|yes$') }
+if (-not $PSBoundParameters.ContainsKey('RedirectHttpPort')      -and $cfg['RedirectHttpPort'])      { try { $RedirectHttpPort = [int]$cfg['RedirectHttpPort'] } catch {} }
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -234,6 +254,46 @@ function Find-AvailablePort {
         $candidate++
     }
     throw "No available port found. Primary $Primary was in use; tried fallback range $Fallback–$($candidate - 1)."
+}
+
+# ===================================================================
+# HTTPS certificate validation
+#
+# Resolves the configured thumbprint to a cert in Cert:\LocalMachine\My,
+# verifies it is not past NotAfter, and returns an object describing
+# the cert and how many days until expiry. Throws when the cert is
+# missing or expired. Callers decide whether to emit EventId 103 when
+# DaysUntilExpiry is below their warning threshold.
+# ===================================================================
+function Resolve-DashboardCertificate {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]   # validate inside so our error message wins over the binder's
+        [string]$Thumbprint
+    )
+    $clean = $Thumbprint.Trim() -replace '\s', '' -replace '[^0-9A-Fa-f]', ''
+    if (-not $clean) {
+        throw "CertificateThumbprint is empty or not a valid hexadecimal thumbprint."
+    }
+    $certPath = "Cert:\LocalMachine\My\$clean"
+    $cert = Get-Item -LiteralPath $certPath -ErrorAction SilentlyContinue
+    if (-not $cert) {
+        throw "Certificate with thumbprint $clean not found in Cert:\LocalMachine\My. " +
+              "Use Install-DefenderDashboard.ps1 -UseHttps to generate one, or import a PKI-issued cert into LocalMachine\My."
+    }
+    $now             = Get-Date
+    $daysUntilExpiry = [int]($cert.NotAfter - $now).TotalDays
+    if ($daysUntilExpiry -lt 0) {
+        throw "Certificate $clean expired $(-$daysUntilExpiry) day(s) ago (NotAfter: $($cert.NotAfter)). " +
+              "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate."
+    }
+    [pscustomobject]@{
+        Certificate     = $cert
+        Thumbprint      = $clean
+        Subject         = $cert.Subject
+        NotAfter        = $cert.NotAfter
+        DaysUntilExpiry = $daysUntilExpiry
+    }
 }
 
 # ===================================================================
@@ -945,8 +1005,41 @@ Write-DashLog "Port            : $Port"
 Write-DashLog "Refresh interval: ${RefreshInterval}s"
 Write-DashLog "Parallel threads: $ParallelThreads"
 Write-DashLog "Default theme   : $DashboardTheme"
+Write-DashLog "HTTPS           : $(if ($UseHttps) { "enabled (cert $CertificateThumbprint)" } else { 'disabled' })"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+
+# ===================================================================
+# HTTPS validation (early — fail fast before any other startup work)
+# ===================================================================
+$dashboardCert = $null
+if ($UseHttps) {
+    try {
+        $dashboardCert = Resolve-DashboardCertificate -Thumbprint $CertificateThumbprint
+        Write-DashLog "Certificate    : $($dashboardCert.Subject)" 'INFO'
+        Write-DashLog "Cert expires   : $($dashboardCert.NotAfter.ToString('yyyy-MM-dd')) ($($dashboardCert.DaysUntilExpiry) day(s) from now)" 'INFO'
+    } catch {
+        Write-DashLog $_.Exception.Message 'ERROR'
+        exit 1
+    }
+    # Warn when cert is within 30 days of expiry. Emit EventId 103 if the
+    # event source is registered (installer registers it; gracefully degrade
+    # for interactive runs).
+    if ($dashboardCert.DaysUntilExpiry -lt 30) {
+        $expiryMsg = "Dashboard TLS certificate $($dashboardCert.Thumbprint) expires in $($dashboardCert.DaysUntilExpiry) day(s) (on $($dashboardCert.NotAfter.ToString('yyyy-MM-dd'))). " +
+                     "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate, or replace with a PKI-issued cert."
+        Write-DashLog $expiryMsg 'WARN'
+        try {
+            if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
+                Write-EventLog -LogName Application -Source 'Manage-DefenderOffline' `
+                    -EventId 103 -EntryType Warning -Message $expiryMsg
+                Write-DashLog 'Warning written to Windows Event Log (EventId 103).' 'WARN'
+            }
+        } catch {
+            Write-DashLog "Could not write EventId 103 to Windows Event Log: $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
 
 $TargetComputers = @(Resolve-TargetComputers)
 if ($ExcludeList.Count -gt 0) {
@@ -977,18 +1070,62 @@ if ($portResult.IsFallback) {
 }
 $Port = $portResult.Port
 
-# Start HTTP listener
+# Start primary listener (HTTP or HTTPS depending on -UseHttps)
+$scheme   = if ($UseHttps) { 'https' } else { 'http' }
 $listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add("http://+:$Port/")
+$listener.Prefixes.Add("${scheme}://+:$Port/")
 try {
     $listener.Start()
 } catch {
-    Write-DashLog "Failed to bind to port $Port : $($_.Exception.Message)" 'ERROR'
-    Write-DashLog 'Ensure no other process owns this port and that the account has permission to register HTTP prefixes.' 'ERROR'
+    Write-DashLog "Failed to bind to port $Port (${scheme}): $($_.Exception.Message)" 'ERROR'
+    if ($UseHttps) {
+        Write-DashLog "For HTTPS, the cert must also be bound to the port via:  netsh http add sslcert ipport=0.0.0.0:$Port certhash=$($dashboardCert.Thumbprint) appid={GUID}" 'ERROR'
+        Write-DashLog 'The installer (Install-DefenderDashboard.ps1 -UseHttps) handles this binding automatically.' 'ERROR'
+    } else {
+        Write-DashLog 'Ensure no other process owns this port and that the account has permission to register HTTP prefixes.' 'ERROR'
+    }
     exit 1
 }
-Write-DashLog "HTTP listener started on http://+:$Port/" 'SUCCESS'
-Write-DashLog "Browse to: http://localhost:$Port/defender" 'INFO'
+Write-DashLog "$($scheme.ToUpper()) listener started on ${scheme}://+:$Port/" 'SUCCESS'
+Write-DashLog "Browse to: ${scheme}://localhost:$Port/defender" 'INFO'
+
+# Optional HTTP-to-HTTPS redirect listener. Spun up in a thread job so it
+# runs alongside the main listener; cleaned up in the main finally block.
+$redirectListener = $null
+$redirectJob      = $null
+if ($UseHttps -and $RedirectHttpToHttps) {
+    if ($RedirectHttpPort -eq $Port) {
+        Write-DashLog "RedirectHttpPort ($RedirectHttpPort) collides with HTTPS Port ($Port). Skipping HTTP redirect listener." 'WARN'
+    } else {
+        try {
+            $redirectListener = [System.Net.HttpListener]::new()
+            $redirectListener.Prefixes.Add("http://+:$RedirectHttpPort/")
+            $redirectListener.Start()
+            $redirectJob = Start-ThreadJob -Name 'HttpsRedirect' -ScriptBlock {
+                param($listener, $httpsPort)
+                while ($listener.IsListening) {
+                    try {
+                        $ctx = $listener.GetContext()
+                    } catch {
+                        break  # listener stopped during shutdown
+                    }
+                    try {
+                        $httpsUrl = "https://$($ctx.Request.Url.Host):$httpsPort$($ctx.Request.Url.PathAndQuery)"
+                        $ctx.Response.StatusCode      = 301
+                        $ctx.Response.RedirectLocation = $httpsUrl
+                    } catch {} finally {
+                        try { $ctx.Response.Close() } catch {}
+                    }
+                }
+            } -ArgumentList $redirectListener, $Port
+            Write-DashLog "HTTP redirect listener started on http://+:$RedirectHttpPort/ (301 -> https://+:$Port/)" 'SUCCESS'
+        } catch {
+            Write-DashLog "Could not start HTTP redirect listener on port $RedirectHttpPort : $($_.Exception.Message)" 'WARN'
+            $redirectListener = $null
+            $redirectJob      = $null
+        }
+    }
+}
 
 # Write runtime status file so the installer and administrators can
 # discover the actual bound port without reading through the log.
@@ -1144,6 +1281,14 @@ try {
     Write-DashLog 'Stopping listener…' 'WARN'
     $listener.Stop()
     $listener.Close()
+    if ($redirectListener) {
+        try { $redirectListener.Stop()  } catch {}
+        try { $redirectListener.Close() } catch {}
+    }
+    if ($redirectJob) {
+        Stop-Job   $redirectJob -ErrorAction SilentlyContinue
+        Remove-Job $redirectJob -Force -ErrorAction SilentlyContinue
+    }
     if ($script:RefreshJob) {
         Stop-Job $script:RefreshJob -Force -ErrorAction SilentlyContinue
         Remove-Job $script:RefreshJob -Force -ErrorAction SilentlyContinue
