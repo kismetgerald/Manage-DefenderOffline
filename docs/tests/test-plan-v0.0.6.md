@@ -618,13 +618,13 @@ Get-NetFirewallRule -DisplayName 'DefenderDashboard-TCP-8080' |
 - [ ] Dashboard accessible at `/defender`, `/status`, `/health` after install
 - [ ] Dashboard starts automatically after system reboot
 
-**Result:** PASS (Attempt 4) — Install ran cleanly with traditional service account (`WGSDAC\xxSecurityMonitor`), `-AddFirewallRule`, and `-StartImmediately`. Task registered at `\WGSDAC\DefenderDashboard`, principal verified (`LogonType=Password`, `RunLevel=Highest`). Firewall rule created on Domain+Private profiles. `/health` probe passed after 15s (matches expected initial-collection time for 33-host fleet). Conf ACL clean: one explicit `Modify` plus one inherited `ReadAndExecute` from script folder. After reboot, the AtStartup trigger fired without manual login; dashboard reachable from a remote workstation at `http://<host>:8080/defender`, loading Light theme on first visit (confirms `DashboardTheme` config default propagates to fresh clients). Surfaced and fixed during this test:
+**Result:** PASS (Attempt 4) — Install ran cleanly with traditional service account (`HOME\xxSecurityMonitor`), `-AddFirewallRule`, and `-StartImmediately`. Task registered at `\HOME\DefenderDashboard`, principal verified (`LogonType=Password`, `RunLevel=Highest`). Firewall rule created on Domain+Private profiles. `/health` probe passed after 15s (matches expected initial-collection time for 33-host fleet). Conf ACL clean: one explicit `Modify` plus one inherited `ReadAndExecute` from script folder. After reboot, the AtStartup trigger fired without manual login; dashboard reachable from a remote workstation at `http://<host>:8080/defender`, loading Light theme on first visit (confirms `DashboardTheme` config default propagates to fresh clients). Surfaced and fixed during this test:
 - `New-ScheduledTaskSettingsSet -StartWhenAvailable $true` was parsed as positional arg → switched to presence-only form
 - `New-ScheduledTaskRule -Force` parameter does not exist → removed; existing-rule replacement now uses `Remove-NetFirewallRule` first when `-Force` is supplied to the installer
-- Task path display concatenated `$TaskFolder + $TaskName` without separator (`\WGSDACDefenderDashboard`) → added separator-aware join helper
+- Task path display concatenated `$TaskFolder + $TaskName` without separator (`\HOMEDefenderDashboard`) → added separator-aware join helper
 - `/health` probe used a 5s timeout but dashboard runs initial collection synchronously before serving requests → replaced with 6 retries × 10s with backoff
 - `$confFolder` and `$configFolder` aliased to same path causing duplicate ACL grant on conf → deduplicated
-- `Get-ScheduledTask -TaskPath '\WGSDAC'` returned nothing (requires trailing `\`) → normalized `$TaskFolder` at input to always end with `\`
+- `Get-ScheduledTask -TaskPath '\HOME'` returned nothing (requires trailing `\`) → normalized `$TaskFolder` at input to always end with `\`
 
 ---
 

@@ -339,7 +339,7 @@ PrimaryPort = 8080      ; the configured primary
 IsFallback  = False     ; True if primary was in use and FallbackPort/sequential was selected
 StartTime   = 2026-05-24T12:29:53
 ProcessId   = 12345
-Hostname    = WGSDAC-DH01
+Hostname    = HOME-DH01
 ```
 
 The installer waits up to 45 s for this file, then performs an HTTP `/health` probe (retried up to 6 × 10 s). The status file is deleted on `Stop-ScheduledTask` or `Ctrl+C` so its mere presence implies a live service.
@@ -355,7 +355,7 @@ The installer waits up to 45 s for this file, then performs an HTTP `/health` pr
 | `FallbackPort` ships as `8090` in config but CLI default is `8443` | 8443 collides with Tomcat / Splunk / many self-signed test setups; 8090 is much less crowded | Documentation has to call out both values |
 | `Send-MailMessage` replaced by `SmtpClient` | Marked `[Obsolete]` in PS7; emits a warning on every run | UTF-8 encoding and attachment paths must be set explicitly (defaults are ASCII + .NET CurrentDirectory) |
 | `DisableIPv6 = true` by default | On LANs that advertise AAAA records but don't actually route IPv6, every unreachable host eats the full ~21 s TCP timeout before IPv4 fallback | Set `false` on networks where IPv6 is fully routed |
-| `TaskFolder` normalized with trailing `\` | `Get-ScheduledTask -TaskPath` uses CIM WQL exact matching and won't find `'\WGSDAC'` without the trailing slash | Useful-commands output and `Get-ScheduledTask` calls all need the normalized form |
+| `TaskFolder` normalized with trailing `\` | `Get-ScheduledTask -TaskPath` uses CIM WQL exact matching and won't find `'\HOME'` without the trailing slash | Useful-commands output and `Get-ScheduledTask` calls all need the normalized form |
 | Async `BeginGetContext` request loop | `HttpListener.Pending()` doesn't exist (TcpListener-only idiom); `GetContext()` blocks forever | Loop responsiveness controlled by `WaitOne(500)` |
 
 ---
