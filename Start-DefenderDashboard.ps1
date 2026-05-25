@@ -1063,12 +1063,24 @@ if ($AvailableVersionStr) {
     Write-DashLog 'No SourceSharePath provided; version currency check disabled.' 'WARN'
 }
 
-# Resolve port (check availability, fall back if needed)
-$portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
-if ($portResult.IsFallback) {
-    Write-DashLog "Port $($portResult.PrimaryPort) is in use. Binding to fallback port $($portResult.Port) instead." 'WARN'
+# Resolve port. HTTPS does NOT use fallback because netsh sslcert binds the
+# cert to a specific ipport — if the dashboard fell back to a different port,
+# the cert wouldn't be bound there and the listener would fail to start.
+# HTTP mode keeps the existing fallback behavior.
+if ($UseHttps) {
+    if (-not (Test-PortFree $Port)) {
+        Write-DashLog "Port $Port is in use and HTTPS does not support fallback (the TLS certificate is bound to a specific port via netsh)." 'ERROR'
+        Write-DashLog "Stop the conflicting process or change Port in config.conf, then re-run the installer with -RenewCertificate to rebind." 'ERROR'
+        exit 1
+    }
+    $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
+} else {
+    $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
+    if ($portResult.IsFallback) {
+        Write-DashLog "Port $($portResult.PrimaryPort) is in use. Binding to fallback port $($portResult.Port) instead." 'WARN'
+    }
+    $Port = $portResult.Port
 }
-$Port = $portResult.Port
 
 # Start primary listener (HTTP or HTTPS depending on -UseHttps)
 $scheme   = if ($UseHttps) { 'https' } else { 'http' }
