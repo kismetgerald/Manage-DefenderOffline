@@ -1397,39 +1397,9 @@ Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 
 # ===================================================================
-# HTTPS validation (early — fail fast before any other startup work)
-# ===================================================================
-$dashboardCert = $null
-if ($UseHttps) {
-    try {
-        $dashboardCert = Resolve-DashboardCertificate -Thumbprint $CertificateThumbprint
-        Write-DashLog "Certificate    : $($dashboardCert.Subject)" 'INFO'
-        Write-DashLog "Cert expires   : $($dashboardCert.NotAfter.ToString('yyyy-MM-dd')) ($($dashboardCert.DaysUntilExpiry) day(s) from now)" 'INFO'
-    } catch {
-        Write-DashLog $_.Exception.Message 'ERROR'
-        exit 1
-    }
-    # Warn when cert is within 30 days of expiry. Emit EventId 103 if the
-    # event source is registered (installer registers it; gracefully degrade
-    # for interactive runs).
-    if ($dashboardCert.DaysUntilExpiry -lt 30) {
-        $expiryMsg = "Dashboard TLS certificate $($dashboardCert.Thumbprint) expires in $($dashboardCert.DaysUntilExpiry) day(s) (on $($dashboardCert.NotAfter.ToString('yyyy-MM-dd'))). " +
-                     "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate, or replace with a PKI-issued cert."
-        Write-DashLog $expiryMsg 'WARN'
-        try {
-            if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
-                Write-EventLog -LogName Application -Source 'Manage-DefenderOffline' `
-                    -EventId 103 -EntryType Warning -Message $expiryMsg
-                Write-DashLog 'Warning written to Windows Event Log (EventId 103).' 'WARN'
-            }
-        } catch {
-            Write-DashLog "Could not write EventId 103 to Windows Event Log: $($_.Exception.Message)" 'WARN'
-        }
-    }
-}
-
-# ===================================================================
-# Authentication validation (early — fail fast for misconfigurations)
+# Authentication validation (early — fail fast for misconfigurations).
+# Runs before HTTPS cert resolution so an auth-config problem surfaces
+# in its own right instead of being masked by an unrelated cert error.
 # ===================================================================
 switch ($AuthMethod) {
     'Basic' {
@@ -1492,6 +1462,37 @@ switch ($AuthMethod) {
     }
     'None' {
         Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
+    }
+}
+
+# ===================================================================
+# HTTPS validation (after auth so auth errors surface first).
+# Resolves the cert thumbprint, warns on imminent expiry, and emits
+# EventId 103 if the event source is registered.
+# ===================================================================
+$dashboardCert = $null
+if ($UseHttps) {
+    try {
+        $dashboardCert = Resolve-DashboardCertificate -Thumbprint $CertificateThumbprint
+        Write-DashLog "Certificate    : $($dashboardCert.Subject)" 'INFO'
+        Write-DashLog "Cert expires   : $($dashboardCert.NotAfter.ToString('yyyy-MM-dd')) ($($dashboardCert.DaysUntilExpiry) day(s) from now)" 'INFO'
+    } catch {
+        Write-DashLog $_.Exception.Message 'ERROR'
+        exit 1
+    }
+    if ($dashboardCert.DaysUntilExpiry -lt 30) {
+        $expiryMsg = "Dashboard TLS certificate $($dashboardCert.Thumbprint) expires in $($dashboardCert.DaysUntilExpiry) day(s) (on $($dashboardCert.NotAfter.ToString('yyyy-MM-dd'))). " +
+                     "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate, or replace with a PKI-issued cert."
+        Write-DashLog $expiryMsg 'WARN'
+        try {
+            if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
+                Write-EventLog -LogName Application -Source 'Manage-DefenderOffline' `
+                    -EventId 103 -EntryType Warning -Message $expiryMsg
+                Write-DashLog 'Warning written to Windows Event Log (EventId 103).' 'WARN'
+            }
+        } catch {
+            Write-DashLog "Could not write EventId 103 to Windows Event Log: $($_.Exception.Message)" 'WARN'
+        }
     }
 }
 
