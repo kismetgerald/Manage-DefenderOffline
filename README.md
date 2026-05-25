@@ -728,13 +728,36 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ---
 
+## Running tests
+
+Unit tests are written in [Pester 5](https://pester.dev/) and live in `tests/`. They exercise the config parser, hosts.conf loader, version comparison, endpoint classification, port-availability helpers, the dashboard status-file contract, and the shared `lib/` helpers — without touching the network or any external system.
+
+**Prerequisite:** Pester 5.5+ in the current user's PSModulePath.
+
+```powershell
+# One-time install
+Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+
+# Run the whole suite
+Invoke-Pester -Path ./tests -Output Detailed
+
+# Run a single test file
+Invoke-Pester -Path ./tests/ConfigParser.Tests.ps1 -Output Detailed
+```
+
+The same suite runs in CI on every PR via [`.github/workflows/pester.yml`](.github/workflows/pester.yml) — JUnit XML is uploaded as a workflow artifact.
+
+`tests/Auth.Tests.ps1` and `tests/HttpsCert.Tests.ps1` contain `-Skip` placeholders for the v0.0.7 authentication and HTTPS work; Pester reports them as skipped (not failed) so CI stays green while those features are queued.
+
+---
+
 ## Contributing
 
 Contributions welcome. Please open an issue before submitting a large pull request.
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes
+3. Commit your changes (and the corresponding Pester tests)
 4. Push and open a Pull Request
 
 ---
