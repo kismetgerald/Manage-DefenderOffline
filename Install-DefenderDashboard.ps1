@@ -213,8 +213,8 @@ if (-not $PSBoundParameters.ContainsKey('TaskName')        -and $cfg['TaskName']
 if (-not $PSBoundParameters.ContainsKey('TaskFolder')      -and $cfg['TaskFolder'])      { $TaskFolder = $cfg['TaskFolder'] }
 
 # Normalize: Get-ScheduledTask -TaskPath uses CIM WQL exact matching and will
-# return nothing for '\WGSDAC' unless the trailing backslash is present
-# ('\WGSDAC\'). Register-ScheduledTask is more forgiving but the asymmetry
+# return nothing for '\HOME' unless the trailing backslash is present
+# ('\HOME\'). Register-ScheduledTask is more forgiving but the asymmetry
 # breaks the Useful-commands hints printed to the operator. Force trailing
 # slash on every code path.
 if (-not $TaskFolder.EndsWith('\')) { $TaskFolder = "$TaskFolder\" }

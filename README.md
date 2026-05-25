@@ -461,7 +461,7 @@ $cred = Get-Credential -UserName "CONTOSO\svc-defender" -Message "Service accoun
 | `-SaveCredential` | — | Pass-through to `Start-DefenderDashboard.ps1`; saves WinRM credential under the running identity |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
-The installer prints a tailored "Useful commands" block at the end of every run. If `TaskFolder` is non-root, those commands include `-TaskPath` because `Get-ScheduledTask -TaskPath` requires the **trailing backslash** (`'\WGSDAC\'`, not `'\WGSDAC'`).
+The installer prints a tailored "Useful commands" block at the end of every run. If `TaskFolder` is non-root, those commands include `-TaskPath` because `Get-ScheduledTask -TaskPath` requires the **trailing backslash** (`'\HOME\'`, not `'\HOME'`).
 
 **Manage the installed service** (substitute the `-TaskPath` value the installer printed):
 ```powershell
