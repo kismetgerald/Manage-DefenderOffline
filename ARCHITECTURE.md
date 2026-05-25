@@ -10,33 +10,38 @@ Read this when you need to understand **why** something is the way it is, or how
 
 ```mermaid
 flowchart LR
+    classDef script fill:#dff6dd,stroke:#107c10,color:#000
+    classDef infra  fill:#eee5f7,stroke:#5c2d91,color:#000
+    classDef state  fill:#fff4ce,stroke:#ca5010,color:#000
+    classDef ext    fill:#edebe9,stroke:#605e5c,color:#000
+
     subgraph admin["Admin / Operator workstation"]
-        update["Update-DefenderOffline.ps1<br/>(scheduled or manual)"]
-        show["Show-DefenderStatus.ps1<br/>(interactive Forms GUI)"]
-        installer["Install-DefenderDashboard.ps1<br/>(one-time, elevated)"]
+        update["Update-DefenderOffline.ps1<br/>(scheduled or manual)"]:::script
+        show["Show-DefenderStatus.ps1<br/>(interactive Forms GUI)"]:::script
+        installer["Install-DefenderDashboard.ps1<br/>(one-time, elevated)"]:::script
     end
 
     subgraph dashHost["Dashboard host (continuous service)"]
-        dashboard["Start-DefenderDashboard.ps1<br/>(Scheduled Task / gMSA or svc acct)"]
-        task[("Task Scheduler<br/>AtStartup, restart-on-failure")]
-        evtlog[("Windows Event Log<br/>source: Manage-DefenderOffline")]
-        fw[("Windows Firewall<br/>Inbound TCP rule")]
+        dashboard["Start-DefenderDashboard.ps1<br/>(Scheduled Task / gMSA or svc acct)"]:::script
+        task[("Task Scheduler<br/>AtStartup, restart-on-failure")]:::infra
+        evtlog[("Windows Event Log<br/>source: Manage-DefenderOffline")]:::infra
+        fw[("Windows Firewall<br/>Inbound TCP rule")]:::infra
     end
 
     subgraph shared["Shared on-disk state (script folder)"]
-        cfg[/"conf/config.conf"/]
-        hosts[/"hosts.conf"/]
-        creds[/"conf/*.xml<br/>(DPAPI credentials)"/]
-        status[/"conf/dashboard.status<br/>(runtime port)"/]
-        reports[/".\Reports\<br/>HTML + CSV"/]
+        cfg[/"conf/config.conf"/]:::state
+        hosts[/"hosts.conf"/]:::state
+        creds[/"conf/*.xml<br/>(DPAPI credentials)"/]:::state
+        status[/"conf/dashboard.status<br/>(runtime port)"/]:::state
+        reports[/".\Reports\<br/>HTML + CSV"/]:::state
     end
 
     subgraph external["External systems"]
-        share[("\\\\NAS\\...\\YYYYMMDD\\v#.#.#.#\\<br/>mpam-fe.exe")]
-        ad[("Active Directory")]
-        targets[("Target endpoints<br/>WinRM TCP 5985")]
-        smtp[("SMTP server")]
-        browser(["Browser clients"])
+        share[("\\\\NAS\\...\\YYYYMMDD\\v#.#.#.#\\<br/>mpam-fe.exe")]:::ext
+        ad[("Active Directory")]:::ext
+        targets[("Target endpoints<br/>WinRM TCP 5985")]:::ext
+        smtp[("SMTP server")]:::ext
+        browser(["Browser clients"]):::ext
     end
 
     cfg -.->|read by| update
@@ -73,6 +78,8 @@ flowchart LR
 
     dashboard -->|HTTP :8080/defender| browser
 ```
+
+**Legend:** 🟢 green = toolkit scripts · 🟣 purple = Windows infrastructure · 🟡 amber = shared on-disk state · ⚪ gray = external systems
 
 **Component responsibilities:**
 
@@ -132,7 +139,7 @@ sequenceDiagram
                 Script->>Target: Remove temp folder
             end
         end
-        Note right of Script: Soft failures retried up to 3×;<br/>hard failures (offline, denied) skip retry
+        Note right of Script: Soft failures retried up to 3 times. Hard failures such as offline or access denied skip retry
     end
 
     Script->>Script: Compute fleet analytics (oldest/newest/avg delta)
@@ -168,7 +175,7 @@ sequenceDiagram
     Installer->>EL: Register source 'Manage-DefenderOffline'
     Installer->>Installer: Validate AD account exists
     Installer->>FS: Create dirs, grant ACLs (RX on script, Modify on conf + log)
-    Installer->>Installer: Test-PortFree → select primary or fallback
+    Installer->>Installer: Test-PortFree then select primary or fallback
     Installer->>TS: Register-ScheduledTask (AtStartup, LogonType=Password, RunLevel=Highest)
     opt -AddFirewallRule
         Installer->>FW: New-NetFirewallRule (Inbound TCP, Domain+Private)
@@ -182,7 +189,7 @@ sequenceDiagram
         Dashboard->>EL: EventId 100 (or 101 if fallback)
         Dashboard->>Dashboard: Initial fleet collection (synchronous, ~0.5s/host)
         Dashboard->>Dashboard: Enter main request loop
-        loop Up to 6 retries × 10s
+        loop Up to 6 retries of 10s each
             Installer->>Dashboard: GET /health
             alt 200 OK
                 Dashboard-->>Installer: OK
@@ -200,35 +207,35 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant Listener as HttpListener
-    participant Loop as Main request loop
+    participant MainLoop as Main request loop
     participant Job as Background refresh job
     participant Browser
     participant Status as conf/dashboard.status
 
-    Loop->>Loop: Determine if refresh due<br/>(NextRefresh < now AND no job running)
+    MainLoop->>MainLoop: Determine if refresh due (NextRefresh < now AND no job running)
     opt Refresh due
-        Loop->>Job: Start ForEach-Object -Parallel (N threads)
-        Note right of Job: Asynchronous;<br/>does NOT block request handling
+        MainLoop->>Job: Start ForEach-Object -Parallel (N threads)
+        Note right of Job: Asynchronous. Does NOT block request handling
     end
 
-    Loop->>Listener: BeginGetContext (async)
-    Loop->>Loop: AsyncWaitHandle.WaitOne(500ms)
+    MainLoop->>Listener: BeginGetContext (async)
+    MainLoop->>MainLoop: AsyncWaitHandle.WaitOne(500ms)
     alt Request arrived
         Browser->>Listener: GET /defender or /status or /health or /refresh
-        Listener->>Loop: EndGetContext → context
-        Loop->>Browser: Render HTML / JSON / "OK" / redirect
+        Listener->>MainLoop: EndGetContext yields context
+        MainLoop->>Browser: Render HTML / JSON / "OK" / redirect
     else No request in 500ms
-        Loop->>Loop: Tick — check refresh status again
+        MainLoop->>MainLoop: Tick to check refresh status again
     end
 
     opt Refresh complete (job state = Completed)
-        Job-->>Loop: New fleet data
-        Loop->>Loop: Atomic swap into $script:CurrentData
+        Job-->>MainLoop: New fleet data
+        MainLoop->>MainLoop: Atomic swap into $script:CurrentData
     end
 
-    Note over Loop: Ctrl+C / Stop-ScheduledTask triggers cleanup
-    Loop->>Status: Delete conf/dashboard.status
-    Loop->>Loop: EventId 102 (Stopped)
+    Note over MainLoop: Ctrl+C / Stop-ScheduledTask triggers cleanup
+    MainLoop->>Status: Delete conf/dashboard.status
+    MainLoop->>MainLoop: EventId 102 (Stopped)
 ```
 
 **Why `BeginGetContext` + `WaitOne(500)`:** the previous attempt used `HttpListener.Pending()` (which doesn't exist) and the obvious `GetContext()` (which blocks forever). The async pattern with a 500 ms wait keeps the loop responsive enough to check the background refresh job's state and to handle `Ctrl+C` cleanly, without busy-looping.
@@ -243,36 +250,46 @@ The Update and Show scripts can use **per-tier credentials** so that a workstati
 
 ```mermaid
 flowchart TD
-    start([Need to query host X]) --> hasCfg{ClassificationMethod<br/>set?}
-    hasCfg -- "blank<br/>(auto)" --> autoDetect{Machine<br/>domain-joined?}
-    autoDetect -- yes --> useAD[Use AD method]
-    autoDetect -- no --> useSingle[Use Single method]
+    classDef startEnd fill:#cce4f7,stroke:#0078d4,color:#000,stroke-width:2px
+    classDef decision fill:#fff4ce,stroke:#ca5010,color:#000
+    classDef method   fill:#dff6dd,stroke:#107c10,color:#000
+    classDef tierWs   fill:#cfe5cc,stroke:#107c10,color:#000
+    classDef tierSrv  fill:#fde7c4,stroke:#ca5010,color:#000
+    classDef tierDc   fill:#f7c8c5,stroke:#a4262c,color:#000
+    classDef cred     fill:#eee5f7,stroke:#5c2d91,color:#000
+
+    start([Need to query host X]):::startEnd --> hasCfg{ClassificationMethod set?}:::decision
+    hasCfg -- "blank (auto)" --> autoDetect{Machine domain-joined?}:::decision
+    autoDetect -- yes --> useAD[Use AD method]:::method
+    autoDetect -- no --> useSingle[Use Single method]:::method
     hasCfg -- AD --> useAD
-    hasCfg -- Pattern --> usePattern[Use Pattern method]
+    hasCfg -- Pattern --> usePattern[Use Pattern method]:::method
     hasCfg -- Single --> useSingle
 
-    useAD --> adQuery[Query AD:<br/>OperatingSystem +<br/>userAccountControl bit 0x2000]
-    adQuery --> adTier{OS / DC flag}
+    useAD --> adQuery[Query AD: OperatingSystem + userAccountControl bit 0x2000]:::method
+    adQuery --> adTier{OS / DC flag}:::decision
     adTier -- "Workstation OS" --> ws
     adTier -- "Server OS, not DC" --> srv
     adTier -- "Server OS, DC bit set" --> dc
 
-    usePattern --> patternMatch{Hostname<br/>matches…}
+    usePattern --> patternMatch{Hostname matches…}:::decision
     patternMatch -- WorkstationPattern --> ws
     patternMatch -- DomainControllerPattern --> dc
     patternMatch -- "no match" --> srv
 
-    useSingle --> single[Use -Credential or<br/>conf/WinRmCredential.xml]
-    single --> done([Connect via WinRM])
+    useSingle --> single[Use -Credential or conf/WinRmCredential.xml]:::cred
+    single --> done([Connect via WinRM]):::startEnd
 
-    ws[Tier: Workstation] --> wsCred[Use -WorkstationCredential or<br/>conf/WorkstationCredential.xml]
-    srv[Tier: Member Server] --> srvCred[Use -ServerCredential or<br/>conf/ServerCredential.xml]
-    dc[Tier: Domain Controller] --> dcCred[Use -DomainControllerCredential or<br/>conf/DomainControllerCredential.xml]
+    ws[Tier: Workstation]:::tierWs --> wsCred[Use -WorkstationCredential or conf/WorkstationCredential.xml]:::cred
+    srv[Tier: Member Server]:::tierSrv --> srvCred[Use -ServerCredential or conf/ServerCredential.xml]:::cred
+    dc[Tier: Domain Controller]:::tierDc --> dcCred[Use -DomainControllerCredential or conf/DomainControllerCredential.xml]:::cred
 
     wsCred --> done
     srvCred --> done
     dcCred --> done
 ```
+
+**Legend:** 🟦 blue = start/end · 🟡 yellow = decision · 🟢 green = method/workstation · 🟠 orange = member server · 🔴 red = domain controller · 🟣 purple = credential file
 
 **`-ADCredential` is separate.** It controls *how the script binds to AD for hosts.conf discovery*, not which credential is sent to the target endpoint. It exists for STIG-hardened environments where the running account has WinRM rights on endpoints but no AD read rights. Saved to `conf/ADCredential.xml` via DPAPI.
 
