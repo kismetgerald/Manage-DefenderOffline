@@ -213,6 +213,12 @@ $ScriptVersion   = '0.0.6'
 $ScriptStartTime = Get-Date
 $ScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
+
+# Single chokepoint for all WinRM execution. Path is also passed into thread
+# runspaces (Invoke-DefenderUpdate runs as a Start-ThreadJob) so the wrapper
+# is available there too.
+$LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
+. $LibInvokeDefenderRemote
 $RunAsUser       = "$env:USERDOMAIN\$env:USERNAME"
 $RunFromHost     = $env:COMPUTERNAME
 $RunFromIP       = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -749,10 +755,21 @@ function Invoke-DefenderUpdate {
         [bool]$WhatIfMode,
         [string]$LogSharePath,
         [System.Management.Automation.PSCredential]$WinRmCredential,
-        [bool]$DisableIPv6 = $true
+        [bool]$DisableIPv6 = $true,
+        [string]$LibPath              # Path to lib/Invoke-DefenderRemote.ps1.
+                                      # Required when this function runs inside a
+                                      # Start-ThreadJob runspace (PS7 parallel mode).
+                                      # Optional in PS 5.1 serial mode where the
+                                      # main runspace's dot-source is inherited.
     )
 
     $WarningPreference = 'SilentlyContinue'
+
+    # Make wrapper functions available in this runspace. The Start-ThreadJob
+    # runspace doesn't inherit functions from the parent, so we re-import here.
+    if ($LibPath -and (Test-Path $LibPath)) {
+        . $LibPath
+    }
 
     $result = [pscustomobject]@{
         ComputerName = $Computer
@@ -804,13 +821,13 @@ function Invoke-DefenderUpdate {
                     else          { 'Host offline (no ping response; WinRM 5985 not reachable)' })
         }
 
-        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        $sessionParams = @{ ComputerName = $Computer }
         if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
-        $session = New-PSSession @sessionParams
+        $session = New-DefenderRemoteSession @sessionParams
 
         try {
             # --- Pre-update health check ---
-            $svcStatus = Invoke-Command -Session $session -ScriptBlock {
+            $svcStatus = Invoke-DefenderRemote -Session $session -ScriptBlock {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 if ($svc) { $svc.Status.ToString() } else { 'NotFound' }
             }
@@ -819,7 +836,7 @@ function Invoke-DefenderUpdate {
             }
 
             # --- Current version check (pre-transfer) ---
-            $currentVerStr = Invoke-Command -Session $session -ScriptBlock {
+            $currentVerStr = Invoke-DefenderRemote -Session $session -ScriptBlock {
                 try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion }
                 catch { $null }
             }
@@ -840,14 +857,14 @@ function Invoke-DefenderUpdate {
 
             # --- File transfer ---
             $mpamFileName = Split-Path $SourceFile -Leaf
-            Invoke-Command -Session $session -ScriptBlock {
+            Invoke-DefenderRemote -Session $session -ScriptBlock {
                 New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null
             }
             $remoteFile = Join-Path $TempFolderOnTarget $mpamFileName
             Copy-Item -Path $SourceFile -Destination $remoteFile -ToSession $session -Force
 
             # --- Silent install ---
-            $install = Invoke-Command -Session $session -ScriptBlock {
+            $install = Invoke-DefenderRemote -Session $session -ScriptBlock {
                 $logFile = Join-Path $using:TempFolderOnTarget "install_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
                 $errFile = $logFile + '.err'
                 $p = Start-Process `
@@ -864,7 +881,7 @@ function Invoke-DefenderUpdate {
             }
 
             # --- Post-install version ---
-            $newVerStr = Invoke-Command -Session $session -ScriptBlock {
+            $newVerStr = Invoke-DefenderRemote -Session $session -ScriptBlock {
                 try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion }
                 catch { $null }
             }
@@ -885,7 +902,7 @@ function Invoke-DefenderUpdate {
             }
 
             # --- Cleanup remote temp ---
-            Invoke-Command -Session $session -ScriptBlock {
+            Invoke-DefenderRemote -Session $session -ScriptBlock {
                 Remove-Item $using:TempFolderOnTarget -Recurse -Force -ErrorAction SilentlyContinue
             }
 
@@ -1059,7 +1076,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 [bool]$WhatIfMode,
                 $LogSharePath,
                 $item.Credential,
-                [bool]$DisableIPv6
+                [bool]$DisableIPv6,
+                $LibInvokeDefenderRemote
             )
             $ActiveJobs[$job.Id] = @{
                 Job        = $job
@@ -1167,7 +1185,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
             -WhatIfMode          ([bool]$WhatIfMode) `
             -LogSharePath        $LogSharePath `
             -WinRmCredential     $HostCredentials[$comp] `
-            -DisableIPv6         $DisableIPv6
+            -DisableIPv6         $DisableIPv6 `
+            -LibPath             $LibInvokeDefenderRemote
         $Results.Add($r)
     }
     Write-Progress -Activity 'Done' -Completed

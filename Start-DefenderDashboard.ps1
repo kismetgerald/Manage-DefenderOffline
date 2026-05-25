@@ -105,6 +105,11 @@ param(
 
 $ScriptVersion = '0.0.6'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+# Single chokepoint for all WinRM execution. Path is also passed into thread
+# runspaces (see Invoke-FleetRefresh) so the wrapper is available there too.
+$LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
+. $LibInvokeDefenderRemote
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
 # ===================================================================
@@ -384,11 +389,11 @@ function Get-DefenderStatus {
             return $result
         }
 
-        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        $sessionParams = @{ ComputerName = $Computer }
         if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
-        $session = New-PSSession @sessionParams
+        $session = New-DefenderRemoteSession @sessionParams
         try {
-            $data = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
+            $data = Invoke-DefenderRemote -Session $session -ScriptBlock {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
@@ -448,9 +453,15 @@ function Invoke-FleetRefresh {
         [int]$TSeconds,
         [string]$FunctionDef,    # Get-DefenderStatus serialised as a string
         [System.Management.Automation.PSCredential]$WinRmCredential,
-        [bool]$DisableIPv6 = $true
+        [bool]$DisableIPv6 = $true,
+        [string]$LibPath         # Path to lib/Invoke-DefenderRemote.ps1 (passed through
+                                 # to child runspaces so wrapper functions are available)
     )
 
+    # Dot-source the wrapper in this runspace (Invoke-FleetRefresh runs inside
+    # a Start-ThreadJob from Start-BackgroundRefresh, so the parent's lib
+    # dot-source isn't visible here).
+    if ($LibPath) { . $LibPath }
     ${function:Get-DefenderStatus} = [scriptblock]::Create($FunctionDef)
 
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -458,6 +469,8 @@ function Invoke-FleetRefresh {
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $Computers | ForEach-Object -Parallel {
             $comp = [string]$_
+            # Each parallel runspace is also isolated; re-import the wrapper.
+            if ($using:LibPath) { . $using:LibPath }
             ${function:Get-DefenderStatus} = [scriptblock]::Create($using:FunctionDef)
             $cred = $using:WinRmCredential
             Get-DefenderStatus -Computer $comp `
@@ -999,7 +1012,7 @@ function Start-BackgroundRefresh {
     Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
 
     $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
-        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, $LibInvokeDefenderRemote
 }
 
 function Receive-RefreshIfDone {
@@ -1031,7 +1044,8 @@ $initResults = Invoke-FleetRefresh `
     -TSeconds            $TimeoutSeconds `
     -FunctionDef         $FunctionDef `
     -WinRmCredential     $Credential `
-    -DisableIPv6         $DisableIPv6
+    -DisableIPv6         $DisableIPv6 `
+    -LibPath             $LibInvokeDefenderRemote
 
 $script:CachedResults = $initResults
 $script:CachedAt      = Get-Date
