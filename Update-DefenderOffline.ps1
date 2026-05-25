@@ -338,15 +338,6 @@ if ($SaveADCredential) {
 }
 
 # ===================================================================
-# Administrative Privilege Check
-# ===================================================================
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    throw 'This script requires administrative privileges. Run PowerShell as Administrator.'
-}
-
-# ===================================================================
 # Configuration File
 # ===================================================================
 if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
@@ -468,25 +459,6 @@ function Write-Log {
         Write-Host $line -ForegroundColor $color
     }
 }
-
-# ===================================================================
-# Startup Banner
-# ===================================================================
-Write-Log "=== Microsoft Defender Offline Update v$ScriptVersion ===" 'HEADER'
-Write-Log "Started       : $(Get-Date)"
-Write-Log "PowerShell    : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
-Write-Log "Parallel Mode : $(if ($PSVersionTable.PSVersion.Major -ge 7) { "ENABLED ($ParallelThreads threads)" } else { 'DISABLED (PS 5.1 serial)' })"
-Write-Log "Log File      : $LogFile"
-Write-Log "Report Folder : $ReportPath"
-Write-Log "WhatIf Mode   : $WhatIfMode"
-if ($SendEmail) { Write-Log "Email         : $SmtpServer → $($To -join ', ')" }
-$credParts = @()
-if ($DomainControllerCredential) { $credParts += "DC=$($DomainControllerCredential.UserName)" }
-if ($ServerCredential)           { $credParts += "Server=$($ServerCredential.UserName)" }
-if ($WorkstationCredential)      { $credParts += "WS=$($WorkstationCredential.UserName)" }
-if ($Credential)                 { $credParts += "Single=$($Credential.UserName)" }
-Write-Log "WinRM Auth    : $(if ($credParts) { $credParts -join ' | ' } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
-Write-Log "Classification: $ClassificationMethod"
 
 # ===================================================================
 # Target Computer Resolution
@@ -935,6 +907,204 @@ function Invoke-DefenderUpdate {
 }
 
 # ===================================================================
+# HTML Report Generation
+# ===================================================================
+function New-HtmlReport {
+    param(
+        [System.Collections.Generic.List[pscustomobject]]$Data,
+        [timespan]$RunTime
+    )
+
+    $successCount  = @($Data | Where-Object Status -eq 'Success').Count
+    $failCount     = @($Data | Where-Object Status -eq 'Failed').Count
+    $skipCount     = @($Data | Where-Object Status -eq 'No Update Needed').Count
+    $whatifCount   = @($Data | Where-Object Status -eq 'WhatIf').Count
+    $excludedCount = @($Data | Where-Object Status -eq 'Excluded').Count
+
+    $css = @'
+<style>
+  *   { box-sizing: border-box; }
+  body{ font-family: "Segoe UI", Arial, sans-serif; margin: 40px; background: #f5f7fa; color: #333; }
+  h1  { color: #0078d4; border-bottom: 3px solid #0078d4; padding-bottom: 10px; margin-bottom: 4px; }
+  h2  { color: #005a9e; margin-top: 32px; }
+  p   { line-height: 1.6; }
+  table          { width: 100%; border-collapse: collapse; margin: 16px 0; background: #fff;
+                   box-shadow: 0 4px 12px rgba(0,0,0,.1); border-radius: 8px; overflow: hidden; }
+  th             { background: #0078d4; color: #fff; padding: 13px 12px; text-align: left; font-weight: 600; }
+  td             { padding: 11px 12px; border-bottom: 1px solid #e8e8e8; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:nth-child(even) td { background: #f9f9f9; }
+  .tag           { display: inline-block; padding: 2px 10px; border-radius: 12px;
+                   font-size: .85em; font-weight: 600; color: #fff; }
+  .success       { background: #107c10; }
+  .failed        { background: #d13438; }
+  .skipped       { background: #9c5100; }
+  .whatif        { background: #0078d4; }
+  .excluded      { background: #6b7280; }
+  .stat-card     { display: inline-block; padding: 14px 28px; border-radius: 10px; margin: 6px 8px 6px 0;
+                   font-size: 1.1em; font-weight: 700; color: #fff; min-width: 120px; text-align: center;
+                   cursor: pointer; user-select: none; }
+  .stat-card.active-filter { outline: 3px solid rgba(255,255,255,.85); outline-offset: -3px; }
+  .sc-ok         { background: #107c10; }
+  .sc-fail       { background: #d13438; }
+  .sc-skip       { background: #9c5100; }
+  .sc-info       { background: #0078d4; }
+  /* Use <table> for the version summary layout, not CSS Grid — Gmail's
+     CSS sanitizer strips 'display: grid' so the cards stack vertically
+     when the report is sent as the email body. */
+  .version-table  { width: 100%; border-collapse: separate; border-spacing: 8px 0; margin: 16px 0; }
+  .version-table td { width: 33.33%; padding: 0; vertical-align: top; }
+  .vcard          { background: #fff; border-radius: 8px; padding: 16px 20px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+                    border-top: 4px solid #0078d4; }
+  .vcard .label   { font-size: .85em; color: #666; margin-bottom: 4px; }
+  .vcard .value   { font-size: 1.4em; font-weight: 700; color: #0078d4; }
+  .vcard-oldest        { border-top-color: #b45309; }
+  .vcard-oldest .value { color: #b45309; }
+  .vcard-newest        { border-top-color: #107c10; }
+  .vcard-newest .value { color: #107c10; }
+  .vcard-hosts         { border-top-color: #0078d4; }
+  .vcard-hosts  .value { color: #0078d4; }
+  .footer        { margin-top: 48px; color: #888; font-size: .85em; text-align: center;
+                   border-top: 1px solid #ddd; padding-top: 16px; }
+  a              { color: #0078d4; }
+</style>
+'@
+
+    # Build table rows and inject status badges
+    $rows = $Data | Sort-Object ComputerName |
+        ConvertTo-Html -Fragment -Property ComputerName, Status, OldVersion, NewVersion, DurationSec, Delta, Attempt, Timeout, Details
+
+    # Add table id for the JS badge filter
+    if ($rows.Count -gt 0) { $rows[0] = $rows[0] -replace '<table>', '<table id="resultsTable">' }
+
+    foreach ($i in 0..($rows.Count - 1)) {
+        $rows[$i] = $rows[$i] `
+            -replace '<td>Success</td>',          '<td><span class="tag success">Success</span></td>' `
+            -replace '<td>Failed</td>',           '<td><span class="tag failed">Failed</span></td>' `
+            -replace '<td>No Update Needed</td>', '<td><span class="tag skipped">No Update Needed</span></td>' `
+            -replace '<td>WhatIf</td>',           '<td><span class="tag whatif">WhatIf</span></td>' `
+            -replace '<td>Excluded</td>',         '<td><span class="tag excluded">Excluded</span></td>' `
+            -replace '<td>True</td>',             '<td><strong style="color:#d13438">Yes</strong></td>' `
+            -replace '<td>False</td>',            '<td>No</td>'
+    }
+
+    @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Defender Update Report – $(Get-Date -f 'yyyy-MM-dd')</title>
+  $css
+</head>
+<body>
+  <h1>Microsoft Defender Antivirus – Definitions Update Report</h1>
+  <p>
+    <strong>Run Date:</strong> $ScriptStartTime &nbsp;|&nbsp;
+    <strong>Available Version:</strong> v$AvailableVersionStr &nbsp;|&nbsp;
+    <strong>Total Duration:</strong> $($RunTime.ToString('hh\:mm\:ss')) &nbsp;|&nbsp;
+    <strong>Run By:</strong> $RunAsUser @ $RunFromHost ($RunFromIP)
+  </p>
+  <p style="font-size:.9em; color:#555; margin-top:-6px;">
+    <strong>Source File:</strong> $SourceFile
+  </p>
+
+  <div id="statusCards">
+    <span class="stat-card sc-ok"    data-filter="Success"        onclick="filterByStatus(this)">Success<br>$successCount</span>
+    <span class="stat-card sc-fail"  data-filter="Failed"         onclick="filterByStatus(this)">Failed<br>$failCount</span>
+    <span class="stat-card sc-skip"  data-filter="No Update Needed" onclick="filterByStatus(this)">Skipped<br>$skipCount</span>$(if ($whatifCount   -gt 0) { "`n    <span class='stat-card sc-info'  data-filter='WhatIf'   onclick='filterByStatus(this)'>WhatIf<br>$whatifCount</span>" })$(if ($excludedCount -gt 0) { "`n    <span class='stat-card' style='background:#6b7280' data-filter='Excluded'  onclick='filterByStatus(this)'>Excluded<br>$excludedCount</span>" })
+  </div>
+  <p style="font-size:.8em; color:#888; margin-top:4px;">Click a badge to filter the results table. Click again to clear.</p>
+
+  <h2>Fleet Version Summary</h2>
+  <table class="version-table" role="presentation">
+    <tr>
+      <td><div class="vcard vcard-oldest"><div class="label">Oldest Version Found</div><div class="value">$OldestVersion</div></div></td>
+      <td><div class="vcard vcard-newest"><div class="label">Newest Version Applied</div><div class="value">$NewestVersion</div></div></td>
+      <td><div class="vcard vcard-hosts"><div class="label">Hosts Updated</div><div class="value">$HostsUpdated</div></div></td>
+    </tr>
+  </table>
+
+  <h2>Detailed Results ($($Data.Count) computers)</h2>
+  $($rows -join "`n")
+
+  <div class="footer">
+    Generated by Update-DefenderOffline.ps1 v$ScriptVersion &nbsp;|&nbsp;
+    Run by <strong>$RunAsUser</strong> from <strong>$RunFromHost</strong> ($RunFromIP) &nbsp;|&nbsp;
+    <a href="file:///$([uri]::EscapeUriString($LogFile.Replace('\','/')))">View Full Log</a>
+  </div>
+
+  <script>
+    var _activeFilter = null;
+    function filterByStatus(el) {
+      var status = el.dataset.filter;
+      var rows   = document.querySelectorAll('#resultsTable tbody tr');
+      if (_activeFilter === status) {
+        _activeFilter = null;
+        rows.forEach(function(r) { r.style.display = ''; });
+        document.querySelectorAll('.stat-card').forEach(function(c) { c.classList.remove('active-filter'); });
+      } else {
+        _activeFilter = status;
+        rows.forEach(function(r) {
+          var badge = r.querySelector('.tag');
+          // ConvertTo-Html -Fragment emits header <tr> and data <tr>s as
+          // siblings (no <thead>/<tbody>); browsers auto-wrap all of them
+          // in an implicit <tbody>, so this selector matches the header
+          // row too.  Skip rows without a .tag (header / non-data rows).
+          if (!badge) return;
+          r.style.display = badge.textContent.trim() === status ? '' : 'none';
+        });
+        document.querySelectorAll('.stat-card').forEach(function(c) { c.classList.remove('active-filter'); });
+        el.classList.add('active-filter');
+      }
+    }
+  </script>
+</body>
+</html>
+"@
+}
+
+# ===================================================================
+# Main-flow guard
+#
+# When this script is dot-sourced (Pester or interactive testing of
+# individual functions), return here so the banner and execution
+# engine below do not run.  Direct invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ===================================================================
+# Administrative Privilege Check
+#
+# Placed AFTER the main-flow guard so dot-source (Pester) does not
+# trip the elevation requirement.
+# ===================================================================
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    throw 'This script requires administrative privileges. Run PowerShell as Administrator.'
+}
+
+# ===================================================================
+# Startup Banner
+# ===================================================================
+Write-Log "=== Microsoft Defender Offline Update v$ScriptVersion ===" 'HEADER'
+Write-Log "Started       : $(Get-Date)"
+Write-Log "PowerShell    : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+Write-Log "Parallel Mode : $(if ($PSVersionTable.PSVersion.Major -ge 7) { "ENABLED ($ParallelThreads threads)" } else { 'DISABLED (PS 5.1 serial)' })"
+Write-Log "Log File      : $LogFile"
+Write-Log "Report Folder : $ReportPath"
+Write-Log "WhatIf Mode   : $WhatIfMode"
+if ($SendEmail) { Write-Log "Email         : $SmtpServer → $($To -join ', ')" }
+$credParts = @()
+if ($DomainControllerCredential) { $credParts += "DC=$($DomainControllerCredential.UserName)" }
+if ($ServerCredential)           { $credParts += "Server=$($ServerCredential.UserName)" }
+if ($WorkstationCredential)      { $credParts += "WS=$($WorkstationCredential.UserName)" }
+if ($Credential)                 { $credParts += "Single=$($Credential.UserName)" }
+Write-Log "WinRM Auth    : $(if ($credParts) { $credParts -join ' | ' } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+Write-Log "Classification: $ClassificationMethod"
+
+# ===================================================================
 # Resolve Targets and Source
 # ===================================================================
 $TargetComputers = Resolve-TargetComputers
@@ -1221,164 +1391,6 @@ $NewestVersion = ($Results | Where-Object NewVersion |
     Sort-Object { try { [version]$_.NewVersion } catch { [version]'0.0.0.0' } } -Descending |
     Select-Object -First 1).NewVersion
 $HostsUpdated  = @($Results | Where-Object Status -eq 'Success').Count
-
-# ===================================================================
-# HTML Report Generation
-# ===================================================================
-function New-HtmlReport {
-    param(
-        [System.Collections.Generic.List[pscustomobject]]$Data,
-        [timespan]$RunTime
-    )
-
-    $successCount  = @($Data | Where-Object Status -eq 'Success').Count
-    $failCount     = @($Data | Where-Object Status -eq 'Failed').Count
-    $skipCount     = @($Data | Where-Object Status -eq 'No Update Needed').Count
-    $whatifCount   = @($Data | Where-Object Status -eq 'WhatIf').Count
-    $excludedCount = @($Data | Where-Object Status -eq 'Excluded').Count
-
-    $css = @'
-<style>
-  *   { box-sizing: border-box; }
-  body{ font-family: "Segoe UI", Arial, sans-serif; margin: 40px; background: #f5f7fa; color: #333; }
-  h1  { color: #0078d4; border-bottom: 3px solid #0078d4; padding-bottom: 10px; margin-bottom: 4px; }
-  h2  { color: #005a9e; margin-top: 32px; }
-  p   { line-height: 1.6; }
-  table          { width: 100%; border-collapse: collapse; margin: 16px 0; background: #fff;
-                   box-shadow: 0 4px 12px rgba(0,0,0,.1); border-radius: 8px; overflow: hidden; }
-  th             { background: #0078d4; color: #fff; padding: 13px 12px; text-align: left; font-weight: 600; }
-  td             { padding: 11px 12px; border-bottom: 1px solid #e8e8e8; vertical-align: top; }
-  tr:last-child td { border-bottom: none; }
-  tr:nth-child(even) td { background: #f9f9f9; }
-  .tag           { display: inline-block; padding: 2px 10px; border-radius: 12px;
-                   font-size: .85em; font-weight: 600; color: #fff; }
-  .success       { background: #107c10; }
-  .failed        { background: #d13438; }
-  .skipped       { background: #9c5100; }
-  .whatif        { background: #0078d4; }
-  .excluded      { background: #6b7280; }
-  .stat-card     { display: inline-block; padding: 14px 28px; border-radius: 10px; margin: 6px 8px 6px 0;
-                   font-size: 1.1em; font-weight: 700; color: #fff; min-width: 120px; text-align: center;
-                   cursor: pointer; user-select: none; }
-  .stat-card.active-filter { outline: 3px solid rgba(255,255,255,.85); outline-offset: -3px; }
-  .sc-ok         { background: #107c10; }
-  .sc-fail       { background: #d13438; }
-  .sc-skip       { background: #9c5100; }
-  .sc-info       { background: #0078d4; }
-  /* Use <table> for the version summary layout, not CSS Grid — Gmail's
-     CSS sanitizer strips 'display: grid' so the cards stack vertically
-     when the report is sent as the email body. */
-  .version-table  { width: 100%; border-collapse: separate; border-spacing: 8px 0; margin: 16px 0; }
-  .version-table td { width: 33.33%; padding: 0; vertical-align: top; }
-  .vcard          { background: #fff; border-radius: 8px; padding: 16px 20px;
-                    box-shadow: 0 2px 8px rgba(0,0,0,.08);
-                    border-top: 4px solid #0078d4; }
-  .vcard .label   { font-size: .85em; color: #666; margin-bottom: 4px; }
-  .vcard .value   { font-size: 1.4em; font-weight: 700; color: #0078d4; }
-  .vcard-oldest        { border-top-color: #b45309; }
-  .vcard-oldest .value { color: #b45309; }
-  .vcard-newest        { border-top-color: #107c10; }
-  .vcard-newest .value { color: #107c10; }
-  .vcard-hosts         { border-top-color: #0078d4; }
-  .vcard-hosts  .value { color: #0078d4; }
-  .footer        { margin-top: 48px; color: #888; font-size: .85em; text-align: center;
-                   border-top: 1px solid #ddd; padding-top: 16px; }
-  a              { color: #0078d4; }
-</style>
-'@
-
-    # Build table rows and inject status badges
-    $rows = $Data | Sort-Object ComputerName |
-        ConvertTo-Html -Fragment -Property ComputerName, Status, OldVersion, NewVersion, DurationSec, Delta, Attempt, Timeout, Details
-
-    # Add table id for the JS badge filter
-    if ($rows.Count -gt 0) { $rows[0] = $rows[0] -replace '<table>', '<table id="resultsTable">' }
-
-    foreach ($i in 0..($rows.Count - 1)) {
-        $rows[$i] = $rows[$i] `
-            -replace '<td>Success</td>',          '<td><span class="tag success">Success</span></td>' `
-            -replace '<td>Failed</td>',           '<td><span class="tag failed">Failed</span></td>' `
-            -replace '<td>No Update Needed</td>', '<td><span class="tag skipped">No Update Needed</span></td>' `
-            -replace '<td>WhatIf</td>',           '<td><span class="tag whatif">WhatIf</span></td>' `
-            -replace '<td>Excluded</td>',         '<td><span class="tag excluded">Excluded</span></td>' `
-            -replace '<td>True</td>',             '<td><strong style="color:#d13438">Yes</strong></td>' `
-            -replace '<td>False</td>',            '<td>No</td>'
-    }
-
-    @"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Defender Update Report – $(Get-Date -f 'yyyy-MM-dd')</title>
-  $css
-</head>
-<body>
-  <h1>Microsoft Defender Antivirus – Definitions Update Report</h1>
-  <p>
-    <strong>Run Date:</strong> $ScriptStartTime &nbsp;|&nbsp;
-    <strong>Available Version:</strong> v$AvailableVersionStr &nbsp;|&nbsp;
-    <strong>Total Duration:</strong> $($RunTime.ToString('hh\:mm\:ss')) &nbsp;|&nbsp;
-    <strong>Run By:</strong> $RunAsUser @ $RunFromHost ($RunFromIP)
-  </p>
-  <p style="font-size:.9em; color:#555; margin-top:-6px;">
-    <strong>Source File:</strong> $SourceFile
-  </p>
-
-  <div id="statusCards">
-    <span class="stat-card sc-ok"    data-filter="Success"        onclick="filterByStatus(this)">Success<br>$successCount</span>
-    <span class="stat-card sc-fail"  data-filter="Failed"         onclick="filterByStatus(this)">Failed<br>$failCount</span>
-    <span class="stat-card sc-skip"  data-filter="No Update Needed" onclick="filterByStatus(this)">Skipped<br>$skipCount</span>$(if ($whatifCount   -gt 0) { "`n    <span class='stat-card sc-info'  data-filter='WhatIf'   onclick='filterByStatus(this)'>WhatIf<br>$whatifCount</span>" })$(if ($excludedCount -gt 0) { "`n    <span class='stat-card' style='background:#6b7280' data-filter='Excluded'  onclick='filterByStatus(this)'>Excluded<br>$excludedCount</span>" })
-  </div>
-  <p style="font-size:.8em; color:#888; margin-top:4px;">Click a badge to filter the results table. Click again to clear.</p>
-
-  <h2>Fleet Version Summary</h2>
-  <table class="version-table" role="presentation">
-    <tr>
-      <td><div class="vcard vcard-oldest"><div class="label">Oldest Version Found</div><div class="value">$OldestVersion</div></div></td>
-      <td><div class="vcard vcard-newest"><div class="label">Newest Version Applied</div><div class="value">$NewestVersion</div></div></td>
-      <td><div class="vcard vcard-hosts"><div class="label">Hosts Updated</div><div class="value">$HostsUpdated</div></div></td>
-    </tr>
-  </table>
-
-  <h2>Detailed Results ($($Data.Count) computers)</h2>
-  $($rows -join "`n")
-
-  <div class="footer">
-    Generated by Update-DefenderOffline.ps1 v$ScriptVersion &nbsp;|&nbsp;
-    Run by <strong>$RunAsUser</strong> from <strong>$RunFromHost</strong> ($RunFromIP) &nbsp;|&nbsp;
-    <a href="file:///$([uri]::EscapeUriString($LogFile.Replace('\','/')))">View Full Log</a>
-  </div>
-
-  <script>
-    var _activeFilter = null;
-    function filterByStatus(el) {
-      var status = el.dataset.filter;
-      var rows   = document.querySelectorAll('#resultsTable tbody tr');
-      if (_activeFilter === status) {
-        _activeFilter = null;
-        rows.forEach(function(r) { r.style.display = ''; });
-        document.querySelectorAll('.stat-card').forEach(function(c) { c.classList.remove('active-filter'); });
-      } else {
-        _activeFilter = status;
-        rows.forEach(function(r) {
-          var badge = r.querySelector('.tag');
-          // ConvertTo-Html -Fragment emits header <tr> and data <tr>s as
-          // siblings (no <thead>/<tbody>); browsers auto-wrap all of them
-          // in an implicit <tbody>, so this selector matches the header
-          // row too.  Skip rows without a .tag (header / non-data rows).
-          if (!badge) return;
-          r.style.display = badge.textContent.trim() === status ? '' : 'none';
-        });
-        document.querySelectorAll('.stat-card').forEach(function(c) { c.classList.remove('active-filter'); });
-        el.classList.add('active-filter');
-      }
-    }
-  </script>
-</body>
-</html>
-"@
-}
 
 # ===================================================================
 # Write Reports
