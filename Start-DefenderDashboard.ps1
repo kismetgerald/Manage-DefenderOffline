@@ -255,6 +255,13 @@ if (-not $PSBoundParameters.ContainsKey('AuthAllowedGroups')     -and $cfg['Auth
 if (-not $PSBoundParameters.ContainsKey('AuthBasicUsersFile')    -and $cfg['AuthBasicUsersFile'])    { $AuthBasicUsersFile    = $cfg['AuthBasicUsersFile'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('AuthToken')             -and $cfg['AuthToken'])             { $AuthToken             = $cfg['AuthToken'].Trim() }
 
+# Relative paths in config.conf must resolve against the script directory,
+# not the current working directory — Task Scheduler launches pwsh.exe with
+# CWD = %SystemRoot%\System32, which makes 'conf\dashboard.users' unreachable.
+if ($AuthBasicUsersFile -and -not [System.IO.Path]::IsPathRooted($AuthBasicUsersFile)) {
+    $AuthBasicUsersFile = Join-Path $ScriptDir $AuthBasicUsersFile
+}
+
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
     $ExcludeList = $cfg['ExcludeComputers'] -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
