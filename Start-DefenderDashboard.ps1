@@ -134,6 +134,10 @@ param(
     # conf\dashboard.token with restricted ACL.
     [string]$AuthToken,
 
+    # Helper mode: prompts for a password, PBKDF2-hashes it, and appends a
+    # username:salt:iterations:hash line to AuthBasicUsersFile, then exits.
+    [string]$AddBasicUser,
+
     [string]$ConfigPath
 )
 
@@ -250,6 +254,13 @@ if (-not $PSBoundParameters.ContainsKey('AuthMethod')            -and $cfg['Auth
 if (-not $PSBoundParameters.ContainsKey('AuthAllowedGroups')     -and $cfg['AuthAllowedGroups'])     { $AuthAllowedGroups     = $cfg['AuthAllowedGroups'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('AuthBasicUsersFile')    -and $cfg['AuthBasicUsersFile'])    { $AuthBasicUsersFile    = $cfg['AuthBasicUsersFile'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('AuthToken')             -and $cfg['AuthToken'])             { $AuthToken             = $cfg['AuthToken'].Trim() }
+
+# Relative paths in config.conf must resolve against the script directory,
+# not the current working directory — Task Scheduler launches pwsh.exe with
+# CWD = %SystemRoot%\System32, which makes 'conf\dashboard.users' unreachable.
+if ($AuthBasicUsersFile -and -not [System.IO.Path]::IsPathRooted($AuthBasicUsersFile)) {
+    $AuthBasicUsersFile = Join-Path $ScriptDir $AuthBasicUsersFile
+}
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -372,6 +383,142 @@ function New-RandomToken {
     return [Convert]::ToBase64String($bytes)
 }
 
+# PBKDF2-SHA256 hashing for the Basic-auth users file. Line format:
+#   username:salt-b64:iterations:hash-b64
+# 16-byte salt, 100k iterations, 32-byte hash by default.
+function New-DashboardPasswordHash {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [securestring]$Password,
+        [int]$Iterations = 100000,
+        [int]$SaltBytes  = 16,
+        [int]$HashBytes  = 32
+    )
+    $salt = [byte[]]::new($SaltBytes)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($salt)
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+    try {
+        $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        $pbkdf2 = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
+            $plain, $salt, $Iterations,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        try {
+            $hash = $pbkdf2.GetBytes($HashBytes)
+        } finally { $pbkdf2.Dispose() }
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+    return '{0}:{1}:{2}' -f ([Convert]::ToBase64String($salt)), $Iterations, ([Convert]::ToBase64String($hash))
+}
+
+function Test-DashboardPasswordHash {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    # Verify-against-hash necessarily takes the cleartext candidate so we can
+    # PBKDF2 it and compare. SecureString conversion would add round-trips
+    # without changing the in-memory exposure window.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'Password',
+        Justification = 'Hash-verification cannot avoid receiving the cleartext candidate.')]
+    param(
+        [Parameter(Mandatory)] [string]$Password,
+        [Parameter(Mandatory)] [string]$StoredHash
+    )
+    # StoredHash is the part AFTER the username colon: salt-b64:iterations:hash-b64
+    $parts = $StoredHash.Split(':')
+    if ($parts.Count -ne 3) { return $false }
+    $salt       = try { [Convert]::FromBase64String($parts[0]) } catch { return $false }
+    $iterations = 0
+    if (-not [int]::TryParse($parts[1], [ref]$iterations) -or $iterations -lt 1) { return $false }
+    $expected   = try { [Convert]::FromBase64String($parts[2]) } catch { return $false }
+    $pbkdf2 = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
+        $Password, $salt, $iterations,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $actual = $pbkdf2.GetBytes($expected.Length)
+    } finally { $pbkdf2.Dispose() }
+    return Test-ConstantTimeEqual `
+        -A ([Convert]::ToBase64String($expected)) `
+        -B ([Convert]::ToBase64String($actual))
+}
+
+# Reads AuthBasicUsersFile and returns a dictionary of username -> StoredHash.
+# Lines beginning with # are comments. Blank lines are ignored. Bad lines are
+# logged via Write-DashLog (when available) and skipped.
+function Read-DashboardUsersFile {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.Dictionary[string,string]])]
+    param([Parameter(Mandatory)] [string]$Path)
+    $users = [System.Collections.Generic.Dictionary[string,string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path -LiteralPath $Path)) { return $users }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $t = $line.Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        # username:salt:iterations:hash → 4 colon-separated fields total
+        $idx = $t.IndexOf(':')
+        if ($idx -lt 1) { continue }
+        $user = $t.Substring(0, $idx).Trim()
+        $rest = $t.Substring($idx + 1).Trim()
+        if (-not $user -or -not $rest) { continue }
+        $users[$user] = $rest
+    }
+    return $users
+}
+
+# Appends a new user to the users file (creates the file if missing). Caller is
+# responsible for prompting for the password. Returns the path written.
+function Add-DashboardBasicUser {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Username,
+        [Parameter(Mandatory)] [securestring]$Password
+    )
+    if ($Username -notmatch '^[A-Za-z0-9._-]+$') {
+        throw "Username '$Username' contains characters that would corrupt the users file. Allowed: letters, digits, dot, underscore, hyphen."
+    }
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        @(
+            '# Manage-DefenderOffline Dashboard – Basic-auth users'
+            '# One user per line: username:salt-b64:iterations:hash-b64'
+            '# Generated and appended to by Start-DefenderDashboard.ps1 -AddBasicUser.'
+        ) | Out-File -LiteralPath $Path -Encoding UTF8 -Force
+    }
+    # Reject duplicate usernames so callers do not silently shadow a previous
+    # entry. -RemoveBasicUser is the documented way to replace one.
+    $existing = Read-DashboardUsersFile -Path $Path
+    if ($existing.ContainsKey($Username)) {
+        throw "User '$Username' already exists in $Path. Remove the existing line first."
+    }
+    $hash = New-DashboardPasswordHash -Password $Password
+    $line = '{0}:{1}' -f $Username, $hash
+    Add-Content -LiteralPath $Path -Value $line -Encoding UTF8
+
+    # Best-effort ACL tightening to the current identity (matches dashboard.token
+    # treatment). Silent fallback if Set-Acl fails — e.g. running on a drive
+    # where the user lacks SeSecurityPrivilege, or under a sandbox.
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        @($acl.Access) | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+        $identity = "$env:USERDOMAIN\$env:USERNAME"
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity, 'FullControl', 'Allow')
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    } catch {}
+
+    return $Path
+}
+
 function Test-DashboardAuth {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -440,8 +587,60 @@ function Test-DashboardAuth {
         }
 
         'Basic' {
-            # PR-D2 implements full Basic auth.
-            throw 'AuthMethod=Basic is not yet implemented (queued for PR-D2).'
+            # HTTP Basic: Authorization: Basic base64(username:password). The
+            # HttpListener stays in Anonymous mode and we parse the header
+            # ourselves so /health stays anonymous and the response loop can
+            # emit a 401 with WWW-Authenticate: Basic realm=... on first hit.
+            $authHeader = $Context.Request.Headers['Authorization']
+            if (-not $authHeader -or $authHeader -notmatch '^Basic\s+(.+)$') {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'no-credentials'
+                }
+            }
+            $decoded = $null
+            try {
+                $decoded = [System.Text.Encoding]::UTF8.GetString(
+                    [Convert]::FromBase64String($matches[1]))
+            } catch {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'malformed-credentials'
+                }
+            }
+            $colon = $decoded.IndexOf(':')
+            if ($colon -lt 1) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'malformed-credentials'
+                }
+            }
+            $providedUser = $decoded.Substring(0, $colon)
+            $providedPwd  = $decoded.Substring($colon + 1)
+
+            if (-not $UsersFile -or -not (Test-Path -LiteralPath $UsersFile)) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 500
+                    User = $providedUser; Reason = 'users-file-missing'
+                }
+            }
+            $users = Read-DashboardUsersFile -Path $UsersFile
+            if (-not $users.ContainsKey($providedUser)) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = $providedUser; Reason = 'unknown-user'
+                }
+            }
+            if (Test-DashboardPasswordHash -Password $providedPwd -StoredHash $users[$providedUser]) {
+                return [pscustomobject]@{
+                    Authorized = $true; StatusCode = 200
+                    User = $providedUser; Reason = 'password-matched'
+                }
+            }
+            return [pscustomobject]@{
+                Authorized = $false; StatusCode = 401
+                User = $providedUser; Reason = 'password-mismatch'
+            }
         }
 
         'ADIntegrated' {
@@ -449,6 +648,45 @@ function Test-DashboardAuth {
             throw 'AuthMethod=ADIntegrated is not yet implemented (queued for PR-D2).'
         }
     }
+}
+
+# ===================================================================
+# -AddBasicUser helper mode  (exits after completion)
+#
+# Appends a new entry to AuthBasicUsersFile. The file path comes from CLI
+# parameter or conf/config.conf; we default to conf\dashboard.users when
+# neither is set. The password is read as a SecureString so it never sits
+# in the host's command history or process arg list.
+# ===================================================================
+if ($AddBasicUser) {
+    Write-Host "`n=== Add Basic Auth User ===" -ForegroundColor Cyan
+    Write-Host ''
+    $usersPath = $AuthBasicUsersFile
+    if (-not $usersPath) { $usersPath = Join-Path $ScriptDir 'conf\dashboard.users' }
+    Write-Host "  Users file: $usersPath"
+    Write-Host "  Username  : $AddBasicUser"
+    try {
+        $pwd1 = Read-Host -AsSecureString -Prompt '  Enter password'
+        $pwd2 = Read-Host -AsSecureString -Prompt '  Confirm password'
+        $b1 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwd1)
+        $b2 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwd2)
+        try {
+            $p1 = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($b1)
+            $p2 = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($b2)
+            if ($p1 -ne $p2) { Write-Host '  ERROR: passwords do not match.' -ForegroundColor Red; exit 1 }
+            if (-not $p1)    { Write-Host '  ERROR: password cannot be empty.' -ForegroundColor Red; exit 1 }
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
+        }
+        $written = Add-DashboardBasicUser -Path $usersPath -Username $AddBasicUser -Password $pwd1
+        Write-Host "  Saved: $written" -ForegroundColor Green
+        Write-Host "  Hint : ensure conf/config.conf sets AuthMethod = Basic and AuthBasicUsersFile = $written" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
 }
 
 # ===================================================================
@@ -1166,39 +1404,9 @@ Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 
 # ===================================================================
-# HTTPS validation (early — fail fast before any other startup work)
-# ===================================================================
-$dashboardCert = $null
-if ($UseHttps) {
-    try {
-        $dashboardCert = Resolve-DashboardCertificate -Thumbprint $CertificateThumbprint
-        Write-DashLog "Certificate    : $($dashboardCert.Subject)" 'INFO'
-        Write-DashLog "Cert expires   : $($dashboardCert.NotAfter.ToString('yyyy-MM-dd')) ($($dashboardCert.DaysUntilExpiry) day(s) from now)" 'INFO'
-    } catch {
-        Write-DashLog $_.Exception.Message 'ERROR'
-        exit 1
-    }
-    # Warn when cert is within 30 days of expiry. Emit EventId 103 if the
-    # event source is registered (installer registers it; gracefully degrade
-    # for interactive runs).
-    if ($dashboardCert.DaysUntilExpiry -lt 30) {
-        $expiryMsg = "Dashboard TLS certificate $($dashboardCert.Thumbprint) expires in $($dashboardCert.DaysUntilExpiry) day(s) (on $($dashboardCert.NotAfter.ToString('yyyy-MM-dd'))). " +
-                     "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate, or replace with a PKI-issued cert."
-        Write-DashLog $expiryMsg 'WARN'
-        try {
-            if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
-                Write-EventLog -LogName Application -Source 'Manage-DefenderOffline' `
-                    -EventId 103 -EntryType Warning -Message $expiryMsg
-                Write-DashLog 'Warning written to Windows Event Log (EventId 103).' 'WARN'
-            }
-        } catch {
-            Write-DashLog "Could not write EventId 103 to Windows Event Log: $($_.Exception.Message)" 'WARN'
-        }
-    }
-}
-
-# ===================================================================
-# Authentication validation (early — fail fast for misconfigurations)
+# Authentication validation (early — fail fast for misconfigurations).
+# Runs before HTTPS cert resolution so an auth-config problem surfaces
+# in its own right instead of being masked by an unrelated cert error.
 # ===================================================================
 switch ($AuthMethod) {
     'Basic' {
@@ -1208,9 +1416,16 @@ switch ($AuthMethod) {
         }
         if (-not $AuthBasicUsersFile -or -not (Test-Path -LiteralPath $AuthBasicUsersFile)) {
             Write-DashLog "AuthMethod=Basic but AuthBasicUsersFile is missing or not found: $AuthBasicUsersFile" 'ERROR'
-            Write-DashLog "Create users via:  .\Start-DefenderDashboard.ps1 -AddBasicUser <username>   (PR-D2)" 'ERROR'
+            Write-DashLog "Create users via:  .\Start-DefenderDashboard.ps1 -AddBasicUser <username>" 'ERROR'
             exit 1
         }
+        $userCount = (Read-DashboardUsersFile -Path $AuthBasicUsersFile).Count
+        if ($userCount -eq 0) {
+            Write-DashLog "AuthMethod=Basic but AuthBasicUsersFile contains no users: $AuthBasicUsersFile" 'ERROR'
+            Write-DashLog "Add at least one user via:  .\Start-DefenderDashboard.ps1 -AddBasicUser <username>" 'ERROR'
+            exit 1
+        }
+        Write-DashLog "Basic auth: $userCount user(s) loaded from $AuthBasicUsersFile" 'INFO'
     }
     'Token' {
         if (-not $AuthToken) {
@@ -1254,6 +1469,37 @@ switch ($AuthMethod) {
     }
     'None' {
         Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
+    }
+}
+
+# ===================================================================
+# HTTPS validation (after auth so auth errors surface first).
+# Resolves the cert thumbprint, warns on imminent expiry, and emits
+# EventId 103 if the event source is registered.
+# ===================================================================
+$dashboardCert = $null
+if ($UseHttps) {
+    try {
+        $dashboardCert = Resolve-DashboardCertificate -Thumbprint $CertificateThumbprint
+        Write-DashLog "Certificate    : $($dashboardCert.Subject)" 'INFO'
+        Write-DashLog "Cert expires   : $($dashboardCert.NotAfter.ToString('yyyy-MM-dd')) ($($dashboardCert.DaysUntilExpiry) day(s) from now)" 'INFO'
+    } catch {
+        Write-DashLog $_.Exception.Message 'ERROR'
+        exit 1
+    }
+    if ($dashboardCert.DaysUntilExpiry -lt 30) {
+        $expiryMsg = "Dashboard TLS certificate $($dashboardCert.Thumbprint) expires in $($dashboardCert.DaysUntilExpiry) day(s) (on $($dashboardCert.NotAfter.ToString('yyyy-MM-dd'))). " +
+                     "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate, or replace with a PKI-issued cert."
+        Write-DashLog $expiryMsg 'WARN'
+        try {
+            if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
+                Write-EventLog -LogName Application -Source 'Manage-DefenderOffline' `
+                    -EventId 103 -EntryType Warning -Message $expiryMsg
+                Write-DashLog 'Warning written to Windows Event Log (EventId 103).' 'WARN'
+            }
+        } catch {
+            Write-DashLog "Could not write EventId 103 to Windows Event Log: $($_.Exception.Message)" 'WARN'
+        }
     }
 }
 
