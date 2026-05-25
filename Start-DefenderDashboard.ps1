@@ -116,6 +116,24 @@ param(
     [ValidateRange(1024, 65535)]
     [int]$RedirectHttpPort = 8080,
 
+    # Authentication for /defender, /status, /refresh. /health stays anonymous
+    # in all modes so external monitoring can probe liveness without creds.
+    # PR-D1 implements None and Token; PR-D2 fills in Basic and ADIntegrated.
+    [ValidateSet('None', 'ADIntegrated', 'Basic', 'Token')]
+    [string]$AuthMethod = 'None',
+
+    # ADIntegrated only (PR-D2): comma-separated allow list. Prefix entries with
+    # '!' to deny (deny wins over allow). Empty allow-list = any authenticated user.
+    [string]$AuthAllowedGroups,
+
+    # Basic only (PR-D2): path to file with 'username:pbkdf2-hash' per line.
+    [string]$AuthBasicUsersFile,
+
+    # Token only: bearer token. If blank when AuthMethod=Token, a random
+    # 32-byte token is generated at first startup and written to
+    # conf\dashboard.token with restricted ACL.
+    [string]$AuthToken,
+
     [string]$ConfigPath
 )
 
@@ -225,6 +243,13 @@ if (-not $PSBoundParameters.ContainsKey('UseHttps')              -and $cfg['UseH
 if (-not $PSBoundParameters.ContainsKey('CertificateThumbprint') -and $cfg['CertificateThumbprint']) { $CertificateThumbprint = $cfg['CertificateThumbprint'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('RedirectHttpToHttps')   -and $cfg['RedirectHttpToHttps'])   { $RedirectHttpToHttps   = ($cfg['RedirectHttpToHttps']   -match '^(?i)true|1|yes$') }
 if (-not $PSBoundParameters.ContainsKey('RedirectHttpPort')      -and $cfg['RedirectHttpPort'])      { try { $RedirectHttpPort = [int]$cfg['RedirectHttpPort'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('AuthMethod')            -and $cfg['AuthMethod'])            {
+    $am = $cfg['AuthMethod'].Trim()
+    if ($am -match '^(?i)None|ADIntegrated|Basic|Token$') { $AuthMethod = (Get-Culture).TextInfo.ToTitleCase($am.ToLower()) -replace '^Adintegrated$','ADIntegrated' }
+}
+if (-not $PSBoundParameters.ContainsKey('AuthAllowedGroups')     -and $cfg['AuthAllowedGroups'])     { $AuthAllowedGroups     = $cfg['AuthAllowedGroups'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('AuthBasicUsersFile')    -and $cfg['AuthBasicUsersFile'])    { $AuthBasicUsersFile    = $cfg['AuthBasicUsersFile'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('AuthToken')             -and $cfg['AuthToken'])             { $AuthToken             = $cfg['AuthToken'].Trim() }
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -293,6 +318,136 @@ function Resolve-DashboardCertificate {
         Subject         = $cert.Subject
         NotAfter        = $cert.NotAfter
         DaysUntilExpiry = $daysUntilExpiry
+    }
+}
+
+# ===================================================================
+# Authentication helpers
+#
+# Test-ConstantTimeEqual: defends bearer-token comparison against timing
+# attacks. Standard equality short-circuits on the first mismatched byte;
+# an attacker can use response-timing to discover the token byte by byte.
+# This implementation always touches every byte, then ORs the differences.
+#
+# New-RandomToken: cryptographically random 32-byte token, base64-encoded
+# (~43 chars). Used for AuthMethod=Token when no AuthToken is configured.
+#
+# Test-DashboardAuth: central authorization chokepoint. Returns a result
+# object with Authorized, StatusCode, User, and Reason. Always allows
+# /health regardless of AuthMethod (liveness probes need to work without
+# credentials).
+#
+# PR-D1 implements None and Token. PR-D2 fills in Basic and ADIntegrated.
+# ===================================================================
+
+function Test-ConstantTimeEqual {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$A,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$B
+    )
+    if ($null -eq $A -or $null -eq $B) { return $false }
+    if ($A.Length -ne $B.Length)        { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $A.Length; $i++) {
+        $diff = $diff -bor ([byte][char]$A[$i] -bxor [byte][char]$B[$i])
+    }
+    return $diff -eq 0
+}
+
+function New-RandomToken {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([int]$ByteLength = 32)
+    $bytes = [byte[]]::new($ByteLength)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    return [Convert]::ToBase64String($bytes)
+}
+
+function Test-DashboardAuth {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        # Untyped so Pester can pass a PSObject duck-type stub. At runtime
+        # the production caller always passes a [System.Net.HttpListenerContext].
+        # We only access .Request.Url.LocalPath, .Request.Headers, and
+        # .Request.QueryString — all of which work on either a real context
+        # or a stub with the same shape.
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('None', 'ADIntegrated', 'Basic', 'Token')]
+        [string]$Method,
+
+        # Mode-specific inputs. Each is only meaningful for its own Method.
+        [string]$Token,
+        [string]$AllowedGroups,
+        [string]$UsersFile
+    )
+
+    # /health is always anonymous so external monitoring works in every mode
+    if ($Context.Request.Url.LocalPath -eq '/health') {
+        return [pscustomobject]@{
+            Authorized = $true; StatusCode = 200
+            User = 'anonymous'; Reason = 'health-bypass'
+        }
+    }
+
+    switch ($Method) {
+        'None' {
+            return [pscustomobject]@{
+                Authorized = $true; StatusCode = 200
+                User = 'anonymous'; Reason = 'auth-disabled'
+            }
+        }
+
+        'Token' {
+            # Accept token in Authorization: Bearer <token> header OR ?token= query string.
+            # Header is checked first (more secure: not logged in URL).
+            $provided = $null
+            $authHeader = $Context.Request.Headers['Authorization']
+            if ($authHeader -and $authHeader -match '^Bearer\s+(.+)$') {
+                $provided = $matches[1]
+            } elseif ($Context.Request.QueryString['token']) {
+                $provided = $Context.Request.QueryString['token']
+            }
+
+            if (-not $provided) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'no-token'
+                }
+            }
+            if (Test-ConstantTimeEqual -A $provided -B $Token) {
+                return [pscustomobject]@{
+                    Authorized = $true; StatusCode = 200
+                    User = 'token-bearer'; Reason = 'token-matched'
+                }
+            }
+            return [pscustomobject]@{
+                Authorized = $false; StatusCode = 403
+                User = 'anonymous'; Reason = 'token-mismatch'
+            }
+        }
+
+        'Basic' {
+            # PR-D2 implements full Basic auth.
+            throw 'AuthMethod=Basic is not yet implemented (queued for PR-D2).'
+        }
+
+        'ADIntegrated' {
+            # PR-D2 implements full AD-integrated auth.
+            throw 'AuthMethod=ADIntegrated is not yet implemented (queued for PR-D2).'
+        }
     }
 }
 
@@ -1006,6 +1161,7 @@ Write-DashLog "Refresh interval: ${RefreshInterval}s"
 Write-DashLog "Parallel threads: $ParallelThreads"
 Write-DashLog "Default theme   : $DashboardTheme"
 Write-DashLog "HTTPS           : $(if ($UseHttps) { "enabled (cert $CertificateThumbprint)" } else { 'disabled' })"
+Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 
@@ -1038,6 +1194,66 @@ if ($UseHttps) {
         } catch {
             Write-DashLog "Could not write EventId 103 to Windows Event Log: $($_.Exception.Message)" 'WARN'
         }
+    }
+}
+
+# ===================================================================
+# Authentication validation (early — fail fast for misconfigurations)
+# ===================================================================
+switch ($AuthMethod) {
+    'Basic' {
+        if (-not $UseHttps) {
+            Write-DashLog "AuthMethod=Basic over plain HTTP would send credentials in cleartext on every request. Enable UseHttps=true in config.conf, or pick a different AuthMethod." 'ERROR'
+            exit 1
+        }
+        if (-not $AuthBasicUsersFile -or -not (Test-Path -LiteralPath $AuthBasicUsersFile)) {
+            Write-DashLog "AuthMethod=Basic but AuthBasicUsersFile is missing or not found: $AuthBasicUsersFile" 'ERROR'
+            Write-DashLog "Create users via:  .\Start-DefenderDashboard.ps1 -AddBasicUser <username>   (PR-D2)" 'ERROR'
+            exit 1
+        }
+    }
+    'Token' {
+        if (-not $AuthToken) {
+            $tokenFile = Join-Path $ScriptDir 'conf\dashboard.token'
+            if (Test-Path -LiteralPath $tokenFile) {
+                $AuthToken = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+                Write-DashLog "Loaded existing dashboard token from $tokenFile" 'INFO'
+            } else {
+                $AuthToken = New-RandomToken -ByteLength 32
+                try {
+                    $AuthToken | Out-File -LiteralPath $tokenFile -Encoding ASCII -NoNewline
+                    # Tighten ACL: disable inheritance, allow only the current
+                    # identity (which is the scheduled-task service account
+                    # when run as a service). Falls back to file-system default
+                    # if any of these calls fail.
+                    try {
+                        $acl = Get-Acl -LiteralPath $tokenFile
+                        $acl.SetAccessRuleProtection($true, $false)
+                        # Remove all inherited / pre-existing rules
+                        @($acl.Access) | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+                        $identity = "$env:USERDOMAIN\$env:USERNAME"
+                        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                            $identity, 'FullControl', 'Allow')
+                        $acl.AddAccessRule($rule)
+                        Set-Acl -LiteralPath $tokenFile -AclObject $acl
+                    } catch {
+                        Write-DashLog "Could not tighten ACL on $tokenFile : $($_.Exception.Message). Falling back to default file permissions." 'WARN'
+                    }
+                    Write-DashLog "Generated new dashboard token and wrote to $tokenFile (restricted to $env:USERDOMAIN\$env:USERNAME)" 'SUCCESS'
+                } catch {
+                    Write-DashLog "Could not write token file $tokenFile : $($_.Exception.Message). Using in-memory token only (will regenerate on restart)." 'WARN'
+                }
+            }
+        }
+    }
+    'ADIntegrated' {
+        # PR-D2: full implementation lands then. For now, fail at startup so
+        # operators don't think it's silently working.
+        Write-DashLog "AuthMethod=ADIntegrated is not yet implemented (queued for PR-D2). Use AuthMethod=Token or None for now." 'ERROR'
+        exit 1
+    }
+    'None' {
+        Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
     }
 }
 
@@ -1247,6 +1463,24 @@ try {
         $context    = $listener.EndGetContext($pendingCtx)
         $pendingCtx = $null
         $path       = $context.Request.Url.AbsolutePath.TrimEnd('/')
+
+        # ----- Authorization check (before any work) -----
+        $authResult = Test-DashboardAuth `
+            -Context        $context `
+            -Method         $AuthMethod `
+            -Token          $AuthToken `
+            -AllowedGroups  $AuthAllowedGroups `
+            -UsersFile      $AuthBasicUsersFile
+        if (-not $authResult.Authorized) {
+            $context.Response.StatusCode = $authResult.StatusCode
+            if ($authResult.StatusCode -eq 401 -and $AuthMethod -eq 'Basic') {
+                $context.Response.Headers.Add('WWW-Authenticate', 'Basic realm="Defender Dashboard"')
+            }
+            try { $context.Response.OutputStream.Close() } catch {}
+            try { $context.Response.Close() } catch {}
+            Write-DashLog "Denied $path ($($authResult.Reason); HTTP $($authResult.StatusCode))" 'INFO'
+            continue
+        }
 
         switch ($path) {
             '/defender' {
