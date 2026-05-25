@@ -618,6 +618,15 @@ $($rows -join "`n")
 }
 
 # ===================================================================
+# Main-flow guard
+#
+# When this script is dot-sourced (Pester or interactive testing of
+# individual functions), return here so the setup and Forms GUI below
+# do not run.  Direct invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ===================================================================
 # Setup
 # ===================================================================
 $TargetComputers = @(Resolve-TargetComputers)
