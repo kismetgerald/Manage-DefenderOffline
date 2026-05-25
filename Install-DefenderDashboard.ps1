@@ -253,6 +253,47 @@ function Write-Warn  ([string]$Msg) { Write-Host "    [WARN] $Msg" -ForegroundCo
 function Write-Fail  ([string]$Msg) { Write-Host "    [FAIL] $Msg" -ForegroundColor Red }
 function Write-Info  ([string]$Msg) { Write-Host "          $Msg" -ForegroundColor Gray }
 
+function Grant-FolderAccess {
+    param([string]$Path, [string]$Identity, [string]$Rights = 'ReadAndExecute')
+    try {
+        $acl  = Get-Acl $Path
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $Identity, $Rights,
+            'ContainerInherit,ObjectInherit',
+            'None',
+            'Allow'
+        )
+        $acl.AddAccessRule($rule)
+        Set-Acl -Path $Path -AclObject $acl
+        Write-Ok "Granted $Rights to '$Identity' on $Path"
+    } catch {
+        Write-Warn "Could not set ACL on $Path : $($_.Exception.Message)"
+        Write-Info 'Grant manually if required.'
+    }
+}
+# ===================================================================
+# Main-flow guard
+#
+# When this script is dot-sourced (Pester or interactive testing of
+# individual functions), return here so the installer banner and
+# main flow below do not run.  Direct invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ===================================================================
+# Administrative Privilege Check
+#
+# Placed AFTER the main-flow guard so dot-source (Pester) does not
+# trip the elevation requirement.
+# ===================================================================
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Fail 'This script must be run as Administrator.'
+    exit 1
+}
+Write-Ok 'Running as Administrator'
+
 # ===================================================================
 # STEP 0 – Prerequisites
 # ===================================================================
@@ -262,15 +303,6 @@ Write-Host "   Defender Dashboard Installer v$ScriptVersion" -ForegroundColor Ma
 Write-Host "  ============================================================" -ForegroundColor Magenta
 
 Write-Step "Checking prerequisites…"
-
-# Admin check
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Fail 'This script must be run as Administrator.'
-    exit 1
-}
-Write-Ok 'Running as Administrator'
 
 # PowerShell 7 on the target machine (pwsh.exe)
 $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
@@ -382,24 +414,6 @@ foreach ($p in $pathsToCreate | Select-Object -Unique) {
     }
 }
 
-function Grant-FolderAccess {
-    param([string]$Path, [string]$Identity, [string]$Rights = 'ReadAndExecute')
-    try {
-        $acl  = Get-Acl $Path
-        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $Identity, $Rights,
-            'ContainerInherit,ObjectInherit',
-            'None',
-            'Allow'
-        )
-        $acl.AddAccessRule($rule)
-        Set-Acl -Path $Path -AclObject $acl
-        Write-Ok "Granted $Rights to '$Identity' on $Path"
-    } catch {
-        Write-Warn "Could not set ACL on $Path : $($_.Exception.Message)"
-        Write-Info 'Grant manually if required.'
-    }
-}
 
 Grant-FolderAccess -Path $scriptFolder -Identity $identityLabel -Rights 'ReadAndExecute'
 Grant-FolderAccess -Path $confFolder   -Identity $identityLabel -Rights 'Modify'   # writes dashboard.status + reads/writes WinRmCredential.xml
