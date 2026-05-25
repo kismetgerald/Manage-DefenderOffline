@@ -163,6 +163,24 @@ param(
     # Save WinRM credential for the dashboard service account (DPAPI-encrypted)
     [switch]$SaveCredential,
 
+    # --- Authentication (pass-through to dashboard via config.conf) ---
+    # When any of these are provided, the installer writes them to the
+    # [Dashboard] section of config.conf so the scheduled task picks them
+    # up at startup. Omitted parameters leave the existing config values
+    # alone.
+    [ValidateSet('None', 'Token', 'Basic', 'ADIntegrated')]
+    [string]$AuthMethod,
+
+    # ADIntegrated only. Comma-separated; entries prefixed '!' are denies.
+    [string]$AuthAllowedGroups,
+
+    # Basic only. Path to the users file (PBKDF2 hashes), relative paths
+    # resolve against the dashboard script directory.
+    [string]$AuthBasicUsersFile,
+
+    # Token only. Leave blank to let the dashboard auto-generate one.
+    [string]$AuthToken,
+
     [string]$ConfigPath
 )
 
@@ -542,6 +560,65 @@ if ($UseHttps) {
     } catch {
         Write-Fail "Failed to update config.conf: $($_.Exception.Message)"
         Write-Info "Manually set in [Dashboard]:  UseHttps = true  /  CertificateThumbprint = $CertificateThumbprint"
+        exit 1
+    }
+}
+
+# ===================================================================
+# STEP 2.6 – Authentication pass-through
+# Persists any -Auth* parameter that was supplied on the CLI to the
+# [Dashboard] section of config.conf so the scheduled task picks it
+# up at startup. Omitted parameters leave existing config alone.
+# For ADIntegrated, also tries to resolve each allow-list entry to
+# an SID and warns (doesn't block) on unresolvable ones.
+# ===================================================================
+$authBound = @($PSBoundParameters.Keys | Where-Object { $_ -in 'AuthMethod','AuthAllowedGroups','AuthBasicUsersFile','AuthToken' })
+if ($authBound.Count -gt 0) {
+    Write-Step "Configuring authentication…"
+    if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+    try {
+        if ($PSBoundParameters.ContainsKey('AuthMethod')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthMethod' -Value $AuthMethod
+            Write-Ok "Persisted AuthMethod=$AuthMethod"
+        }
+        if ($PSBoundParameters.ContainsKey('AuthAllowedGroups')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthAllowedGroups' -Value $AuthAllowedGroups
+            Write-Ok "Persisted AuthAllowedGroups=$AuthAllowedGroups"
+        }
+        if ($PSBoundParameters.ContainsKey('AuthBasicUsersFile')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthBasicUsersFile' -Value $AuthBasicUsersFile
+            Write-Ok "Persisted AuthBasicUsersFile=$AuthBasicUsersFile"
+        }
+        if ($PSBoundParameters.ContainsKey('AuthToken')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthToken' -Value $AuthToken
+            Write-Ok 'Persisted AuthToken (value not displayed)'
+        }
+    } catch {
+        Write-Fail "Failed to update config.conf: $($_.Exception.Message)"
+        exit 1
+    }
+
+    # Warn-only validation: with ADIntegrated + an allow-list, try to resolve
+    # each entry to a SID so typos surface here rather than first request.
+    if ($AuthMethod -eq 'ADIntegrated' -and $AuthAllowedGroups) {
+        foreach ($entry in ($AuthAllowedGroups -split ',')) {
+            $e = $entry.Trim()
+            if (-not $e) { continue }
+            $name = if ($e.StartsWith('!')) { $e.Substring(1).Trim() } else { $e }
+            if (-not $name) { continue }
+            try {
+                [void]([System.Security.Principal.NTAccount]::new($name)).Translate(
+                    [System.Security.Principal.SecurityIdentifier])
+            } catch {
+                Write-Warn "AuthAllowedGroups entry '$e' could not be resolved to an SID on this host. The dashboard will ignore it. Check spelling / domain reachability."
+            }
+        }
+    }
+
+    # Cleartext-Basic protection mirrors the dashboard's own startup check
+    # so an operator can't accidentally install a misconfigured task.
+    if ($AuthMethod -eq 'Basic' -and -not $UseHttps) {
+        Write-Fail "AuthMethod=Basic without -UseHttps would send credentials in cleartext on every request. Re-run with -UseHttps, or pick a different AuthMethod."
         exit 1
     }
 }
