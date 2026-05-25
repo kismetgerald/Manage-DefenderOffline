@@ -13,6 +13,9 @@ conf/dashboard.status
 # AI assistant working notes (local to the maintainer; not part of the public project)
 CLAUDE.md
 
+# Planning documents (local to the maintainer; not part of the public project)
+docs/plans/
+
 # IDE settings
 .vscode/
 
