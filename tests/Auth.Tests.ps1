@@ -34,7 +34,10 @@ BeforeAll {
         param(
             [string]$Path        = '/defender',
             [hashtable]$Headers  = @{},
-            [hashtable]$Query    = @{}
+            [hashtable]$Query    = @{},
+            # ADIntegrated: a duck-type principal with .Identity having
+            # .IsAuthenticated, .Name, .User (SID), and .Groups (SID[]).
+            $User                = $null
         )
         $headerCollection = [System.Collections.Specialized.NameValueCollection]::new()
         foreach ($k in $Headers.Keys) { $headerCollection.Add($k, $Headers[$k]) }
@@ -45,6 +48,31 @@ BeforeAll {
                 Url         = [pscustomobject]@{ LocalPath = $Path }
                 Headers     = $headerCollection
                 QueryString = $queryCollection
+            }
+            User = $User
+        }
+    }
+
+    # Helper: build a WindowsIdentity-shaped duck-type. SecurityIdentifier
+    # is unsealed-and-equatable, so we use real SIDs (well-known SID strings)
+    # and assemble them into the .Groups collection.
+    function New-FakePrincipal {
+        param(
+            [Parameter(Mandatory)] [string]$UserSidString,
+            [string]$Name = 'WGSDAC\testuser',
+            [string[]]$GroupSidStrings = @(),
+            [bool]$IsAuthenticated = $true
+        )
+        $userSid  = [System.Security.Principal.SecurityIdentifier]::new($UserSidString)
+        $groupSids = @($GroupSidStrings | ForEach-Object {
+            [System.Security.Principal.SecurityIdentifier]::new($_)
+        })
+        [pscustomobject]@{
+            Identity = [pscustomobject]@{
+                IsAuthenticated = $IsAuthenticated
+                Name            = $Name
+                User            = $userSid
+                Groups          = $groupSids
             }
         }
     }
@@ -448,14 +476,249 @@ Describe '-AddBasicUser helper mode (live-fire only)' -Tag 'Integration' {
 }
 
 # ============================================================================
-# Stubs queued for PR-D2b — ADIntegrated, deny syntax, installer pass-through
+# PR-D2b: ADIntegrated auth — group resolution + membership + branch behavior
 # ============================================================================
 
-Describe 'AuthMethod = ADIntegrated (PR-D2b placeholder)' -Tag 'Skip-Until-PR-D2b' {
-    It 'rejects requests with no credentials (401)' -Skip {}
-    It 'allows users whose group is in AuthAllowedGroups' -Skip {}
-    It 'rejects users not in any allowed group (403)' -Skip {}
-    It 'rejects users in a denied group via !Group syntax (deny precedence)' -Skip {}
-    It 'allows when AuthAllowedGroups is empty (any authenticated user)' -Skip {}
+Describe 'Resolve-DashboardAllowedGroups' {
+
+    It 'returns empty allow/deny/unresolved when given an empty allow-list' {
+        $r = Resolve-DashboardAllowedGroups -AllowList ''
+        $r.AllowSids.Count  | Should -Be 0
+        $r.DenySids.Count   | Should -Be 0
+        $r.Unresolved.Count | Should -Be 0
+    }
+
+    It 'resolves a single allow entry to a SID (using BUILTIN\Administrators)' {
+        # BUILTIN\Administrators is present on every Windows host, so this
+        # works on a workgroup test box as well as a domain-joined one.
+        $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Administrators'
+        $r.AllowSids.Count | Should -Be 1
+        $r.AllowSids[0].Value | Should -Be 'S-1-5-32-544'
+        $r.DenySids.Count  | Should -Be 0
+        $r.Unresolved.Count | Should -Be 0
+    }
+
+    It 'treats !Group entries as denies (deny list separate from allow list)' {
+        $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Users,!BUILTIN\Guests'
+        $r.AllowSids.Count | Should -Be 1
+        $r.AllowSids[0].Value | Should -Be 'S-1-5-32-545'   # Users
+        $r.DenySids.Count  | Should -Be 1
+        $r.DenySids[0].Value  | Should -Be 'S-1-5-32-546'   # Guests
+    }
+
+    It 'collects unresolvable entries in .Unresolved instead of throwing' {
+        $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Administrators,NOSUCHDOMAIN\NoSuchGroup-NonExistent'
+        $r.AllowSids.Count  | Should -Be 1
+        $r.Unresolved.Count | Should -Be 1
+        $r.Unresolved[0]    | Should -Match 'NoSuchGroup-NonExistent'
+    }
+
+    It 'tolerates whitespace around entries and empty segments' {
+        $r = Resolve-DashboardAllowedGroups -AllowList '  BUILTIN\Administrators ,, ! BUILTIN\Guests ,'
+        $r.AllowSids.Count | Should -Be 1
+        $r.DenySids.Count  | Should -Be 1
+    }
+}
+
+Describe 'Test-IdentityInAllowedGroups' {
+
+    BeforeAll {
+        # Reusable well-known SIDs so the tests don't depend on actual AD.
+        $script:UserSid       = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')
+        $script:AdminsSid     = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')  # BUILTIN\Administrators
+        $script:UsersSid      = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')  # BUILTIN\Users
+        $script:GuestsSid     = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-546')  # BUILTIN\Guests
+        $script:AuthUsersSid  = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-11')      # NT AUTHORITY\Authenticated Users
+    }
+
+    It 'allows any authenticated user when allow-list is empty' {
+        $allowed = [pscustomobject]@{ AllowSids = @(); DenySids = @(); Unresolved = @() }
+        $r = Test-IdentityInAllowedGroups -UserSid $script:UserSid -GroupSids @($script:UsersSid) -AllowedGroups $allowed
+        $r.Authorized | Should -BeTrue
+        $r.Reason     | Should -Be 'no-allow-list'
+    }
+
+    It 'allows when user is a member of an allowed group' {
+        $allowed = [pscustomobject]@{ AllowSids = @($script:AdminsSid); DenySids = @(); Unresolved = @() }
+        $r = Test-IdentityInAllowedGroups -UserSid $script:UserSid `
+            -GroupSids @($script:AdminsSid, $script:UsersSid) `
+            -AllowedGroups $allowed
+        $r.Authorized | Should -BeTrue
+        $r.Reason     | Should -Be 'group-allowed'
+        $r.MatchedSid.Value | Should -Be 'S-1-5-32-544'
+    }
+
+    It 'rejects users with no membership in the allow-list (not-in-allow-list)' {
+        $allowed = [pscustomobject]@{ AllowSids = @($script:AdminsSid); DenySids = @(); Unresolved = @() }
+        $r = Test-IdentityInAllowedGroups -UserSid $script:UserSid `
+            -GroupSids @($script:UsersSid) `
+            -AllowedGroups $allowed
+        $r.Authorized | Should -BeFalse
+        $r.Reason     | Should -Be 'not-in-allow-list'
+    }
+
+    It 'rejects when user matches a deny entry — deny wins over allow' {
+        # User is BOTH in Administrators (allowed) AND Guests (denied). Deny wins.
+        $allowed = [pscustomobject]@{
+            AllowSids = @($script:AdminsSid)
+            DenySids  = @($script:GuestsSid)
+            Unresolved = @()
+        }
+        $r = Test-IdentityInAllowedGroups -UserSid $script:UserSid `
+            -GroupSids @($script:AdminsSid, $script:GuestsSid) `
+            -AllowedGroups $allowed
+        $r.Authorized | Should -BeFalse
+        $r.Reason     | Should -Be 'group-denied'
+        $r.MatchedSid.Value | Should -Be 'S-1-5-32-546'
+    }
+
+    It 'matches against the user SID itself (not just group SIDs)' {
+        # AllowSids contains the user's own SID; user has no group memberships.
+        $allowed = [pscustomobject]@{ AllowSids = @($script:UserSid); DenySids = @(); Unresolved = @() }
+        $r = Test-IdentityInAllowedGroups -UserSid $script:UserSid -GroupSids @() -AllowedGroups $allowed
+        $r.Authorized | Should -BeTrue
+        $r.Reason     | Should -Be 'group-allowed'
+    }
+}
+
+Describe 'Test-DashboardAuth — AuthMethod=ADIntegrated' {
+
+    BeforeAll {
+        $script:UserSid    = 'S-1-5-21-1-2-3-1001'
+        $script:AdminsSid  = 'S-1-5-32-544'
+        $script:UsersSid   = 'S-1-5-32-545'
+        $script:GuestsSid  = 'S-1-5-32-546'
+
+        function script:Build-AllowedGroups {
+            param([string[]]$Allow = @(), [string[]]$Deny = @())
+            [pscustomobject]@{
+                AllowSids  = @($Allow | ForEach-Object { [System.Security.Principal.SecurityIdentifier]::new($_) })
+                DenySids   = @($Deny  | ForEach-Object { [System.Security.Principal.SecurityIdentifier]::new($_) })
+                Unresolved = @()
+            }
+        }
+    }
+
+    It 'returns 401 with no-windows-identity when context.User is null' {
+        $ctx = New-FakeContext -Path '/defender' -User $null
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated' -AllowedGroupSids (script:Build-AllowedGroups)
+        $r.Authorized | Should -BeFalse
+        $r.StatusCode | Should -Be 401
+        $r.Reason     | Should -Be 'no-windows-identity'
+    }
+
+    It 'returns 401 when the identity is not authenticated' {
+        $principal = New-FakePrincipal -UserSidString $script:UserSid -IsAuthenticated $false
+        $ctx = New-FakeContext -Path '/defender' -User $principal
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated' -AllowedGroupSids (script:Build-AllowedGroups)
+        $r.Authorized | Should -BeFalse
+        $r.StatusCode | Should -Be 401
+        $r.Reason     | Should -Be 'no-windows-identity'
+    }
+
+    It 'allows when the user is in an allowed group' {
+        $principal = New-FakePrincipal -UserSidString $script:UserSid -GroupSidStrings @($script:AdminsSid)
+        $ctx = New-FakeContext -Path '/defender' -User $principal
+        $allowed = script:Build-AllowedGroups -Allow @($script:AdminsSid)
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated' -AllowedGroupSids $allowed
+        $r.Authorized | Should -BeTrue
+        $r.StatusCode | Should -Be 200
+        $r.Reason     | Should -Be 'group-allowed'
+        $r.User       | Should -Be 'WGSDAC\testuser'
+    }
+
+    It 'rejects (403) when the user is not in any allowed group' {
+        $principal = New-FakePrincipal -UserSidString $script:UserSid -GroupSidStrings @($script:UsersSid)
+        $ctx = New-FakeContext -Path '/defender' -User $principal
+        $allowed = script:Build-AllowedGroups -Allow @($script:AdminsSid)
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated' -AllowedGroupSids $allowed
+        $r.Authorized | Should -BeFalse
+        $r.StatusCode | Should -Be 403
+        $r.Reason     | Should -Be 'not-in-allow-list'
+    }
+
+    It 'rejects (403) when the user is in a denied group — deny wins over allow' {
+        $principal = New-FakePrincipal -UserSidString $script:UserSid `
+            -GroupSidStrings @($script:AdminsSid, $script:GuestsSid)
+        $ctx = New-FakeContext -Path '/defender' -User $principal
+        $allowed = script:Build-AllowedGroups -Allow @($script:AdminsSid) -Deny @($script:GuestsSid)
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated' -AllowedGroupSids $allowed
+        $r.Authorized | Should -BeFalse
+        $r.StatusCode | Should -Be 403
+        $r.Reason     | Should -Be 'group-denied'
+    }
+
+    It 'allows any authenticated user when allow-list and deny-list are both empty' {
+        $principal = New-FakePrincipal -UserSidString $script:UserSid
+        $ctx = New-FakeContext -Path '/defender' -User $principal
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated' -AllowedGroupSids (script:Build-AllowedGroups)
+        $r.Authorized | Should -BeTrue
+        $r.Reason     | Should -Be 'no-allow-list'
+    }
+
+    It '/health bypass still anonymous in ADIntegrated mode' {
+        # The selector delegate sets /health to Anonymous at the listener level;
+        # this verifies the in-function bypass also handles a request that
+        # arrived without a populated User (matches the listener's behavior).
+        $ctx = New-FakeContext -Path '/health' -User $null
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated' -AllowedGroupSids (script:Build-AllowedGroups)
+        $r.Authorized | Should -BeTrue
+        $r.Reason     | Should -Be 'health-bypass'
+    }
+
+    It 'tolerates AllowedGroupSids being omitted entirely (defaults to any authenticated user)' {
+        $principal = New-FakePrincipal -UserSidString $script:UserSid
+        $ctx = New-FakeContext -Path '/defender' -User $principal
+        $r = Test-DashboardAuth -Context $ctx -Method 'ADIntegrated'
+        $r.Authorized | Should -BeTrue
+        $r.Reason     | Should -Be 'no-allow-list'
+    }
+}
+
+# Startup-validation tests live-fire only — they exit() the host process so
+# can't run inside Pester without a subprocess wrapper. Validated by the
+# maintainer when smoke-testing PR-D2b.
+Describe 'AuthMethod = ADIntegrated — startup validation (live-fire only)' -Tag 'Integration' {
     It 'warns at startup when host is not domain-joined' -Skip {}
+    It 'warns at startup for each unresolvable AuthAllowedGroups entry' -Skip {}
+    It 'logs "any authenticated user permitted" when allow-list is empty' -Skip {}
+}
+
+Describe 'Installer pass-through — -AuthMethod/-AuthAllowedGroups/-AuthBasicUsersFile/-AuthToken' {
+    # Exercises Update-ConfigValue via the same path the installer uses,
+    # so we can assert the [Dashboard] section ends up with the expected
+    # keys regardless of which Auth* params were supplied.
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'lib\Update-ConfigValue.ps1')
+    }
+
+    BeforeEach {
+        $script:TestConfig = Join-Path $TestDrive 'config.conf'
+        Set-Content -Path $script:TestConfig -Value @(
+            '[Dashboard]'
+            'Port = 8080'
+            'AuthMethod = None'
+            'AuthAllowedGroups ='
+            'AuthBasicUsersFile = conf\dashboard.users'
+            'AuthToken ='
+        ) -Encoding UTF8
+    }
+
+    It 'persists AuthMethod to [Dashboard]' {
+        Update-ConfigValue -Path $script:TestConfig -Section 'Dashboard' -Key 'AuthMethod' -Value 'ADIntegrated'
+        (Get-Content $script:TestConfig -Raw) | Should -Match '(?m)^AuthMethod = ADIntegrated'
+    }
+
+    It 'persists AuthAllowedGroups (allow+deny syntax)' {
+        Update-ConfigValue -Path $script:TestConfig -Section 'Dashboard' -Key 'AuthAllowedGroups' `
+            -Value 'Domain Admins,Helpdesk,!Contractors'
+        (Get-Content $script:TestConfig -Raw) | Should -Match 'Domain Admins,Helpdesk,!Contractors'
+    }
+
+    It 'persists AuthToken without disturbing other keys' {
+        Update-ConfigValue -Path $script:TestConfig -Section 'Dashboard' -Key 'AuthToken' -Value 'opaque-token'
+        $content = Get-Content $script:TestConfig -Raw
+        $content | Should -Match 'AuthToken = opaque-token'
+        $content | Should -Match '(?m)^Port = 8080'
+    }
 }
