@@ -899,6 +899,44 @@ function Send-HttpResponse {
     }
 }
 
+function Start-BackgroundRefresh {
+    if ($script:IsRefreshing) { return }
+    $script:IsRefreshing = $true
+    Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
+
+    $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, $LibInvokeDefenderRemote
+}
+
+function Receive-RefreshIfDone {
+    if (-not $script:RefreshJob) { return }
+    if ($script:RefreshJob.State -notin 'Running','NotStarted') {
+        $newData = Receive-Job $script:RefreshJob -ErrorAction SilentlyContinue
+        Remove-Job $script:RefreshJob -Force
+        $script:RefreshJob   = $null
+        $script:IsRefreshing = $false
+
+        if ($newData) {
+            $script:CachedResults = if ($newData -is [array]) { [System.Collections.Generic.List[pscustomobject]]$newData } else { $newData }
+            $script:CachedAt      = Get-Date
+            $onlineCount  = @($script:CachedResults | Where-Object Online).Count
+            $outdatedCount = @($script:CachedResults | Where-Object VersionStatus -eq 'Outdated').Count
+            Write-DashLog "Refresh complete: $($script:CachedResults.Count) computers | $onlineCount online | $outdatedCount outdated" 'SUCCESS'
+        } else {
+            Write-DashLog 'Refresh job returned no data.' 'WARN'
+        }
+    }
+}
+
+# ===================================================================
+# Main-flow guard
+#
+# When this script is dot-sourced (Pester or interactive testing of
+# individual functions), return here so the banner and HTTP listener
+# below do not run.  Direct invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 # ===================================================================
 # Startup
 # ===================================================================
@@ -1005,35 +1043,6 @@ $script:CachedAt       = [datetime]::MinValue
 $script:IsRefreshing   = $false
 $script:RefreshJob     = $null
 $FunctionDef           = ${function:Get-DefenderStatus}.ToString()
-
-function Start-BackgroundRefresh {
-    if ($script:IsRefreshing) { return }
-    $script:IsRefreshing = $true
-    Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
-
-    $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
-        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, $LibInvokeDefenderRemote
-}
-
-function Receive-RefreshIfDone {
-    if (-not $script:RefreshJob) { return }
-    if ($script:RefreshJob.State -notin 'Running','NotStarted') {
-        $newData = Receive-Job $script:RefreshJob -ErrorAction SilentlyContinue
-        Remove-Job $script:RefreshJob -Force
-        $script:RefreshJob   = $null
-        $script:IsRefreshing = $false
-
-        if ($newData) {
-            $script:CachedResults = if ($newData -is [array]) { [System.Collections.Generic.List[pscustomobject]]$newData } else { $newData }
-            $script:CachedAt      = Get-Date
-            $onlineCount  = @($script:CachedResults | Where-Object Online).Count
-            $outdatedCount = @($script:CachedResults | Where-Object VersionStatus -eq 'Outdated').Count
-            Write-DashLog "Refresh complete: $($script:CachedResults.Count) computers | $onlineCount online | $outdatedCount outdated" 'SUCCESS'
-        } else {
-            Write-DashLog 'Refresh job returned no data.' 'WARN'
-        }
-    }
-}
 
 # Do an initial synchronous refresh so the first visitor sees real data
 Write-DashLog 'Performing initial data collection…' 'INFO'
