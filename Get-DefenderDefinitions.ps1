@@ -69,9 +69,12 @@
 param(
     [string]$OutputPath,
 
-    # Comma-separated list, or 'All'. Resolved later against the
-    # supported architectures.
-    [string]$Architecture = 'All',
+    # Architectures to download. Accepts:
+    #   -Architecture x64                            (single value)
+    #   -Architecture x64,arm64                      (array form — natural PS idiom)
+    #   -Architecture 'x64,arm64'                    (comma-separated, also accepted)
+    #   -Architecture All                            (default — downloads x64 + x86 + arm64)
+    [string[]]$Architecture = @('All'),
 
     [switch]$SkipSignatureCheck,
 
@@ -136,15 +139,20 @@ function Resolve-Architectures {
     # automatic variable (pipeline input enumerator) and silently shadows
     # explicit param bindings on non-advanced functions, so callers always
     # see $null inside and the "no input -> return All" branch fires.
-    param([string]$Spec)
-    if (-not $Spec -or $Spec -match '^(?i)all$') {
+    param([string[]]$Spec)
+    # Flatten: each element may itself be comma-separated (e.g. when the
+    # value came from config.conf as 'x64,arm64' rather than from a CLI
+    # array). Normalise to lowercase + trim + drop empties.
+    $flat = $Spec | ForEach-Object { $_ -split ',' } |
+                    ForEach-Object { $_.Trim().ToLower() } |
+                    Where-Object   { $_ }
+    if (-not $flat -or $flat.Count -eq 0 -or $flat -contains 'all') {
         return @($ArchitectureUrls.Keys)
     }
-    $requested = $Spec -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
-    $valid     = New-Object System.Collections.Generic.List[string]
-    foreach ($a in $requested) {
+    $valid = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $flat) {
         if ($ArchitectureUrls.Contains($a)) {
-            [void]$valid.Add($a)
+            if (-not $valid.Contains($a)) { [void]$valid.Add($a) }
         } else {
             throw "Unknown architecture '$a'. Supported: x64, x86, ARM64, All."
         }
