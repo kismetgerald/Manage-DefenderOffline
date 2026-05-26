@@ -1,5 +1,8 @@
-# Release packaging folder and its output (local build tooling, not part of the project)
-.dist/
+# Release packaging folder. The build script itself is tracked so it stays
+# in sync across maintainers; only its outputs (and any other local notes)
+# are ignored.
+.dist/*
+!.dist/release.ps1
 
 # Runtime directories (created automatically at first run; not part of the project)
 Config/
