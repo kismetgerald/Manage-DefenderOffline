@@ -344,7 +344,8 @@ You have four ways to proceed:
 ==============================================================================
 "@
         Write-Host $help -ForegroundColor Yellow
-        throw 'Cannot resolve target list.'
+        # exit (not throw): see comment in Update-DefenderOffline's matching block.
+        exit 1
     }
 }
 

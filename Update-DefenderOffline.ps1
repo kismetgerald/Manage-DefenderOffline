@@ -613,7 +613,11 @@ You have four ways to proceed:
 ==============================================================================
 "@
         Write-Host $help -ForegroundColor Yellow
-        throw 'Cannot proceed without a target list.'
+        # exit (not throw): the friendly help block above is the operator-facing
+        # message — letting throw bubble up would print the exception text on top
+        # of that, doubling the noise. Exit 1 preserves the non-zero status for
+        # scheduled-task wrappers without the duplicated error display.
+        exit 1
     }
 }
 

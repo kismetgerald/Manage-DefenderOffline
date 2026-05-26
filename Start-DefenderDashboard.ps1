@@ -919,7 +919,10 @@ function Resolve-TargetComputers {
         Write-DashLog '  - Save an AD credential once via:  .\Start-DefenderDashboard.ps1 -SaveADCredential' 'ERROR'
         Write-DashLog "  - Or provide a hosts.conf at:  $HostsFile" 'ERROR'
         Write-DashLog '  - Or grant the dashboard service identity AD read on the domain naming context.' 'ERROR'
-        throw "Cannot resolve target list: $adErr"
+        # exit (not throw): the WARN/ERROR lines above are the operator-facing
+        # diagnostic; throw would dump the exception text on top of that.
+        Write-DashLog "Cannot resolve target list: $adErr" 'ERROR'
+        exit 1
     }
 }
 
