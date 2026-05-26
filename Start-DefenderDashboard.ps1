@@ -2030,3 +2030,8 @@ try {
         if (Test-Path $statusFile) { Remove-Item $statusFile -Force -ErrorAction SilentlyContinue }
     } catch {}
 }
+
+# Explicit success exit (only reached on clean shutdown via Ctrl+C or
+# listener stop) so $LASTEXITCODE is reliably 0 for scheduled-task
+# wrappers and CI.
+exit 0

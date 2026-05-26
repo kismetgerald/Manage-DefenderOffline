@@ -1427,3 +1427,6 @@ $form.add_FormClosing({
     })
 
 [System.Windows.Forms.Application]::Run($form)
+
+# Explicit success exit so $LASTEXITCODE is reliably 0 after the form closes.
+exit 0

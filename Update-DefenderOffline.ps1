@@ -1507,3 +1507,9 @@ if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
         if ($smtp) { $smtp.Dispose() }
     }
 }
+
+# Explicit success exit so $LASTEXITCODE is reliably 0 for callers
+# (scheduled tasks, CI). PowerShell scripts that end naturally without
+# `exit` retain the previous $LASTEXITCODE, which leads to surprising
+# results when a clean run follows a failed one in the same shell.
+exit 0
