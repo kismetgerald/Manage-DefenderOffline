@@ -519,15 +519,111 @@ function Add-DashboardBasicUser {
     return $Path
 }
 
+# ===================================================================
+# ADIntegrated group-membership helpers
+#
+# Resolve-DashboardAllowedGroups: parses the comma-separated AuthAllowedGroups
+# string (entries prefixed '!' are denies; deny wins) and translates each
+# entry to a SecurityIdentifier so per-request membership checks avoid AD
+# round-trips. Entries that can't be resolved are returned in .Unresolved
+# so the caller can WARN and continue.
+#
+# Test-IdentityInAllowedGroups: pure SID-based membership decision. Deny
+# entries checked first; empty allow-list = any authenticated user.
+# ===================================================================
+
+function Resolve-DashboardAllowedGroups {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([AllowEmptyString()] [string]$AllowList)
+
+    $allow      = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
+    $deny       = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
+    $unresolved = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($AllowList) {
+        foreach ($entry in ($AllowList -split ',')) {
+            $e = $entry.Trim()
+            if (-not $e) { continue }
+            $isDeny = $e.StartsWith('!')
+            $name = if ($isDeny) { $e.Substring(1).Trim() } else { $e }
+            if (-not $name) { continue }
+            try {
+                $sid = ([System.Security.Principal.NTAccount]::new($name)).Translate(
+                    [System.Security.Principal.SecurityIdentifier])
+                if ($isDeny) { [void]$deny.Add($sid) } else { [void]$allow.Add($sid) }
+            } catch {
+                [void]$unresolved.Add($e)
+            }
+        }
+    }
+    return [pscustomobject]@{
+        AllowSids  = $allow.ToArray()
+        DenySids   = $deny.ToArray()
+        Unresolved = $unresolved.ToArray()
+    }
+}
+
+function Test-IdentityInAllowedGroups {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Principal.SecurityIdentifier]$UserSid,
+
+        # User's group SIDs (typically WindowsIdentity.Groups). Allowed empty
+        # because the user themselves may match an allow/deny entry directly.
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Security.Principal.SecurityIdentifier[]]$GroupSids,
+
+        # Output of Resolve-DashboardAllowedGroups: { AllowSids, DenySids, Unresolved }.
+        [Parameter(Mandatory)]
+        [pscustomobject]$AllowedGroups
+    )
+    # The user matches if their own SID matches OR any of their group SIDs match.
+    $userAndGroups = @($UserSid) + $GroupSids
+
+    foreach ($denySid in $AllowedGroups.DenySids) {
+        if ($userAndGroups -contains $denySid) {
+            return [pscustomobject]@{
+                Authorized = $false; Reason = 'group-denied'
+                MatchedSid = $denySid
+            }
+        }
+    }
+
+    if ($AllowedGroups.AllowSids.Count -eq 0) {
+        return [pscustomobject]@{
+            Authorized = $true; Reason = 'no-allow-list'
+            MatchedSid = $null
+        }
+    }
+
+    foreach ($allowSid in $AllowedGroups.AllowSids) {
+        if ($userAndGroups -contains $allowSid) {
+            return [pscustomobject]@{
+                Authorized = $true; Reason = 'group-allowed'
+                MatchedSid = $allowSid
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Authorized = $false; Reason = 'not-in-allow-list'
+        MatchedSid = $null
+    }
+}
+
 function Test-DashboardAuth {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
         # Untyped so Pester can pass a PSObject duck-type stub. At runtime
         # the production caller always passes a [System.Net.HttpListenerContext].
-        # We only access .Request.Url.LocalPath, .Request.Headers, and
-        # .Request.QueryString — all of which work on either a real context
-        # or a stub with the same shape.
+        # We access .Request.Url.LocalPath, .Request.Headers, .Request.QueryString,
+        # and (for ADIntegrated) .User.Identity — all of which work on either a
+        # real context or a stub with the same shape.
         [Parameter(Mandatory)]
         $Context,
 
@@ -537,7 +633,9 @@ function Test-DashboardAuth {
 
         # Mode-specific inputs. Each is only meaningful for its own Method.
         [string]$Token,
-        [string]$AllowedGroups,
+        # Resolved allow/deny SID object from Resolve-DashboardAllowedGroups.
+        # Optional so Basic/Token/None callers can omit it.
+        [pscustomobject]$AllowedGroupSids,
         [string]$UsersFile
     )
 
@@ -644,8 +742,46 @@ function Test-DashboardAuth {
         }
 
         'ADIntegrated' {
-            # PR-D2 implements full AD-integrated auth.
-            throw 'AuthMethod=ADIntegrated is not yet implemented (queued for PR-D2).'
+            # The HttpListener's AuthenticationSchemeSelectorDelegate handled
+            # the Negotiate handshake; by the time we see the context the user
+            # is either authenticated (context.User populated) or already 401'd
+            # by the listener (we never receive that context). The explicit
+            # null check below is defense-in-depth.
+            if (-not $Context.User -or -not $Context.User.Identity -or
+                -not $Context.User.Identity.IsAuthenticated) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'no-windows-identity'
+                }
+            }
+            $userName = $Context.User.Identity.Name
+            $userSid  = $Context.User.Identity.User
+            $groupSids = @()
+            if ($Context.User.Identity.Groups) {
+                $groupSids = @($Context.User.Identity.Groups)
+            }
+            if (-not $AllowedGroupSids) {
+                # Empty config = any authenticated user
+                $AllowedGroupSids = [pscustomobject]@{
+                    AllowSids  = @()
+                    DenySids   = @()
+                    Unresolved = @()
+                }
+            }
+            $decision = Test-IdentityInAllowedGroups `
+                -UserSid       $userSid `
+                -GroupSids     $groupSids `
+                -AllowedGroups $AllowedGroupSids
+            if ($decision.Authorized) {
+                return [pscustomobject]@{
+                    Authorized = $true; StatusCode = 200
+                    User = $userName; Reason = $decision.Reason
+                }
+            }
+            return [pscustomobject]@{
+                Authorized = $false; StatusCode = 403
+                User = $userName; Reason = $decision.Reason
+            }
         }
     }
 }
@@ -1408,6 +1544,13 @@ Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } els
 # Runs before HTTPS cert resolution so an auth-config problem surfaces
 # in its own right instead of being masked by an unrelated cert error.
 # ===================================================================
+# Default to an empty allow/deny set so Basic/Token/None code paths can
+# still pass $script:AdGroupResolution into Test-DashboardAuth.
+$script:AdGroupResolution = [pscustomobject]@{
+    AllowSids  = @()
+    DenySids   = @()
+    Unresolved = @()
+}
 switch ($AuthMethod) {
     'Basic' {
         if (-not $UseHttps) {
@@ -1462,10 +1605,28 @@ switch ($AuthMethod) {
         }
     }
     'ADIntegrated' {
-        # PR-D2: full implementation lands then. For now, fail at startup so
-        # operators don't think it's silently working.
-        Write-DashLog "AuthMethod=ADIntegrated is not yet implemented (queued for PR-D2). Use AuthMethod=Token or None for now." 'ERROR'
-        exit 1
+        # Informational: NTLM still works for local-machine accounts on
+        # workgroup hosts, so this is a warn-don't-block check.
+        try {
+            $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+            if (-not $cs.PartOfDomain) {
+                Write-DashLog "AuthMethod=ADIntegrated on a non-domain-joined host. Only local-machine accounts can authenticate (e.g. AuthAllowedGroups = 'BUILTIN\Administrators')." 'WARN'
+            }
+        } catch {
+            Write-DashLog "Could not determine domain membership ($($_.Exception.Message)). ADIntegrated may not work as expected." 'WARN'
+        }
+        # Resolve allow-list to SIDs once at startup. Per-request membership
+        # checks then avoid any AD round-trip.
+        $script:AdGroupResolution = Resolve-DashboardAllowedGroups -AllowList $AuthAllowedGroups
+        foreach ($u in $script:AdGroupResolution.Unresolved) {
+            Write-DashLog "AuthAllowedGroups: entry '$u' could not be resolved to an SID and will be ignored." 'WARN'
+        }
+        if ($script:AdGroupResolution.AllowSids.Count -eq 0 -and
+            $script:AdGroupResolution.DenySids.Count  -eq 0) {
+            Write-DashLog "ADIntegrated auth: no allow/deny groups configured. Any authenticated user will be permitted." 'INFO'
+        } else {
+            Write-DashLog "ADIntegrated auth: $($script:AdGroupResolution.AllowSids.Count) allow group(s), $($script:AdGroupResolution.DenySids.Count) deny group(s) loaded." 'INFO'
+        }
     }
     'None' {
         Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
@@ -1548,6 +1709,37 @@ if ($UseHttps) {
 $scheme   = if ($UseHttps) { 'https' } else { 'http' }
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add("${scheme}://+:$Port/")
+
+# For ADIntegrated, let HttpListener handle the multi-roundtrip Negotiate
+# protocol (we can't reproduce NTLM/Kerberos ourselves). The selector
+# delegate is consulted per request so /health stays anonymous.
+#
+# We use an Add-Type C# static method (not a PowerShell scriptblock) as
+# the delegate target because HttpListener invokes the selector from a
+# thread-pool thread that has no PowerShell Runspace — a scriptblock
+# bound there throws "no Runspace available", which HttpListener surfaces
+# to the caller as HTTP 500 before any of our user-space code runs.
+if ($AuthMethod -eq 'ADIntegrated') {
+    if (-not ('DashboardAuthSelector' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net;
+public static class DashboardAuthSelector {
+    public static AuthenticationSchemes Decide(HttpListenerRequest req) {
+        if (req != null && req.Url != null && req.Url.LocalPath == "/health") {
+            return AuthenticationSchemes.Anonymous;
+        }
+        return AuthenticationSchemes.Negotiate;
+    }
+}
+'@
+    }
+    $listener.AuthenticationSchemeSelectorDelegate = [System.Delegate]::CreateDelegate(
+        [System.Net.AuthenticationSchemeSelector],
+        [DashboardAuthSelector],
+        'Decide')
+    Write-DashLog 'HttpListener configured for Negotiate authentication (anonymous for /health).' 'INFO'
+}
+
 try {
     $listener.Start()
 } catch {
@@ -1712,11 +1904,24 @@ try {
 
         # ----- Authorization check (before any work) -----
         $authResult = Test-DashboardAuth `
-            -Context        $context `
-            -Method         $AuthMethod `
-            -Token          $AuthToken `
-            -AllowedGroups  $AuthAllowedGroups `
-            -UsersFile      $AuthBasicUsersFile
+            -Context           $context `
+            -Method            $AuthMethod `
+            -Token             $AuthToken `
+            -AllowedGroupSids  $script:AdGroupResolution `
+            -UsersFile         $AuthBasicUsersFile
+
+        # Audit fields. Source IP is captured per-request from the HttpListener
+        # context; user identity comes from Test-DashboardAuth (already populated
+        # for all modes — username for Basic, 'token-bearer' for Token, the
+        # WindowsIdentity Name for ADIntegrated, 'anonymous' for None).
+        $auditUser = if ($authResult.User) { $authResult.User } else { 'anonymous' }
+        $auditFrom = 'unknown'
+        try {
+            if ($context.Request.RemoteEndPoint) {
+                $auditFrom = $context.Request.RemoteEndPoint.Address.ToString()
+            }
+        } catch {}
+
         if (-not $authResult.Authorized) {
             $context.Response.StatusCode = $authResult.StatusCode
             if ($authResult.StatusCode -eq 401 -and $AuthMethod -eq 'Basic') {
@@ -1724,8 +1929,17 @@ try {
             }
             try { $context.Response.OutputStream.Close() } catch {}
             try { $context.Response.Close() } catch {}
-            Write-DashLog "Denied $path ($($authResult.Reason); HTTP $($authResult.StatusCode))" 'INFO'
+            # WARN so audit reviewers / SIEM filters can isolate denials at level.
+            Write-DashLog "Denied $path by '$auditUser' from $auditFrom ($($authResult.Reason); HTTP $($authResult.StatusCode))" 'WARN'
             continue
+        }
+
+        # Successful auth for human-facing paths: log who accessed what, from
+        # where (NIST 800-53 AU-2 / STIG AC-7 auditable events). /health and
+        # /status are excluded because they're polled by monitors and dashboard
+        # auto-refresh, which would flood the log without adding audit value.
+        if ($path -notin '/health', '/status' -and $authResult.Reason -ne 'health-bypass') {
+            Write-DashLog "Authorized $path by '$auditUser' from $auditFrom ($($authResult.Reason))" 'INFO'
         }
 
         switch ($path) {
