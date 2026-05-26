@@ -1713,14 +1713,30 @@ $listener.Prefixes.Add("${scheme}://+:$Port/")
 # For ADIntegrated, let HttpListener handle the multi-roundtrip Negotiate
 # protocol (we can't reproduce NTLM/Kerberos ourselves). The selector
 # delegate is consulted per request so /health stays anonymous.
+#
+# We use an Add-Type C# static method (not a PowerShell scriptblock) as
+# the delegate target because HttpListener invokes the selector from a
+# thread-pool thread that has no PowerShell Runspace — a scriptblock
+# bound there throws "no Runspace available", which HttpListener surfaces
+# to the caller as HTTP 500 before any of our user-space code runs.
 if ($AuthMethod -eq 'ADIntegrated') {
-    $listener.AuthenticationSchemeSelectorDelegate = [System.Net.AuthenticationSchemeSelector]{
-        param([System.Net.HttpListenerRequest]$req)
-        if ($req.Url.LocalPath -eq '/health') {
-            return [System.Net.AuthenticationSchemes]::Anonymous
+    if (-not ('DashboardAuthSelector' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net;
+public static class DashboardAuthSelector {
+    public static AuthenticationSchemes Decide(HttpListenerRequest req) {
+        if (req != null && req.Url != null && req.Url.LocalPath == "/health") {
+            return AuthenticationSchemes.Anonymous;
         }
-        return [System.Net.AuthenticationSchemes]::Negotiate
+        return AuthenticationSchemes.Negotiate;
     }
+}
+'@
+    }
+    $listener.AuthenticationSchemeSelectorDelegate = [System.Delegate]::CreateDelegate(
+        [System.Net.AuthenticationSchemeSelector],
+        [DashboardAuthSelector],
+        'Decide')
     Write-DashLog 'HttpListener configured for Negotiate authentication (anonymous for /health).' 'INFO'
 }
 
