@@ -113,9 +113,12 @@ if (-not $OutputPath) { $OutputPath = Join-Path $ScriptDir 'definitions' }
 
 # Resolve the OutputPath against the script directory if a relative path
 # is supplied — same convention as the dashboard's AuthBasicUsersFile.
+# GetFullPath canonicalises '.\foo' style segments so the operator-facing
+# log lines don't show ugly mid-path '.\' fragments.
 if (-not [System.IO.Path]::IsPathRooted($OutputPath)) {
     $OutputPath = Join-Path $ScriptDir $OutputPath
 }
+$OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 
 # ===================================================================
 # Architecture resolution
