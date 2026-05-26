@@ -99,6 +99,10 @@ param(
     [pscredential]$ADCredential,
     [switch]$SaveADCredential,
 
+    # Restrict AD auto-discovery to one or more OU subtrees. Distinguished-name
+    # format; multiple DNs separated by semicolons. Empty = whole-domain search.
+    [string]$ADSearchBase,
+
     [ValidateSet('AD','Pattern','Single')]
     [string]$ClassificationMethod,
     [string]$WorkstationPattern,
@@ -112,6 +116,10 @@ param(
 $ScriptVersion = '0.0.7'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# Shared discovery helper used by all three discovery-aware scripts.
+$LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
+if (Test-Path $LibGetDefenderComputers) { . $LibGetDefenderComputers }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
 # runspaces (see Invoke-FleetRefresh) so the wrapper is available there too.
@@ -203,6 +211,7 @@ function Read-ConfigFile {
 
 $cfg = Read-ConfigFile $ConfigPath
 if (-not $PSBoundParameters.ContainsKey('SourceSharePath')         -and $cfg['SourceSharePath'])         { $SourceSharePath         = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ADSearchBase')            -and $cfg['ADSearchBase'])            { $ADSearchBase            = $cfg['ADSearchBase'] }
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads')         -and $cfg['ParallelThreads'])         { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')          -and $cfg['TimeoutSeconds'])          { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['ClassificationMethod'])    { $ClassificationMethod    = $cfg['ClassificationMethod'] }
@@ -252,42 +261,34 @@ function Resolve-TargetComputers {
             ForEach-Object { $_.Trim().ToUpper() }
     }
     Write-Warning 'hosts.conf not found – attempting Active Directory auto-discovery...'
-    $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
-    if (-not $hasAdModule) {
-        Write-Host 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' -ForegroundColor DarkCyan
-    }
     if ($ADCredential) {
         Write-Host "Using saved AD credential for LDAP bind: $($ADCredential.UserName)" -ForegroundColor DarkCyan
     }
+    if ($ADSearchBase) {
+        Write-Host "Restricting AD discovery to: $ADSearchBase" -ForegroundColor DarkCyan
+    }
     try {
-        if ($hasAdModule) {
-            Import-Module ActiveDirectory -ErrorAction Stop
-            $adParams = @{
-                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
-                Properties = 'Name'
-            }
-            if ($ADCredential) { $adParams.Credential = $ADCredential }
-            return Get-ADComputer @adParams | Sort-Object Name | Select-Object -ExpandProperty Name
-        } else {
-            # ADSI fallback.  When -ADCredential is supplied, bind via
-            # DirectoryEntry with explicit credentials.
-            $domain = (Get-CimInstance Win32_ComputerSystem).Domain
-            $filter = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            if ($ADCredential) {
-                $de = [System.DirectoryServices.DirectoryEntry]::new(
-                    "LDAP://$domain",
-                    $ADCredential.UserName,
-                    $ADCredential.GetNetworkCredential().Password)
-                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
-                $searcher.Filter = $filter
-            } else {
-                $searcher = [adsisearcher]$filter
-                $searcher.SearchRoot = "LDAP://$domain"
-            }
-            $result = $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
-            if ($ADCredential) { $de.Dispose() }
-            return $result
+        $discovery = Get-DefenderComputers -SearchBase $ADSearchBase -ADCredential $ADCredential
+        if (-not $discovery.UsedAdModule) {
+            Write-Host 'ActiveDirectory PowerShell module is not installed; used ADSI fallback.' -ForegroundColor DarkCyan
         }
+        if ($discovery.WasFiltered) {
+            foreach ($s in $discovery.SearchBases) {
+                if ($s.Resolved) {
+                    Write-Host "  AD search base '$($s.DN)' -> $($s.Count) computer(s)" -ForegroundColor DarkGreen
+                } else {
+                    Write-Warning "  AD search base '$($s.DN)' could not be resolved: $($s.Error)"
+                }
+            }
+            $resolved = @($discovery.SearchBases | Where-Object Resolved).Count
+            if ($resolved -eq 0) {
+                throw "All $($discovery.SearchBases.Count) AD search base(s) failed to resolve."
+            }
+        }
+        if (-not $discovery.Computers -or $discovery.Computers.Count -eq 0) {
+            throw 'AD discovery returned no computers.'
+        }
+        return $discovery.Computers
     } catch {
         $adErr = $_.Exception.Message
         $help = @"

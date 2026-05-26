@@ -193,6 +193,12 @@ param(
     [pscredential]$ADCredential,
     [switch]$SaveADCredential,
 
+    # Restrict AD auto-discovery to one or more OU subtrees. Distinguished-name
+    # format; multiple DNs separated by semicolons (commas are valid inside DNs).
+    # Empty = whole-domain search (default).
+    #   Example: 'OU=Workstations,OU=Endpoints,DC=contoso,DC=com;OU=ServersUS,DC=contoso,DC=com'
+    [string]$ADSearchBase,
+
     # Endpoint classification
     [ValidateSet('AD','Pattern','Single')]
     [string]$ClassificationMethod,
@@ -219,6 +225,8 @@ $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
 # is available there too.
 $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
+$LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
+. $LibGetDefenderComputers
 $RunAsUser       = "$env:USERDOMAIN\$env:USERNAME"
 $RunFromHost     = $env:COMPUTERNAME
 $RunFromIP       = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -362,6 +370,7 @@ $cfg = Read-ConfigFile $ConfigPath
 # Apply config values for parameters not explicitly passed on the command line.
 # Command-line parameters always win; config fills in what was omitted.
 if (-not $PSBoundParameters.ContainsKey('SourceSharePath')    -and $cfg['SourceSharePath'])    { $SourceSharePath    = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ADSearchBase')       -and $cfg['ADSearchBase'])       { $ADSearchBase       = $cfg['ADSearchBase'] }
 if (-not $PSBoundParameters.ContainsKey('LogPath')            -and $cfg['LogPath'])            { $LogPath            = $cfg['LogPath'] }
 if (-not $PSBoundParameters.ContainsKey('ReportPath')         -and $cfg['ReportPath'])         { $ReportPath         = $cfg['ReportPath'] }
 if (-not $PSBoundParameters.ContainsKey('TempFolderOnTarget') -and $cfg['TempFolderOnTarget']) { $TempFolderOnTarget = $cfg['TempFolderOnTarget'] }
@@ -491,38 +500,34 @@ function Resolve-TargetComputers {
     if ($ADCredential) {
         Write-Log "Using -ADCredential for LDAP bind: $($ADCredential.UserName)" 'INFO'
     }
+    if ($ADSearchBase) {
+        Write-Log "Restricting AD discovery to: $ADSearchBase" 'INFO'
+    }
     try {
-        if ($hasAdModule) {
-            Import-Module ActiveDirectory -ErrorAction Stop
-            $adParams = @{
-                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
-                Properties = 'Name'
+        $discovery = Get-DefenderComputers -SearchBase $ADSearchBase -ADCredential $ADCredential
+
+        # Log per-DN status (hybrid validation reporting)
+        if ($discovery.WasFiltered) {
+            foreach ($s in $discovery.SearchBases) {
+                if ($s.Resolved) {
+                    Write-Log "  AD search base '$($s.DN)' -> $($s.Count) computer(s)" 'INFO'
+                } else {
+                    Write-Log "  AD search base '$($s.DN)' could not be resolved: $($s.Error)" 'WARN'
+                }
             }
-            if ($ADCredential) { $adParams.Credential = $ADCredential }
-            $computers = Get-ADComputer @adParams |
-                Sort-Object Name |
-                Select-Object -ExpandProperty Name
-        } else {
-            # ADSI fallback.  When -ADCredential is supplied we bind via
-            # DirectoryEntry with explicit credentials; otherwise we use
-            # [adsisearcher] which binds as the current process identity.
-            $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
-            $filter   = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            if ($ADCredential) {
-                $de = [System.DirectoryServices.DirectoryEntry]::new(
-                    "LDAP://$domain",
-                    $ADCredential.UserName,
-                    $ADCredential.GetNetworkCredential().Password)
-                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
-                $searcher.Filter = $filter
-            } else {
-                $searcher = [adsisearcher]$filter
-                $searcher.SearchRoot = "LDAP://$domain"
+            $resolved = @($discovery.SearchBases | Where-Object Resolved).Count
+            $total    = $discovery.SearchBases.Count
+            if ($resolved -eq 0) {
+                throw "All $total AD search base(s) failed to resolve. Check ADSearchBase syntax / AD reachability."
             }
-            $computers = $searcher.FindAll() |
-                ForEach-Object { $_.Properties.name[0] } |
-                Sort-Object
-            if ($ADCredential) { $de.Dispose() }
+            if ($resolved -lt $total) {
+                Write-Log "Partial AD search-base resolution: $resolved of $total succeeded. Continuing with the resolved subset." 'WARN'
+            }
+        }
+
+        $computers = $discovery.Computers
+        if (-not $computers -or $computers.Count -eq 0) {
+            throw 'AD discovery returned no computers.'
         }
 
         $header = @"

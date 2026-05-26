@@ -93,6 +93,10 @@ param(
     [pscredential]$ADCredential,
     [switch]$SaveADCredential,
 
+    # Restrict AD auto-discovery to one or more OU subtrees. Distinguished-name
+    # format; multiple DNs separated by semicolons. Empty = whole-domain search.
+    [string]$ADSearchBase,
+
     [bool]$DisableIPv6 = $true,
 
     # Default theme applied to /defender when the visiting browser has no
@@ -148,6 +152,8 @@ $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path
 # runspaces (see Invoke-FleetRefresh) so the wrapper is available there too.
 $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
+$LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
+. $LibGetDefenderComputers
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
 # ===================================================================
@@ -253,6 +259,7 @@ if (-not $PSBoundParameters.ContainsKey('AuthMethod')            -and $cfg['Auth
 }
 if (-not $PSBoundParameters.ContainsKey('AuthAllowedGroups')     -and $cfg['AuthAllowedGroups'])     { $AuthAllowedGroups     = $cfg['AuthAllowedGroups'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('AuthBasicUsersFile')    -and $cfg['AuthBasicUsersFile'])    { $AuthBasicUsersFile    = $cfg['AuthBasicUsersFile'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('ADSearchBase')          -and $cfg['ADSearchBase'])          { $ADSearchBase          = $cfg['ADSearchBase'] }
 if (-not $PSBoundParameters.ContainsKey('AuthToken')             -and $cfg['AuthToken'])             { $AuthToken             = $cfg['AuthToken'].Trim() }
 
 # Relative paths in config.conf must resolve against the script directory,
@@ -864,40 +871,38 @@ function Resolve-TargetComputers {
             ForEach-Object { $_.Trim().ToUpper() }
     }
     Write-DashLog 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
-    $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
-    if (-not $hasAdModule) {
-        Write-DashLog 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' 'INFO'
-    }
     if ($ADCredential) {
         Write-DashLog "Using saved AD credential for LDAP bind: $($ADCredential.UserName)" 'INFO'
     }
+    if ($ADSearchBase) {
+        Write-DashLog "Restricting AD discovery to: $ADSearchBase" 'INFO'
+    }
     try {
-        if ($hasAdModule) {
-            $adParams = @{
-                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
-                Properties = 'Name'
-            }
-            if ($ADCredential) { $adParams.Credential = $ADCredential }
-            return Get-ADComputer @adParams | Sort-Object Name | Select-Object -ExpandProperty Name
-        } else {
-            # ADSI fallback.  Use DirectoryEntry with explicit creds when ADCredential is set.
-            $domain = (Get-CimInstance Win32_ComputerSystem).Domain
-            $filter = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            if ($ADCredential) {
-                $de = [System.DirectoryServices.DirectoryEntry]::new(
-                    "LDAP://$domain",
-                    $ADCredential.UserName,
-                    $ADCredential.GetNetworkCredential().Password)
-                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
-                $searcher.Filter = $filter
-            } else {
-                $searcher = [adsisearcher]$filter
-                $searcher.SearchRoot = "LDAP://$domain"
-            }
-            $result = $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
-            if ($ADCredential) { $de.Dispose() }
-            return $result
+        $discovery = Get-DefenderComputers -SearchBase $ADSearchBase -ADCredential $ADCredential
+        if (-not $discovery.UsedAdModule) {
+            Write-DashLog 'ActiveDirectory PowerShell module is not installed; used ADSI fallback.' 'INFO'
         }
+        if ($discovery.WasFiltered) {
+            foreach ($s in $discovery.SearchBases) {
+                if ($s.Resolved) {
+                    Write-DashLog "  AD search base '$($s.DN)' -> $($s.Count) computer(s)" 'INFO'
+                } else {
+                    Write-DashLog "  AD search base '$($s.DN)' could not be resolved: $($s.Error)" 'WARN'
+                }
+            }
+            $resolved = @($discovery.SearchBases | Where-Object Resolved).Count
+            $total    = $discovery.SearchBases.Count
+            if ($resolved -eq 0) {
+                throw "All $total AD search base(s) failed to resolve. Check ADSearchBase syntax / AD reachability."
+            }
+            if ($resolved -lt $total) {
+                Write-DashLog "Partial AD search-base resolution: $resolved of $total succeeded. Continuing with the resolved subset." 'WARN'
+            }
+        }
+        if (-not $discovery.Computers -or $discovery.Computers.Count -eq 0) {
+            throw 'AD discovery returned no computers.'
+        }
+        return $discovery.Computers
     } catch {
         $adErr = $_.Exception.Message
         Write-DashLog "AD auto-discovery failed: $adErr" 'ERROR'
