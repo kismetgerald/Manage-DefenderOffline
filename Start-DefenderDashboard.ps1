@@ -1909,6 +1909,19 @@ try {
             -Token             $AuthToken `
             -AllowedGroupSids  $script:AdGroupResolution `
             -UsersFile         $AuthBasicUsersFile
+
+        # Audit fields. Source IP is captured per-request from the HttpListener
+        # context; user identity comes from Test-DashboardAuth (already populated
+        # for all modes — username for Basic, 'token-bearer' for Token, the
+        # WindowsIdentity Name for ADIntegrated, 'anonymous' for None).
+        $auditUser = if ($authResult.User) { $authResult.User } else { 'anonymous' }
+        $auditFrom = 'unknown'
+        try {
+            if ($context.Request.RemoteEndPoint) {
+                $auditFrom = $context.Request.RemoteEndPoint.Address.ToString()
+            }
+        } catch {}
+
         if (-not $authResult.Authorized) {
             $context.Response.StatusCode = $authResult.StatusCode
             if ($authResult.StatusCode -eq 401 -and $AuthMethod -eq 'Basic') {
@@ -1916,8 +1929,17 @@ try {
             }
             try { $context.Response.OutputStream.Close() } catch {}
             try { $context.Response.Close() } catch {}
-            Write-DashLog "Denied $path ($($authResult.Reason); HTTP $($authResult.StatusCode))" 'INFO'
+            # WARN so audit reviewers / SIEM filters can isolate denials at level.
+            Write-DashLog "Denied $path by '$auditUser' from $auditFrom ($($authResult.Reason); HTTP $($authResult.StatusCode))" 'WARN'
             continue
+        }
+
+        # Successful auth for human-facing paths: log who accessed what, from
+        # where (NIST 800-53 AU-2 / STIG AC-7 auditable events). /health and
+        # /status are excluded because they're polled by monitors and dashboard
+        # auto-refresh, which would flood the log without adding audit value.
+        if ($path -notin '/health', '/status' -and $authResult.Reason -ne 'health-bypass') {
+            Write-DashLog "Authorized $path by '$auditUser' from $auditFrom ($($authResult.Reason))" 'INFO'
         }
 
         switch ($path) {
