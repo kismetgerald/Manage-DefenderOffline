@@ -193,6 +193,12 @@ param(
     [pscredential]$ADCredential,
     [switch]$SaveADCredential,
 
+    # Restrict AD auto-discovery to one or more OU subtrees. Distinguished-name
+    # format; multiple DNs separated by semicolons (commas are valid inside DNs).
+    # Empty = whole-domain search (default).
+    #   Example: 'OU=Workstations,OU=Endpoints,DC=contoso,DC=com;OU=ServersUS,DC=contoso,DC=com'
+    [string]$ADSearchBase,
+
     # Endpoint classification
     [ValidateSet('AD','Pattern','Single')]
     [string]$ClassificationMethod,
@@ -219,6 +225,8 @@ $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
 # is available there too.
 $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
+$LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
+. $LibGetDefenderComputers
 $RunAsUser       = "$env:USERDOMAIN\$env:USERNAME"
 $RunFromHost     = $env:COMPUTERNAME
 $RunFromIP       = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -362,6 +370,7 @@ $cfg = Read-ConfigFile $ConfigPath
 # Apply config values for parameters not explicitly passed on the command line.
 # Command-line parameters always win; config fills in what was omitted.
 if (-not $PSBoundParameters.ContainsKey('SourceSharePath')    -and $cfg['SourceSharePath'])    { $SourceSharePath    = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ADSearchBase')       -and $cfg['ADSearchBase'])       { $ADSearchBase       = $cfg['ADSearchBase'] }
 if (-not $PSBoundParameters.ContainsKey('LogPath')            -and $cfg['LogPath'])            { $LogPath            = $cfg['LogPath'] }
 if (-not $PSBoundParameters.ContainsKey('ReportPath')         -and $cfg['ReportPath'])         { $ReportPath         = $cfg['ReportPath'] }
 if (-not $PSBoundParameters.ContainsKey('TempFolderOnTarget') -and $cfg['TempFolderOnTarget']) { $TempFolderOnTarget = $cfg['TempFolderOnTarget'] }
@@ -473,17 +482,28 @@ function Resolve-TargetComputers {
         return $list
     }
 
-    # 2. hosts.conf in script directory
-    if (Test-Path $HostsFile) {
+    # 2. hosts.conf in script directory.
+    #    Skipped when -ADSearchBase is set: the operator is explicitly asking
+    #    for a scoped AD query, so a cached snapshot from a previous (possibly
+    #    differently-scoped) run is semantically wrong. Otherwise hosts.conf
+    #    is the preferred path because it's both faster and lets operators
+    #    manually curate the list (exclude lab boxes, add workgroup hosts).
+    $hostsExists = Test-Path $HostsFile
+    if (-not $ADSearchBase -and $hostsExists) {
         $list = Get-Content $HostsFile |
             Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\S' } |
             ForEach-Object { $_.Trim().ToUpper() }
         Write-Log "Loaded $($list.Count) computers from hosts.conf" 'SUCCESS'
         return $list
     }
+    if ($ADSearchBase -and $hostsExists) {
+        Write-Log "Ignoring hosts.conf because ADSearchBase is set; querying AD with that scope." 'INFO'
+    }
 
     # 3. Active Directory auto-discovery
-    Write-Log 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
+    if (-not $hostsExists) {
+        Write-Log 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
+    }
     $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
     if (-not $hasAdModule) {
         Write-Log 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' 'INFO'
@@ -491,41 +511,43 @@ function Resolve-TargetComputers {
     if ($ADCredential) {
         Write-Log "Using -ADCredential for LDAP bind: $($ADCredential.UserName)" 'INFO'
     }
+    if ($ADSearchBase) {
+        Write-Log "Restricting AD discovery to: $ADSearchBase" 'INFO'
+    }
     try {
-        if ($hasAdModule) {
-            Import-Module ActiveDirectory -ErrorAction Stop
-            $adParams = @{
-                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
-                Properties = 'Name'
+        $discovery = Get-DefenderComputers -SearchBase $ADSearchBase -ADCredential $ADCredential
+
+        # Log per-DN status (hybrid validation reporting)
+        if ($discovery.WasFiltered) {
+            foreach ($s in $discovery.SearchBases) {
+                if ($s.Resolved) {
+                    Write-Log "  AD search base '$($s.DN)' -> $($s.Count) computer(s)" 'INFO'
+                } else {
+                    Write-Log "  AD search base '$($s.DN)' could not be resolved: $($s.Error)" 'WARN'
+                }
             }
-            if ($ADCredential) { $adParams.Credential = $ADCredential }
-            $computers = Get-ADComputer @adParams |
-                Sort-Object Name |
-                Select-Object -ExpandProperty Name
-        } else {
-            # ADSI fallback.  When -ADCredential is supplied we bind via
-            # DirectoryEntry with explicit credentials; otherwise we use
-            # [adsisearcher] which binds as the current process identity.
-            $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
-            $filter   = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            if ($ADCredential) {
-                $de = [System.DirectoryServices.DirectoryEntry]::new(
-                    "LDAP://$domain",
-                    $ADCredential.UserName,
-                    $ADCredential.GetNetworkCredential().Password)
-                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
-                $searcher.Filter = $filter
-            } else {
-                $searcher = [adsisearcher]$filter
-                $searcher.SearchRoot = "LDAP://$domain"
+            $resolved = @($discovery.SearchBases | Where-Object Resolved).Count
+            $total    = $discovery.SearchBases.Count
+            if ($resolved -eq 0) {
+                throw "All $total AD search base(s) failed to resolve. Check ADSearchBase syntax / AD reachability."
             }
-            $computers = $searcher.FindAll() |
-                ForEach-Object { $_.Properties.name[0] } |
-                Sort-Object
-            if ($ADCredential) { $de.Dispose() }
+            if ($resolved -lt $total) {
+                Write-Log "Partial AD search-base resolution: $resolved of $total succeeded. Continuing with the resolved subset." 'WARN'
+            }
         }
 
-        $header = @"
+        $computers = $discovery.Computers
+        if (-not $computers -or $computers.Count -eq 0) {
+            throw 'AD discovery returned no computers.'
+        }
+
+        # Auto-write hosts.conf only when this run was an UNFILTERED
+        # whole-domain discovery. Caching a scoped (ADSearchBase) result would
+        # silently override a later whole-domain run, and operators changing
+        # ADSearchBase between runs would see stale results until they
+        # remembered to delete the cache.
+        if (-not $ADSearchBase) {
+            $header = @"
 # =============================================================================
 # hosts.conf – AUTO-GENERATED by Update-DefenderOffline.ps1 v$ScriptVersion
 # Generated  : $(Get-Date)
@@ -536,9 +558,12 @@ function Resolve-TargetComputers {
 # =============================================================================
 
 "@
-        ($header + ($computers -join "`r`n")) |
-            Out-File -FilePath $HostsFile -Encoding UTF8 -Force
-        Write-Log "Auto-generated hosts.conf with $($computers.Count) computers" 'SUCCESS'
+            ($header + ($computers -join "`r`n")) |
+                Out-File -FilePath $HostsFile -Encoding UTF8 -Force
+            Write-Log "Auto-generated hosts.conf with $($computers.Count) computers" 'SUCCESS'
+        } else {
+            Write-Log "hosts.conf was NOT auto-written because ADSearchBase is set (would cache a scoped result)." 'INFO'
+        }
         return $computers
 
     } catch {
@@ -588,7 +613,11 @@ You have four ways to proceed:
 ==============================================================================
 "@
         Write-Host $help -ForegroundColor Yellow
-        throw 'Cannot proceed without a target list.'
+        # exit (not throw): the friendly help block above is the operator-facing
+        # message — letting throw bubble up would print the exception text on top
+        # of that, doubling the noise. Exit 1 preserves the non-zero status for
+        # scheduled-task wrappers without the duplicated error display.
+        exit 1
     }
 }
 
@@ -1478,3 +1507,9 @@ if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
         if ($smtp) { $smtp.Dispose() }
     }
 }
+
+# Explicit success exit so $LASTEXITCODE is reliably 0 for callers
+# (scheduled tasks, CI). PowerShell scripts that end naturally without
+# `exit` retain the previous $LASTEXITCODE, which leads to surprising
+# results when a clean run follows a failed one in the same shell.
+exit 0
