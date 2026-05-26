@@ -564,6 +564,19 @@ if ($UseHttps) {
     }
 }
 
+# Always persist the effective Port to config.conf. Without this, a re-run of
+# the installer that omits -Port would read the *release default* (8080) from
+# the un-persisted config, silently rebind the cert to that port, and stomp
+# the previous install's port. Surfaced during PR-D2b live-fire when a
+# follow-up install meant only to flip AuthMethod ended up moving the
+# HTTPS listener from 8444 back to 8080.
+try {
+    if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+    Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'Port' -Value $Port | Out-Null
+} catch {
+    Write-Warn "Could not persist Port=$Port to config.conf: $($_.Exception.Message). The task action still uses -Port $Port, but a later installer re-run without -Port may revert to the config's previous value."
+}
+
 # ===================================================================
 # STEP 2.6 – Authentication pass-through
 # Persists any -Auth* parameter that was supplied on the CLI to the
