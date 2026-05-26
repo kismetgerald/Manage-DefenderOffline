@@ -132,11 +132,15 @@ $ArchitectureUrls = [ordered]@{
 }
 
 function Resolve-Architectures {
-    param([string]$Input)
-    if (-not $Input -or $Input -match '^(?i)all$') {
+    # NOTE: parameter MUST NOT be named $Input. $Input is a PowerShell
+    # automatic variable (pipeline input enumerator) and silently shadows
+    # explicit param bindings on non-advanced functions, so callers always
+    # see $null inside and the "no input -> return All" branch fires.
+    param([string]$Spec)
+    if (-not $Spec -or $Spec -match '^(?i)all$') {
         return @($ArchitectureUrls.Keys)
     }
-    $requested = $Input -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
+    $requested = $Spec -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
     $valid     = New-Object System.Collections.Generic.List[string]
     foreach ($a in $requested) {
         if ($ArchitectureUrls.Contains($a)) {
@@ -148,7 +152,7 @@ function Resolve-Architectures {
     return $valid.ToArray()
 }
 
-$Architectures = Resolve-Architectures -Input $Architecture
+$Architectures = Resolve-Architectures -Spec $Architecture
 if ($Architectures.Count -eq 0) {
     Write-Host 'ERROR: No architectures to download.' -ForegroundColor Red
     exit 1
