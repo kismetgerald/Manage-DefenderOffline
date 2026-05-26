@@ -255,12 +255,21 @@ function Resolve-TargetComputers {
     if ($ComputerName) {
         return $ComputerName | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim().ToUpper() }
     }
-    if (Test-Path $HostsFile) {
+    # hosts.conf is skipped when -ADSearchBase is set so a cached snapshot
+    # from a previous (possibly differently-scoped) run does not override the
+    # operator's explicit AD scope.
+    $hostsExists = Test-Path $HostsFile
+    if (-not $ADSearchBase -and $hostsExists) {
         return Get-Content $HostsFile |
             Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\S' } |
             ForEach-Object { $_.Trim().ToUpper() }
     }
-    Write-Warning 'hosts.conf not found – attempting Active Directory auto-discovery...'
+    if ($ADSearchBase -and $hostsExists) {
+        Write-Host 'Ignoring hosts.conf because ADSearchBase is set; querying AD with that scope.' -ForegroundColor DarkCyan
+    }
+    if (-not $hostsExists) {
+        Write-Warning 'hosts.conf not found – attempting Active Directory auto-discovery...'
+    }
     if ($ADCredential) {
         Write-Host "Using saved AD credential for LDAP bind: $($ADCredential.UserName)" -ForegroundColor DarkCyan
     }
