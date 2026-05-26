@@ -1308,18 +1308,13 @@ $latest              = $AvailableFiles | Sort-Object Version -Descending | Selec
 $SourceFile          = $latest.File
 $AvailableVersionStr = $latest.Version.ToString()
 
-if ($AvailableByArch.Keys.Count -gt 1 -or ($AvailableByArch.Values | Where-Object { -not $_.IsFlatLayout }).Count -gt 0) {
-    Write-Log 'Available definition versions (per architecture):' 'SUCCESS'
-    foreach ($arch in 'x64','x86','arm64') {
-        if ($AvailableByArch.ContainsKey($arch)) {
-            $entry = $AvailableByArch[$arch]
-            $note  = if ($entry.IsFlatLayout) { ' (flat layout — classified as x64)' } else { '' }
-            Write-Log ("  {0,-5} = v{1,-12}  -> {2}{3}" -f $arch, $entry.Version, $entry.File, $note) 'INFO'
-        }
+Write-Log 'Available definition versions (per architecture):' 'SUCCESS'
+foreach ($arch in 'x64','x86','arm64') {
+    if ($AvailableByArch.ContainsKey($arch)) {
+        $entry = $AvailableByArch[$arch]
+        $note  = if ($entry.IsFlatLayout) { ' (flat layout — classified as x64)' } else { '' }
+        Write-Log ("  {0,-5} = v{1,-12}  -> {2}{3}" -f $arch, $entry.Version, $entry.File, $note) 'INFO'
     }
-} else {
-    Write-Log "Latest definition version: v$AvailableVersionStr" 'SUCCESS'
-    Write-Log "Source file              : $SourceFile" 'INFO'
 }
 
 if ($Architecture) {
