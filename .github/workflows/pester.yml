@@ -1,0 +1,45 @@
+name: Pester
+
+on:
+  pull_request:
+    branches: [main, "feat/**"]
+  push:
+    branches: [main, "feat/**"]
+
+jobs:
+  test:
+    name: Run Pester tests on windows-latest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5.5+
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable Pester | Where-Object Version -ge ([version]'5.5.0'))) {
+            Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          }
+          Get-Module -ListAvailable Pester | Select-Object Name, Version
+
+      - name: Run Pester
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path           = './tests'
+          $config.Run.PassThru       = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'JUnitXml'
+          $config.TestResult.OutputPath   = './testresults.xml'
+          $config.Output.Verbosity   = 'Detailed'
+          $result = Invoke-Pester -Configuration $config
+          if ($result.FailedCount -gt 0) {
+            Write-Host "::error::Pester reported $($result.FailedCount) failed test(s)"
+            exit 1
+          }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: ./testresults.xml

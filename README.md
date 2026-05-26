@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.6-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.7-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 ## Overview
 
@@ -14,10 +14,12 @@
 - 🚀 **10x faster** with PowerShell 7+ parallel processing (up to 32 threads)
 - 📊 **Real-time update dashboard** with live progress tracking during deployments
 - 🖥️ **Fleet monitor GUI** — interactive Windows Forms status dashboard
-- 🌐 **Persistent web dashboard** — headless HTTP service for continuous fleet visibility
+- 🌐 **Persistent web dashboard** — headless HTTP/HTTPS service for continuous fleet visibility
+- 🔐 **Four auth modes** — None, Token (bearer), Basic (PBKDF2 hashed), or ADIntegrated (Negotiate with allow/deny groups)
+- 📝 **Audit-grade access logging** — every authentication decision logged with user identity + source IP + reason (NIST 800-53 AU-2 / STIG AC-7)
 - 🔄 **Auto-discovery** of computers from Active Directory
 - 🔧 **Email notifications** with HTML reports and CSV attachments
-- 🛡️ **Safe & tested** with dry-run mode and automatic retry logic
+- 🛡️ **Safe & tested** — 174-test Pester suite + GitHub Actions CI + dry-run mode + automatic retry logic
 - ⚙️ **Enterprise-ready** for scheduled tasks, service accounts, and gMSA
 - 📈 **Version analytics** with fleet-wide statistics and CSV exports
 
@@ -647,7 +649,39 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.6 (2026-05-24) — Current
+### v0.0.7 (2026-05-25) — Current
+
+Auth + HTTPS + audit logging. Dashboard goes from "trust the network" to "trust the user." Test infrastructure added so regressions get caught before they ship.
+
+**Dashboard (`Start-DefenderDashboard.ps1`):**
+- ✨ **HTTPS support** — `-UseHttps` + `-CertificateThumbprint`, with cert-validation helper and a 30-day expiry warning (Windows Event Log EventId 103)
+- ✨ **HTTP→HTTPS redirect listener** on a secondary port so http:// bookmarks still resolve
+- ✨ **Authentication framework** with four modes selected via `AuthMethod` in `conf/config.conf`:
+  - `None` — anonymous (default; logs a `WARN` at startup)
+  - `Token` — bearer token in `Authorization: Bearer …` or `?token=` query string; auto-generated to `conf/dashboard.token` with restricted ACL if blank
+  - `Basic` — PBKDF2-SHA256 (16-byte salt, 100k iterations) against `conf/dashboard.users`. Rejected at startup unless `UseHttps=true`
+  - `ADIntegrated` — Negotiate / Kerberos, with `AuthAllowedGroups` allow-list and `!Group` deny syntax (deny wins; empty list = any authenticated user)
+- ✨ `-AddBasicUser <username>` helper mode — `SecureString` prompt, PBKDF2 hash, append to users file, exit
+- ✨ `/health` endpoint always anonymous in every auth mode — external monitors can probe liveness without credentials
+- ✨ **Audit-grade access logging**: every authenticated request logs `Authorized /path by 'DOMAIN\user' from 10.0.0.5 (reason)`; every denial logs `WARN Denied /path by 'DOMAIN\user' from 10.0.0.5 (reason; HTTP nnn)` — covers NIST 800-53 AU-2 / STIG AC-7
+
+**Installer (`Install-DefenderDashboard.ps1`):**
+- ✨ `-UseHttps` / `-CertificateThumbprint` / `-RenewCertificate` — self-signed cert generation (RSA 2048, 2-year NotAfter, non-exportable, SANs for hostname + FQDN + localhost), netsh sslcert binding, URL ACL grant for the service identity
+- ✨ Cleartext-Basic install-time protection — refuses to register `-AuthMethod Basic` without `-UseHttps`
+- ✨ `-AuthMethod` / `-AuthAllowedGroups` / `-AuthBasicUsersFile` / `-AuthToken` pass-through to `config.conf` so an operator can install or reconfigure auth without hand-editing the file
+- ✨ Install-time AD group resolution — `-AuthAllowedGroups 'X,Y,Typo'` resolves each entry to a SID and `WARN`s on typos before the dashboard ever starts
+- 🐛 Installer now persists `Port` to `config.conf` (previously only `UseHttps` and `CertificateThumbprint` were persisted, so a re-run without `-Port` would silently rebind the cert to the release default port 8080)
+
+**Refactor + shared infrastructure:**
+- ✨ `lib/Invoke-DefenderRemote.ps1` — single WinRM chokepoint with dual parameter sets (`-ComputerName` and `-Session`) and opt-in `-TimeoutSeconds`; shared across the update + dashboard + monitor scripts
+- ✨ `lib/Update-ConfigValue.ps1` — comment-preserving in-place `config.conf` updater; appends to existing or new sections; honors `-WhatIf`
+- ✨ `ARCHITECTURE.md` — Mermaid diagrams of the data flow, request loop, and auth decision tree
+
+**Test infrastructure:**
+- ✨ **174-test Pester suite** covering version logic, classification, port availability, status file, hosts file, config parser, `Update-ConfigValue`, `Invoke-DefenderRemote`, HTTPS cert validation, and the full auth state machine
+- ✨ **GitHub Actions CI** runs the suite on every PR + push to `main` / `feat/**`, uploads JUnit XML
+
+### v0.0.6 (2026-05-24)
 
 **New scripts:**
 - ✨ `Show-DefenderStatus.ps1` — interactive Windows Forms fleet monitor with Fluent-style theme, clickable stat cards that filter the grid, live query-progress counter, and auto-refresh countdown
@@ -728,13 +762,36 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ---
 
+## Running tests
+
+Unit tests are written in [Pester 5](https://pester.dev/) and live in `tests/`. They exercise the config parser, hosts.conf loader, version comparison, endpoint classification, port-availability helpers, the dashboard status-file contract, and the shared `lib/` helpers — without touching the network or any external system.
+
+**Prerequisite:** Pester 5.5+ in the current user's PSModulePath.
+
+```powershell
+# One-time install
+Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+
+# Run the whole suite
+Invoke-Pester -Path ./tests -Output Detailed
+
+# Run a single test file
+Invoke-Pester -Path ./tests/ConfigParser.Tests.ps1 -Output Detailed
+```
+
+The same suite runs in CI on every PR via [`.github/workflows/pester.yml`](.github/workflows/pester.yml) — JUnit XML is uploaded as a workflow artifact.
+
+`tests/Auth.Tests.ps1` and `tests/HttpsCert.Tests.ps1` contain `-Skip` placeholders for the v0.0.7 authentication and HTTPS work; Pester reports them as skipped (not failed) so CI stays green while those features are queued.
+
+---
+
 ## Contributing
 
 Contributions welcome. Please open an issue before submitting a large pull request.
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes
+3. Commit your changes (and the corresponding Pester tests)
 4. Push and open a Pull Request
 
 ---

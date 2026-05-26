@@ -109,9 +109,14 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.6'
+$ScriptVersion = '0.0.7'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# Single chokepoint for all WinRM execution. Path is also passed into thread
+# runspaces (see Invoke-FleetRefresh) so the wrapper is available there too.
+$LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
+. $LibInvokeDefenderRemote
 
 # ===================================================================
 # Credential Helper Mode  (exits after completion)
@@ -464,11 +469,11 @@ function Get-DefenderStatus {
             return $result
         }
 
-        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        $sessionParams = @{ ComputerName = $Computer }
         if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
-        $session = New-PSSession @sessionParams
+        $session = New-DefenderRemoteSession @sessionParams
         try {
-            $data = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
+            $data = Invoke-DefenderRemote -Session $session -ScriptBlock {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
@@ -611,6 +616,15 @@ $($rows -join "`n")
 </body></html>
 "@
 }
+
+# ===================================================================
+# Main-flow guard
+#
+# When this script is dot-sourced (Pester or interactive testing of
+# individual functions), return here so the setup and Forms GUI below
+# do not run.  Direct invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 # ===================================================================
 # Setup
@@ -1275,12 +1289,17 @@ $btnRefresh.add_Click({
 
     # Bundle everything in a hashtable to pass as a single -ArgumentList
     # value (avoids the array-flattening trap with multi-arg lists).
+    # LibPath is dot-sourced inside each parallel runspace so Get-DefenderStatus
+    # (which calls New-DefenderRemoteSession / Invoke-DefenderRemote) has the
+    # wrapper functions available — they don't propagate across runspace
+    # boundaries automatically.
     $ctx = @{
         Computers           = $TargetComputers
         AvailableVersionStr = $AvailableVersionStr
         Threads             = $ParallelThreads
         Ts                  = $TimeoutSeconds
         FuncDef             = ${function:Get-DefenderStatus}.ToString()
+        LibPath             = $LibInvokeDefenderRemote
         CompletedHosts      = $script:CompletedHosts
         Credentials         = $HostCredentials
         DisableIPv6         = $DisableIPv6
@@ -1293,6 +1312,8 @@ $btnRefresh.add_Click({
             $Ctx.Computers | ForEach-Object -Parallel {
                 $c    = $using:Ctx
                 $comp = [string]$_
+                # Make wrapper functions available in this runspace
+                . $c.LibPath
                 # Assigning to ${function:Name} actually DEFINES the function
                 # in this runspace; dot-sourcing the body alone does not.
                 ${function:Get-DefenderStatus} = [scriptblock]::Create($c.FuncDef)
@@ -1308,6 +1329,7 @@ $btnRefresh.add_Click({
                 $r
             } -ThrottleLimit $Ctx.Threads
         } else {
+            . $Ctx.LibPath
             ${function:Get-DefenderStatus} = [scriptblock]::Create($Ctx.FuncDef)
             foreach ($comp in $Ctx.Computers) {
                 $compStr = [string]$comp

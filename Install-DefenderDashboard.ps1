@@ -143,6 +143,18 @@ param(
     [string]$TaskName   = 'DefenderDashboard',
     [string]$TaskFolder = '\',
 
+    # --- HTTPS support ---
+    [switch]$UseHttps,
+
+    # Existing cert in Cert:\LocalMachine\My to reuse. When omitted and -UseHttps
+    # is supplied, the installer generates a self-signed cert and persists the
+    # thumbprint to config.conf.
+    [string]$CertificateThumbprint,
+
+    # Regenerate the cert (and rebind via netsh sslcert) even if a thumbprint
+    # is already set. Requires -UseHttps.
+    [switch]$RenewCertificate,
+
     # --- Options ---
     [switch]$AddFirewallRule,
     [switch]$StartImmediately,
@@ -151,11 +163,36 @@ param(
     # Save WinRM credential for the dashboard service account (DPAPI-encrypted)
     [switch]$SaveCredential,
 
+    # --- Authentication (pass-through to dashboard via config.conf) ---
+    # When any of these are provided, the installer writes them to the
+    # [Dashboard] section of config.conf so the scheduled task picks them
+    # up at startup. Omitted parameters leave the existing config values
+    # alone.
+    [ValidateSet('None', 'Token', 'Basic', 'ADIntegrated')]
+    [string]$AuthMethod,
+
+    # ADIntegrated only. Comma-separated; entries prefixed '!' are denies.
+    [string]$AuthAllowedGroups,
+
+    # Basic only. Path to the users file (PBKDF2 hashes), relative paths
+    # resolve against the dashboard script directory.
+    [string]$AuthBasicUsersFile,
+
+    # Token only. Leave blank to let the dashboard auto-generate one.
+    [string]$AuthToken,
+
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.6'
+$ScriptVersion = '0.0.7'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+# Shared helper modules (dot-sourced; same chokepoint pattern as the other scripts).
+. (Join-Path $ScriptDir 'lib\Update-ConfigValue.ps1')
+
+# Stable application GUID used for netsh sslcert binding. Reusing this lets
+# the installer find and delete its own previous bindings idempotently.
+$script:HttpsAppId = '{a3f9b1c2-d4e5-46f7-8901-234567890abc}'
 
 # ===================================================================
 # Credential Helper Mode  (exits after completion)
@@ -211,6 +248,10 @@ if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelTh
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TaskName')        -and $cfg['TaskName'])        { $TaskName   = $cfg['TaskName'] }
 if (-not $PSBoundParameters.ContainsKey('TaskFolder')      -and $cfg['TaskFolder'])      { $TaskFolder = $cfg['TaskFolder'] }
+# HTTPS settings. The installer can be re-run without -UseHttps after an
+# initial install; config.conf carries the persisted state.
+if (-not $PSBoundParameters.ContainsKey('UseHttps')              -and $cfg['UseHttps'] -eq 'true')   { $UseHttps              = $true }
+if (-not $PSBoundParameters.ContainsKey('CertificateThumbprint') -and $cfg['CertificateThumbprint']) { $CertificateThumbprint = $cfg['CertificateThumbprint'].Trim() }
 
 # Normalize: Get-ScheduledTask -TaskPath uses CIM WQL exact matching and will
 # return nothing for '\HOME' unless the trailing backslash is present
@@ -253,6 +294,47 @@ function Write-Warn  ([string]$Msg) { Write-Host "    [WARN] $Msg" -ForegroundCo
 function Write-Fail  ([string]$Msg) { Write-Host "    [FAIL] $Msg" -ForegroundColor Red }
 function Write-Info  ([string]$Msg) { Write-Host "          $Msg" -ForegroundColor Gray }
 
+function Grant-FolderAccess {
+    param([string]$Path, [string]$Identity, [string]$Rights = 'ReadAndExecute')
+    try {
+        $acl  = Get-Acl $Path
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $Identity, $Rights,
+            'ContainerInherit,ObjectInherit',
+            'None',
+            'Allow'
+        )
+        $acl.AddAccessRule($rule)
+        Set-Acl -Path $Path -AclObject $acl
+        Write-Ok "Granted $Rights to '$Identity' on $Path"
+    } catch {
+        Write-Warn "Could not set ACL on $Path : $($_.Exception.Message)"
+        Write-Info 'Grant manually if required.'
+    }
+}
+# ===================================================================
+# Main-flow guard
+#
+# When this script is dot-sourced (Pester or interactive testing of
+# individual functions), return here so the installer banner and
+# main flow below do not run.  Direct invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ===================================================================
+# Administrative Privilege Check
+#
+# Placed AFTER the main-flow guard so dot-source (Pester) does not
+# trip the elevation requirement.
+# ===================================================================
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Fail 'This script must be run as Administrator.'
+    exit 1
+}
+Write-Ok 'Running as Administrator'
+
 # ===================================================================
 # STEP 0 – Prerequisites
 # ===================================================================
@@ -263,14 +345,14 @@ Write-Host "  ============================================================" -For
 
 Write-Step "Checking prerequisites…"
 
-# Admin check
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Fail 'This script must be run as Administrator.'
+# HTTPS parameter sanity check (before any side-effects)
+if ($RenewCertificate -and -not $UseHttps) {
+    Write-Fail '-RenewCertificate requires -UseHttps (cert regeneration only makes sense in HTTPS mode).'
     exit 1
 }
-Write-Ok 'Running as Administrator'
+if ($CertificateThumbprint -and -not $UseHttps) {
+    Write-Warn '-CertificateThumbprint supplied without -UseHttps; the thumbprint will not be persisted or bound.'
+}
 
 # PowerShell 7 on the target machine (pwsh.exe)
 $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
@@ -382,41 +464,223 @@ foreach ($p in $pathsToCreate | Select-Object -Unique) {
     }
 }
 
-function Grant-FolderAccess {
-    param([string]$Path, [string]$Identity, [string]$Rights = 'ReadAndExecute')
-    try {
-        $acl  = Get-Acl $Path
-        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $Identity, $Rights,
-            'ContainerInherit,ObjectInherit',
-            'None',
-            'Allow'
-        )
-        $acl.AddAccessRule($rule)
-        Set-Acl -Path $Path -AclObject $acl
-        Write-Ok "Granted $Rights to '$Identity' on $Path"
-    } catch {
-        Write-Warn "Could not set ACL on $Path : $($_.Exception.Message)"
-        Write-Info 'Grant manually if required.'
-    }
-}
 
 Grant-FolderAccess -Path $scriptFolder -Identity $identityLabel -Rights 'ReadAndExecute'
 Grant-FolderAccess -Path $confFolder   -Identity $identityLabel -Rights 'Modify'   # writes dashboard.status + reads/writes WinRmCredential.xml
 Grant-FolderAccess -Path $LogPath      -Identity $identityLabel -Rights 'Modify'
 
 # ===================================================================
-# STEP 3 – Build the scheduled task action arguments
+# STEP 2.5 – HTTPS setup (cert generation + netsh binding + URL ACL)
+# Only runs when -UseHttps is supplied. Persists state back to config.conf
+# so the dashboard scheduled task (which has no access to the installer's
+# CLI args) finds everything via Read-ConfigFile at startup.
 # ===================================================================
+if ($UseHttps) {
+    Write-Step "Configuring HTTPS…"
+
+    # 1. Cert: reuse, regenerate, or create new
+    $certShouldGenerate = $RenewCertificate -or -not $CertificateThumbprint
+    if (-not $RenewCertificate -and $CertificateThumbprint) {
+        # Reuse existing — validate it exists and isn't expired
+        $existing = Get-Item -LiteralPath "Cert:\LocalMachine\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
+        if (-not $existing) {
+            Write-Warn "CertificateThumbprint $CertificateThumbprint not found in Cert:\LocalMachine\My — will generate a new self-signed cert."
+            $certShouldGenerate = $true
+        } elseif ($existing.NotAfter -lt (Get-Date)) {
+            Write-Warn "Existing cert $CertificateThumbprint expired on $($existing.NotAfter.ToString('yyyy-MM-dd')) — will generate a replacement."
+            $certShouldGenerate = $true
+        } else {
+            Write-Ok "Reusing existing cert: $($existing.Subject) (expires $($existing.NotAfter.ToString('yyyy-MM-dd')))"
+        }
+    }
+    if ($certShouldGenerate) {
+        try {
+            $fqdn = if ($env:USERDNSDOMAIN) { "$env:COMPUTERNAME.$env:USERDNSDOMAIN" } else { $env:COMPUTERNAME }
+            $newCert = New-SelfSignedCertificate `
+                -Subject "CN=$env:COMPUTERNAME" `
+                -DnsName $env:COMPUTERNAME, $fqdn, 'localhost' `
+                -CertStoreLocation 'Cert:\LocalMachine\My' `
+                -NotAfter (Get-Date).AddYears(2) `
+                -KeyAlgorithm RSA -KeyLength 2048 `
+                -KeyExportPolicy NonExportable `
+                -KeyUsage DigitalSignature, KeyEncipherment `
+                -ErrorAction Stop
+            $CertificateThumbprint = $newCert.Thumbprint
+            Write-Ok "Generated self-signed certificate"
+            Write-Info "  Subject     : $($newCert.Subject)"
+            Write-Info "  DNS names   : $env:COMPUTERNAME, $fqdn, localhost"
+            Write-Info "  Thumbprint  : $CertificateThumbprint"
+            Write-Info "  Expires     : $($newCert.NotAfter.ToString('yyyy-MM-dd')) (2 years)"
+        } catch {
+            Write-Fail "Self-signed certificate generation failed: $($_.Exception.Message)"
+            exit 1
+        }
+    }
+
+    # 2. netsh sslcert binding (idempotent: delete any prior binding on this port first)
+    try {
+        $existingBinding = & netsh http show sslcert "ipport=0.0.0.0:$Port" 2>&1
+        if ($LASTEXITCODE -eq 0 -and $existingBinding -match 'Certificate Hash') {
+            $null = & netsh http delete sslcert "ipport=0.0.0.0:$Port" 2>&1
+            Write-Info "Removed prior netsh sslcert binding on 0.0.0.0:$Port"
+        }
+        $netshOut = & netsh http add sslcert "ipport=0.0.0.0:$Port" "certhash=$CertificateThumbprint" "appid=$script:HttpsAppId" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "netsh sslcert binding failed: $($netshOut -join ' ')"
+            exit 1
+        }
+        Write-Ok "Bound certificate to 0.0.0.0:$Port via netsh sslcert"
+    } catch {
+        Write-Fail "netsh sslcert binding error: $($_.Exception.Message)"
+        exit 1
+    }
+
+    # 3. URL ACL — required so non-admin service accounts can bind https:// prefixes
+    $serviceIdentityForUrlAcl = if ($isGmsa) { $GmsaName } else { $ServiceAccount }
+    try {
+        # Idempotent delete-then-add. The 'not found' error on delete is harmless.
+        $null = & netsh http delete urlacl "url=https://+:$Port/" 2>&1
+        $netshOut = & netsh http add urlacl "url=https://+:$Port/" "user=$serviceIdentityForUrlAcl" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "netsh urlacl add failed: $($netshOut -join ' ')"
+            exit 1
+        }
+        Write-Ok "URL ACL granted: https://+:$Port/ -> $serviceIdentityForUrlAcl"
+    } catch {
+        Write-Fail "netsh urlacl error: $($_.Exception.Message)"
+        exit 1
+    }
+
+    # 4. Persist HTTPS state to config.conf so the scheduled task picks it up
+    try {
+        if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+        Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'UseHttps'              -Value 'true'
+        Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'CertificateThumbprint' -Value $CertificateThumbprint
+        Write-Ok "Persisted UseHttps=true and CertificateThumbprint to conf/config.conf"
+    } catch {
+        Write-Fail "Failed to update config.conf: $($_.Exception.Message)"
+        Write-Info "Manually set in [Dashboard]:  UseHttps = true  /  CertificateThumbprint = $CertificateThumbprint"
+        exit 1
+    }
+}
+
+# Always persist the effective Port to config.conf. Without this, a re-run of
+# the installer that omits -Port would read the *release default* (8080) from
+# the un-persisted config, silently rebind the cert to that port, and stomp
+# the previous install's port. Surfaced during PR-D2b live-fire when a
+# follow-up install meant only to flip AuthMethod ended up moving the
+# HTTPS listener from 8444 back to 8080.
+try {
+    if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+    Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'Port' -Value $Port | Out-Null
+} catch {
+    Write-Warn "Could not persist Port=$Port to config.conf: $($_.Exception.Message). The task action still uses -Port $Port, but a later installer re-run without -Port may revert to the config's previous value."
+}
+
+# ===================================================================
+# STEP 2.6 – Authentication pass-through
+# Persists any -Auth* parameter that was supplied on the CLI to the
+# [Dashboard] section of config.conf so the scheduled task picks it
+# up at startup. Omitted parameters leave existing config alone.
+# For ADIntegrated, also tries to resolve each allow-list entry to
+# an SID and warns (doesn't block) on unresolvable ones.
+# ===================================================================
+$authBound = @($PSBoundParameters.Keys | Where-Object { $_ -in 'AuthMethod','AuthAllowedGroups','AuthBasicUsersFile','AuthToken' })
+if ($authBound.Count -gt 0) {
+    Write-Step "Configuring authentication…"
+    if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+    try {
+        if ($PSBoundParameters.ContainsKey('AuthMethod')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthMethod' -Value $AuthMethod
+            Write-Ok "Persisted AuthMethod=$AuthMethod"
+        }
+        if ($PSBoundParameters.ContainsKey('AuthAllowedGroups')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthAllowedGroups' -Value $AuthAllowedGroups
+            Write-Ok "Persisted AuthAllowedGroups=$AuthAllowedGroups"
+        }
+        if ($PSBoundParameters.ContainsKey('AuthBasicUsersFile')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthBasicUsersFile' -Value $AuthBasicUsersFile
+            Write-Ok "Persisted AuthBasicUsersFile=$AuthBasicUsersFile"
+        }
+        if ($PSBoundParameters.ContainsKey('AuthToken')) {
+            Update-ConfigValue -Path $ConfigPath -Section 'Dashboard' -Key 'AuthToken' -Value $AuthToken
+            Write-Ok 'Persisted AuthToken (value not displayed)'
+        }
+    } catch {
+        Write-Fail "Failed to update config.conf: $($_.Exception.Message)"
+        exit 1
+    }
+
+    # Warn-only validation: with ADIntegrated + an allow-list, try to resolve
+    # each entry to a SID so typos surface here rather than first request.
+    if ($AuthMethod -eq 'ADIntegrated' -and $AuthAllowedGroups) {
+        foreach ($entry in ($AuthAllowedGroups -split ',')) {
+            $e = $entry.Trim()
+            if (-not $e) { continue }
+            $name = if ($e.StartsWith('!')) { $e.Substring(1).Trim() } else { $e }
+            if (-not $name) { continue }
+            try {
+                [void]([System.Security.Principal.NTAccount]::new($name)).Translate(
+                    [System.Security.Principal.SecurityIdentifier])
+            } catch {
+                Write-Warn "AuthAllowedGroups entry '$e' could not be resolved to an SID on this host. The dashboard will ignore it. Check spelling / domain reachability."
+            }
+        }
+    }
+
+    # Cleartext-Basic protection mirrors the dashboard's own startup check
+    # so an operator can't accidentally install a misconfigured task.
+    if ($AuthMethod -eq 'Basic' -and -not $UseHttps) {
+        Write-Fail "AuthMethod=Basic without -UseHttps would send credentials in cleartext on every request. Re-run with -UseHttps, or pick a different AuthMethod."
+        exit 1
+    }
+}
+
+# ===================================================================
+# STEP 3 – Stop any existing dashboard task, then check port availability
+# ===================================================================
+# Stop any prior instance of our scheduled task BEFORE the port check.
+# Re-installs (especially -RenewCertificate) would otherwise fail here:
+# the still-running dashboard owns the port we're about to verify is free.
+$existingTaskPre = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
+if ($existingTaskPre -and $existingTaskPre.State -eq 'Running') {
+    Write-Step "Stopping previously installed dashboard task…"
+    try {
+        Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction Stop
+        # Wait briefly for the OS to release the bound port. HttpListener
+        # sometimes lingers in TIME_WAIT for a second or two.
+        for ($wait = 0; $wait -lt 10; $wait++) {
+            if (Test-PortFree $Port) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        Write-Ok "Previous instance stopped"
+    } catch {
+        Write-Warn "Could not stop existing task: $($_.Exception.Message)"
+        Write-Info "If install fails at port check, stop the task manually and re-run."
+    }
+}
+
 Write-Step "Checking port availability…"
 
-$portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
-if ($portResult.IsFallback) {
-    Write-Warn "Port $($portResult.PrimaryPort) is already in use on this host."
-    Write-Ok   "Using fallback port $($portResult.Port) instead."
-    $Port = $portResult.Port
+# HTTPS does NOT use fallback (cert is bound to a specific port). HTTP keeps the
+# existing fallback walk.
+if ($UseHttps) {
+    if (-not (Test-PortFree $Port)) {
+        Write-Fail "Port $Port is in use and HTTPS does not support fallback (cert binding is per-port)."
+        Write-Info "Stop the conflicting service or change Port in config.conf, then re-run with -RenewCertificate."
+        exit 1
+    }
+    $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
+    Write-Ok "Port $Port is available (HTTPS)"
 } else {
-    Write-Ok "Port $Port is available"
+    $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
+    if ($portResult.IsFallback) {
+        Write-Warn "Port $($portResult.PrimaryPort) is already in use on this host."
+        Write-Ok   "Using fallback port $($portResult.Port) instead."
+        $Port = $portResult.Port
+    } else {
+        Write-Ok "Port $Port is available"
+    }
 }
 
 Write-Step "Building scheduled task…"
@@ -515,36 +779,53 @@ try {
 }
 
 # ===================================================================
-# STEP 4 – Optional firewall rule
+# STEP 4 – Optional firewall rule(s)
 # ===================================================================
-if ($AddFirewallRule) {
-    Write-Step "Creating Windows Firewall inbound rule…"
-    $ruleName = "DefenderDashboard-TCP-$Port"
+function Add-DashboardFirewallRule {
+    param([int]$RulePort, [string]$Protocol, [string]$Purpose)
+    $ruleName = "DefenderDashboard-${Protocol}-$RulePort"
     $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
     if ($existing -and -not $Force) {
         Write-Warn "Firewall rule '$ruleName' already exists – skipping. (Re-run with -Force to replace.)"
-    } else {
-        try {
-            if ($existing) {
-                Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction Stop
-                Write-Info "Removed existing rule '$ruleName' (replacing because -Force was specified)."
-            }
-            # New-NetFirewallRule has no -Force parameter; -Enabled takes
-            # the string 'True'/'False', not [bool] $true/$false.
-            New-NetFirewallRule `
-                -DisplayName $ruleName `
-                -Description "Allows inbound HTTP traffic to the Defender Fleet Dashboard on TCP $Port" `
-                -Direction   Inbound `
-                -Protocol    TCP `
-                -LocalPort   $Port `
-                -Action      Allow `
-                -Profile     Domain, Private `
-                -Enabled     True | Out-Null
-            Write-Ok "Firewall rule created: $ruleName (TCP $Port, Domain+Private profiles)"
-        } catch {
-            Write-Warn "Could not create firewall rule: $($_.Exception.Message)"
-            Write-Info "Create manually: New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow"
+        return
+    }
+    try {
+        if ($existing) {
+            Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction Stop
+            Write-Info "Removed existing rule '$ruleName' (replacing because -Force was specified)."
         }
+        # New-NetFirewallRule has no -Force parameter; -Enabled takes the
+        # string 'True'/'False', not [bool] $true/$false.
+        New-NetFirewallRule `
+            -DisplayName $ruleName `
+            -Description "Allows inbound $Purpose to the Defender Fleet Dashboard on TCP $RulePort" `
+            -Direction   Inbound `
+            -Protocol    TCP `
+            -LocalPort   $RulePort `
+            -Action      Allow `
+            -Profile     Domain, Private `
+            -Enabled     True | Out-Null
+        Write-Ok "Firewall rule created: $ruleName (TCP $RulePort, Domain+Private profiles)"
+    } catch {
+        Write-Warn "Could not create firewall rule '$ruleName': $($_.Exception.Message)"
+        Write-Info "Create manually: New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol TCP -LocalPort $RulePort -Action Allow"
+    }
+}
+
+if ($AddFirewallRule) {
+    Write-Step "Creating Windows Firewall inbound rule(s)…"
+    if ($UseHttps) {
+        Add-DashboardFirewallRule -RulePort $Port -Protocol 'HTTPS' -Purpose 'HTTPS traffic'
+        # If the dashboard's HTTP redirect listener is enabled and uses a
+        # different port, open that one too. We read the value from config.conf
+        # because the installer doesn't carry RedirectHttpToHttps as a param.
+        $redirectEnabled = ($cfg['RedirectHttpToHttps'] -ne 'false')   # default true
+        $redirectPort    = if ($cfg['RedirectHttpPort']) { [int]$cfg['RedirectHttpPort'] } else { 8080 }
+        if ($redirectEnabled -and $redirectPort -ne $Port) {
+            Add-DashboardFirewallRule -RulePort $redirectPort -Protocol 'HTTP-Redirect' -Purpose 'HTTP traffic (301-redirected to HTTPS)'
+        }
+    } else {
+        Add-DashboardFirewallRule -RulePort $Port -Protocol 'HTTP' -Purpose 'HTTP traffic'
     }
 }
 
@@ -598,12 +879,24 @@ if ($StartImmediately) {
         # but *before* entering the request loop, so /health does not respond
         # until that initial pass completes (~0.5s per host). Retry up to 6
         # times with a 10-second per-probe timeout to give large fleets room.
-        $probeOk    = $false
-        $lastErr    = $null
-        $probeStart = Get-Date
+        $probeScheme = if ($UseHttps) { 'https' } else { 'http' }
+        $probeUrl    = "${probeScheme}://localhost:$actualPort/health"
+        $probeOk     = $false
+        $lastErr     = $null
+        $probeStart  = Get-Date
         for ($i = 1; $i -le 6; $i++) {
             try {
-                $resp = Invoke-WebRequest -Uri "http://localhost:$actualPort/health" -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+                # For HTTPS with the installer's self-signed cert, the local
+                # cert chain won't validate. -SkipCertificateCheck bypasses
+                # validation only for this localhost probe (PS7+ only).
+                $iwrParams = @{
+                    Uri             = $probeUrl
+                    TimeoutSec      = 10
+                    UseBasicParsing = $true
+                    ErrorAction     = 'Stop'
+                }
+                if ($UseHttps) { $iwrParams.SkipCertificateCheck = $true }
+                $resp = Invoke-WebRequest @iwrParams
                 if ($resp.StatusCode -eq 200) { $probeOk = $true; break }
             } catch {
                 $lastErr = $_.Exception.Message
@@ -612,7 +905,7 @@ if ($StartImmediately) {
         }
         $elapsed = [int]((Get-Date) - $probeStart).TotalSeconds
         if ($probeOk) {
-            Write-Ok "HTTP health probe passed after ${elapsed}s: http://localhost:$actualPort/health → 200 OK"
+            Write-Ok "$($probeScheme.ToUpper()) health probe passed after ${elapsed}s: $probeUrl → 200 OK"
         } else {
             Write-Warn "Status file present but /health probe failed after ${elapsed}s of retries: $lastErr"
             Write-Info "Initial fleet collection may still be running for a large fleet. Check the dashboard log: $LogPath"
@@ -641,9 +934,18 @@ if ($portResult.IsFallback) {
 } else {
     Write-Host "  Port         : $Port" -ForegroundColor White
 }
-Write-Host "  Dashboard    : http://<this-host>:$Port/defender" -ForegroundColor White
-Write-Host "  JSON status  : http://<this-host>:$Port/status" -ForegroundColor White
-Write-Host "  Health probe : http://<this-host>:$Port/health" -ForegroundColor White
+$summaryScheme = if ($UseHttps) { 'https' } else { 'http' }
+Write-Host "  Dashboard    : ${summaryScheme}://<this-host>:$Port/defender" -ForegroundColor White
+Write-Host "  JSON status  : ${summaryScheme}://<this-host>:$Port/status" -ForegroundColor White
+Write-Host "  Health probe : ${summaryScheme}://<this-host>:$Port/health" -ForegroundColor White
+if ($UseHttps) {
+    $redirectEnabled = ($cfg['RedirectHttpToHttps'] -ne 'false')
+    $redirectPort    = if ($cfg['RedirectHttpPort']) { [int]$cfg['RedirectHttpPort'] } else { 8080 }
+    if ($redirectEnabled -and $redirectPort -ne $Port) {
+        Write-Host "  HTTP redirect: http://<this-host>:$redirectPort/  (301 → https)" -ForegroundColor White
+    }
+    Write-Host "  Certificate  : $CertificateThumbprint" -ForegroundColor White
+}
 Write-Host "  Logs         : $LogPath" -ForegroundColor White
 Write-Host ""
 $pathArg = if ($TaskFolder -eq '\') { '' } else { " -TaskPath '$TaskFolder'" }

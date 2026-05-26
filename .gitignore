@@ -9,6 +9,8 @@ Reports/
 # Runtime files (written by the scripts during execution)
 hosts.conf
 conf/dashboard.status
+conf/dashboard.token
+conf/dashboard.users
 
 # AI assistant working notes (local to the maintainer; not part of the public project)
 CLAUDE.md
@@ -40,6 +42,7 @@ $RECYCLE.BIN/
 
 # Temporary files
 *.tmp
+*.tmp.*           # Pester writes atomic temp files like Foo.Tests.ps1.tmp.<pid>.<hash>
 *.temp
 ~$*
 

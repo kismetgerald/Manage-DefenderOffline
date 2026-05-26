@@ -100,11 +100,54 @@ param(
     [ValidateSet('Dark','Light')]
     [string]$DashboardTheme = 'Dark',
 
+    # HTTPS support.  When true, Port refers to the HTTPS port.  A certificate
+    # must be present in Cert:\LocalMachine\My and bound to the listener URL
+    # (the installer handles both with -UseHttps).
+    [bool]$UseHttps = $false,
+
+    # Thumbprint of the cert in Cert:\LocalMachine\My to bind.  Required when
+    # -UseHttps is set.
+    [string]$CertificateThumbprint,
+
+    # Bind a secondary HTTP listener on -RedirectHttpPort that 301s every
+    # request to the HTTPS URL.  Only honored when -UseHttps is also true.
+    [bool]$RedirectHttpToHttps = $true,
+
+    [ValidateRange(1024, 65535)]
+    [int]$RedirectHttpPort = 8080,
+
+    # Authentication for /defender, /status, /refresh. /health stays anonymous
+    # in all modes so external monitoring can probe liveness without creds.
+    # PR-D1 implements None and Token; PR-D2 fills in Basic and ADIntegrated.
+    [ValidateSet('None', 'ADIntegrated', 'Basic', 'Token')]
+    [string]$AuthMethod = 'None',
+
+    # ADIntegrated only (PR-D2): comma-separated allow list. Prefix entries with
+    # '!' to deny (deny wins over allow). Empty allow-list = any authenticated user.
+    [string]$AuthAllowedGroups,
+
+    # Basic only (PR-D2): path to file with 'username:pbkdf2-hash' per line.
+    [string]$AuthBasicUsersFile,
+
+    # Token only: bearer token. If blank when AuthMethod=Token, a random
+    # 32-byte token is generated at first startup and written to
+    # conf\dashboard.token with restricted ACL.
+    [string]$AuthToken,
+
+    # Helper mode: prompts for a password, PBKDF2-hashes it, and appends a
+    # username:salt:iterations:hash line to AuthBasicUsersFile, then exits.
+    [string]$AddBasicUser,
+
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.6'
+$ScriptVersion = '0.0.7'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+# Single chokepoint for all WinRM execution. Path is also passed into thread
+# runspaces (see Invoke-FleetRefresh) so the wrapper is available there too.
+$LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
+. $LibInvokeDefenderRemote
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
 # ===================================================================
@@ -200,6 +243,24 @@ if (-not $PSBoundParameters.ContainsKey('DashboardTheme')  -and $cfg['DashboardT
     $t = $cfg['DashboardTheme'].Trim()
     if ($t -match '^(?i)light$|^(?i)dark$') { $DashboardTheme = (Get-Culture).TextInfo.ToTitleCase($t.ToLower()) }
 }
+if (-not $PSBoundParameters.ContainsKey('UseHttps')              -and $cfg['UseHttps'])              { $UseHttps              = ($cfg['UseHttps']              -match '^(?i)true|1|yes$') }
+if (-not $PSBoundParameters.ContainsKey('CertificateThumbprint') -and $cfg['CertificateThumbprint']) { $CertificateThumbprint = $cfg['CertificateThumbprint'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('RedirectHttpToHttps')   -and $cfg['RedirectHttpToHttps'])   { $RedirectHttpToHttps   = ($cfg['RedirectHttpToHttps']   -match '^(?i)true|1|yes$') }
+if (-not $PSBoundParameters.ContainsKey('RedirectHttpPort')      -and $cfg['RedirectHttpPort'])      { try { $RedirectHttpPort = [int]$cfg['RedirectHttpPort'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('AuthMethod')            -and $cfg['AuthMethod'])            {
+    $am = $cfg['AuthMethod'].Trim()
+    if ($am -match '^(?i)None|ADIntegrated|Basic|Token$') { $AuthMethod = (Get-Culture).TextInfo.ToTitleCase($am.ToLower()) -replace '^Adintegrated$','ADIntegrated' }
+}
+if (-not $PSBoundParameters.ContainsKey('AuthAllowedGroups')     -and $cfg['AuthAllowedGroups'])     { $AuthAllowedGroups     = $cfg['AuthAllowedGroups'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('AuthBasicUsersFile')    -and $cfg['AuthBasicUsersFile'])    { $AuthBasicUsersFile    = $cfg['AuthBasicUsersFile'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('AuthToken')             -and $cfg['AuthToken'])             { $AuthToken             = $cfg['AuthToken'].Trim() }
+
+# Relative paths in config.conf must resolve against the script directory,
+# not the current working directory — Task Scheduler launches pwsh.exe with
+# CWD = %SystemRoot%\System32, which makes 'conf\dashboard.users' unreachable.
+if ($AuthBasicUsersFile -and -not [System.IO.Path]::IsPathRooted($AuthBasicUsersFile)) {
+    $AuthBasicUsersFile = Join-Path $ScriptDir $AuthBasicUsersFile
+}
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -229,6 +290,539 @@ function Find-AvailablePort {
         $candidate++
     }
     throw "No available port found. Primary $Primary was in use; tried fallback range $Fallback–$($candidate - 1)."
+}
+
+# ===================================================================
+# HTTPS certificate validation
+#
+# Resolves the configured thumbprint to a cert in Cert:\LocalMachine\My,
+# verifies it is not past NotAfter, and returns an object describing
+# the cert and how many days until expiry. Throws when the cert is
+# missing or expired. Callers decide whether to emit EventId 103 when
+# DaysUntilExpiry is below their warning threshold.
+# ===================================================================
+function Resolve-DashboardCertificate {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]   # validate inside so our error message wins over the binder's
+        [string]$Thumbprint
+    )
+    $clean = $Thumbprint.Trim() -replace '\s', '' -replace '[^0-9A-Fa-f]', ''
+    if (-not $clean) {
+        throw "CertificateThumbprint is empty or not a valid hexadecimal thumbprint."
+    }
+    $certPath = "Cert:\LocalMachine\My\$clean"
+    $cert = Get-Item -LiteralPath $certPath -ErrorAction SilentlyContinue
+    if (-not $cert) {
+        throw "Certificate with thumbprint $clean not found in Cert:\LocalMachine\My. " +
+              "Use Install-DefenderDashboard.ps1 -UseHttps to generate one, or import a PKI-issued cert into LocalMachine\My."
+    }
+    $now             = Get-Date
+    $daysUntilExpiry = [int]($cert.NotAfter - $now).TotalDays
+    if ($daysUntilExpiry -lt 0) {
+        throw "Certificate $clean expired $(-$daysUntilExpiry) day(s) ago (NotAfter: $($cert.NotAfter)). " +
+              "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate."
+    }
+    [pscustomobject]@{
+        Certificate     = $cert
+        Thumbprint      = $clean
+        Subject         = $cert.Subject
+        NotAfter        = $cert.NotAfter
+        DaysUntilExpiry = $daysUntilExpiry
+    }
+}
+
+# ===================================================================
+# Authentication helpers
+#
+# Test-ConstantTimeEqual: defends bearer-token comparison against timing
+# attacks. Standard equality short-circuits on the first mismatched byte;
+# an attacker can use response-timing to discover the token byte by byte.
+# This implementation always touches every byte, then ORs the differences.
+#
+# New-RandomToken: cryptographically random 32-byte token, base64-encoded
+# (~43 chars). Used for AuthMethod=Token when no AuthToken is configured.
+#
+# Test-DashboardAuth: central authorization chokepoint. Returns a result
+# object with Authorized, StatusCode, User, and Reason. Always allows
+# /health regardless of AuthMethod (liveness probes need to work without
+# credentials).
+#
+# PR-D1 implements None and Token. PR-D2 fills in Basic and ADIntegrated.
+# ===================================================================
+
+function Test-ConstantTimeEqual {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$A,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$B
+    )
+    if ($null -eq $A -or $null -eq $B) { return $false }
+    if ($A.Length -ne $B.Length)        { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $A.Length; $i++) {
+        $diff = $diff -bor ([byte][char]$A[$i] -bxor [byte][char]$B[$i])
+    }
+    return $diff -eq 0
+}
+
+function New-RandomToken {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([int]$ByteLength = 32)
+    $bytes = [byte[]]::new($ByteLength)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    return [Convert]::ToBase64String($bytes)
+}
+
+# PBKDF2-SHA256 hashing for the Basic-auth users file. Line format:
+#   username:salt-b64:iterations:hash-b64
+# 16-byte salt, 100k iterations, 32-byte hash by default.
+function New-DashboardPasswordHash {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [securestring]$Password,
+        [int]$Iterations = 100000,
+        [int]$SaltBytes  = 16,
+        [int]$HashBytes  = 32
+    )
+    $salt = [byte[]]::new($SaltBytes)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($salt)
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+    try {
+        $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        $pbkdf2 = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
+            $plain, $salt, $Iterations,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        try {
+            $hash = $pbkdf2.GetBytes($HashBytes)
+        } finally { $pbkdf2.Dispose() }
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+    return '{0}:{1}:{2}' -f ([Convert]::ToBase64String($salt)), $Iterations, ([Convert]::ToBase64String($hash))
+}
+
+function Test-DashboardPasswordHash {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    # Verify-against-hash necessarily takes the cleartext candidate so we can
+    # PBKDF2 it and compare. SecureString conversion would add round-trips
+    # without changing the in-memory exposure window.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'Password',
+        Justification = 'Hash-verification cannot avoid receiving the cleartext candidate.')]
+    param(
+        [Parameter(Mandatory)] [string]$Password,
+        [Parameter(Mandatory)] [string]$StoredHash
+    )
+    # StoredHash is the part AFTER the username colon: salt-b64:iterations:hash-b64
+    $parts = $StoredHash.Split(':')
+    if ($parts.Count -ne 3) { return $false }
+    $salt       = try { [Convert]::FromBase64String($parts[0]) } catch { return $false }
+    $iterations = 0
+    if (-not [int]::TryParse($parts[1], [ref]$iterations) -or $iterations -lt 1) { return $false }
+    $expected   = try { [Convert]::FromBase64String($parts[2]) } catch { return $false }
+    $pbkdf2 = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
+        $Password, $salt, $iterations,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $actual = $pbkdf2.GetBytes($expected.Length)
+    } finally { $pbkdf2.Dispose() }
+    return Test-ConstantTimeEqual `
+        -A ([Convert]::ToBase64String($expected)) `
+        -B ([Convert]::ToBase64String($actual))
+}
+
+# Reads AuthBasicUsersFile and returns a dictionary of username -> StoredHash.
+# Lines beginning with # are comments. Blank lines are ignored. Bad lines are
+# logged via Write-DashLog (when available) and skipped.
+function Read-DashboardUsersFile {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.Dictionary[string,string]])]
+    param([Parameter(Mandatory)] [string]$Path)
+    $users = [System.Collections.Generic.Dictionary[string,string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path -LiteralPath $Path)) { return $users }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $t = $line.Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        # username:salt:iterations:hash → 4 colon-separated fields total
+        $idx = $t.IndexOf(':')
+        if ($idx -lt 1) { continue }
+        $user = $t.Substring(0, $idx).Trim()
+        $rest = $t.Substring($idx + 1).Trim()
+        if (-not $user -or -not $rest) { continue }
+        $users[$user] = $rest
+    }
+    return $users
+}
+
+# Appends a new user to the users file (creates the file if missing). Caller is
+# responsible for prompting for the password. Returns the path written.
+function Add-DashboardBasicUser {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Username,
+        [Parameter(Mandatory)] [securestring]$Password
+    )
+    if ($Username -notmatch '^[A-Za-z0-9._-]+$') {
+        throw "Username '$Username' contains characters that would corrupt the users file. Allowed: letters, digits, dot, underscore, hyphen."
+    }
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        @(
+            '# Manage-DefenderOffline Dashboard – Basic-auth users'
+            '# One user per line: username:salt-b64:iterations:hash-b64'
+            '# Generated and appended to by Start-DefenderDashboard.ps1 -AddBasicUser.'
+        ) | Out-File -LiteralPath $Path -Encoding UTF8 -Force
+    }
+    # Reject duplicate usernames so callers do not silently shadow a previous
+    # entry. -RemoveBasicUser is the documented way to replace one.
+    $existing = Read-DashboardUsersFile -Path $Path
+    if ($existing.ContainsKey($Username)) {
+        throw "User '$Username' already exists in $Path. Remove the existing line first."
+    }
+    $hash = New-DashboardPasswordHash -Password $Password
+    $line = '{0}:{1}' -f $Username, $hash
+    Add-Content -LiteralPath $Path -Value $line -Encoding UTF8
+
+    # Best-effort ACL tightening to the current identity (matches dashboard.token
+    # treatment). Silent fallback if Set-Acl fails — e.g. running on a drive
+    # where the user lacks SeSecurityPrivilege, or under a sandbox.
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        @($acl.Access) | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+        $identity = "$env:USERDOMAIN\$env:USERNAME"
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity, 'FullControl', 'Allow')
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    } catch {}
+
+    return $Path
+}
+
+# ===================================================================
+# ADIntegrated group-membership helpers
+#
+# Resolve-DashboardAllowedGroups: parses the comma-separated AuthAllowedGroups
+# string (entries prefixed '!' are denies; deny wins) and translates each
+# entry to a SecurityIdentifier so per-request membership checks avoid AD
+# round-trips. Entries that can't be resolved are returned in .Unresolved
+# so the caller can WARN and continue.
+#
+# Test-IdentityInAllowedGroups: pure SID-based membership decision. Deny
+# entries checked first; empty allow-list = any authenticated user.
+# ===================================================================
+
+function Resolve-DashboardAllowedGroups {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([AllowEmptyString()] [string]$AllowList)
+
+    $allow      = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
+    $deny       = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
+    $unresolved = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($AllowList) {
+        foreach ($entry in ($AllowList -split ',')) {
+            $e = $entry.Trim()
+            if (-not $e) { continue }
+            $isDeny = $e.StartsWith('!')
+            $name = if ($isDeny) { $e.Substring(1).Trim() } else { $e }
+            if (-not $name) { continue }
+            try {
+                $sid = ([System.Security.Principal.NTAccount]::new($name)).Translate(
+                    [System.Security.Principal.SecurityIdentifier])
+                if ($isDeny) { [void]$deny.Add($sid) } else { [void]$allow.Add($sid) }
+            } catch {
+                [void]$unresolved.Add($e)
+            }
+        }
+    }
+    return [pscustomobject]@{
+        AllowSids  = $allow.ToArray()
+        DenySids   = $deny.ToArray()
+        Unresolved = $unresolved.ToArray()
+    }
+}
+
+function Test-IdentityInAllowedGroups {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Principal.SecurityIdentifier]$UserSid,
+
+        # User's group SIDs (typically WindowsIdentity.Groups). Allowed empty
+        # because the user themselves may match an allow/deny entry directly.
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Security.Principal.SecurityIdentifier[]]$GroupSids,
+
+        # Output of Resolve-DashboardAllowedGroups: { AllowSids, DenySids, Unresolved }.
+        [Parameter(Mandatory)]
+        [pscustomobject]$AllowedGroups
+    )
+    # The user matches if their own SID matches OR any of their group SIDs match.
+    $userAndGroups = @($UserSid) + $GroupSids
+
+    foreach ($denySid in $AllowedGroups.DenySids) {
+        if ($userAndGroups -contains $denySid) {
+            return [pscustomobject]@{
+                Authorized = $false; Reason = 'group-denied'
+                MatchedSid = $denySid
+            }
+        }
+    }
+
+    if ($AllowedGroups.AllowSids.Count -eq 0) {
+        return [pscustomobject]@{
+            Authorized = $true; Reason = 'no-allow-list'
+            MatchedSid = $null
+        }
+    }
+
+    foreach ($allowSid in $AllowedGroups.AllowSids) {
+        if ($userAndGroups -contains $allowSid) {
+            return [pscustomobject]@{
+                Authorized = $true; Reason = 'group-allowed'
+                MatchedSid = $allowSid
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Authorized = $false; Reason = 'not-in-allow-list'
+        MatchedSid = $null
+    }
+}
+
+function Test-DashboardAuth {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        # Untyped so Pester can pass a PSObject duck-type stub. At runtime
+        # the production caller always passes a [System.Net.HttpListenerContext].
+        # We access .Request.Url.LocalPath, .Request.Headers, .Request.QueryString,
+        # and (for ADIntegrated) .User.Identity — all of which work on either a
+        # real context or a stub with the same shape.
+        [Parameter(Mandatory)]
+        $Context,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('None', 'ADIntegrated', 'Basic', 'Token')]
+        [string]$Method,
+
+        # Mode-specific inputs. Each is only meaningful for its own Method.
+        [string]$Token,
+        # Resolved allow/deny SID object from Resolve-DashboardAllowedGroups.
+        # Optional so Basic/Token/None callers can omit it.
+        [pscustomobject]$AllowedGroupSids,
+        [string]$UsersFile
+    )
+
+    # /health is always anonymous so external monitoring works in every mode
+    if ($Context.Request.Url.LocalPath -eq '/health') {
+        return [pscustomobject]@{
+            Authorized = $true; StatusCode = 200
+            User = 'anonymous'; Reason = 'health-bypass'
+        }
+    }
+
+    switch ($Method) {
+        'None' {
+            return [pscustomobject]@{
+                Authorized = $true; StatusCode = 200
+                User = 'anonymous'; Reason = 'auth-disabled'
+            }
+        }
+
+        'Token' {
+            # Accept token in Authorization: Bearer <token> header OR ?token= query string.
+            # Header is checked first (more secure: not logged in URL).
+            $provided = $null
+            $authHeader = $Context.Request.Headers['Authorization']
+            if ($authHeader -and $authHeader -match '^Bearer\s+(.+)$') {
+                $provided = $matches[1]
+            } elseif ($Context.Request.QueryString['token']) {
+                $provided = $Context.Request.QueryString['token']
+            }
+
+            if (-not $provided) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'no-token'
+                }
+            }
+            if (Test-ConstantTimeEqual -A $provided -B $Token) {
+                return [pscustomobject]@{
+                    Authorized = $true; StatusCode = 200
+                    User = 'token-bearer'; Reason = 'token-matched'
+                }
+            }
+            return [pscustomobject]@{
+                Authorized = $false; StatusCode = 403
+                User = 'anonymous'; Reason = 'token-mismatch'
+            }
+        }
+
+        'Basic' {
+            # HTTP Basic: Authorization: Basic base64(username:password). The
+            # HttpListener stays in Anonymous mode and we parse the header
+            # ourselves so /health stays anonymous and the response loop can
+            # emit a 401 with WWW-Authenticate: Basic realm=... on first hit.
+            $authHeader = $Context.Request.Headers['Authorization']
+            if (-not $authHeader -or $authHeader -notmatch '^Basic\s+(.+)$') {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'no-credentials'
+                }
+            }
+            $decoded = $null
+            try {
+                $decoded = [System.Text.Encoding]::UTF8.GetString(
+                    [Convert]::FromBase64String($matches[1]))
+            } catch {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'malformed-credentials'
+                }
+            }
+            $colon = $decoded.IndexOf(':')
+            if ($colon -lt 1) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'malformed-credentials'
+                }
+            }
+            $providedUser = $decoded.Substring(0, $colon)
+            $providedPwd  = $decoded.Substring($colon + 1)
+
+            if (-not $UsersFile -or -not (Test-Path -LiteralPath $UsersFile)) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 500
+                    User = $providedUser; Reason = 'users-file-missing'
+                }
+            }
+            $users = Read-DashboardUsersFile -Path $UsersFile
+            if (-not $users.ContainsKey($providedUser)) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = $providedUser; Reason = 'unknown-user'
+                }
+            }
+            if (Test-DashboardPasswordHash -Password $providedPwd -StoredHash $users[$providedUser]) {
+                return [pscustomobject]@{
+                    Authorized = $true; StatusCode = 200
+                    User = $providedUser; Reason = 'password-matched'
+                }
+            }
+            return [pscustomobject]@{
+                Authorized = $false; StatusCode = 401
+                User = $providedUser; Reason = 'password-mismatch'
+            }
+        }
+
+        'ADIntegrated' {
+            # The HttpListener's AuthenticationSchemeSelectorDelegate handled
+            # the Negotiate handshake; by the time we see the context the user
+            # is either authenticated (context.User populated) or already 401'd
+            # by the listener (we never receive that context). The explicit
+            # null check below is defense-in-depth.
+            if (-not $Context.User -or -not $Context.User.Identity -or
+                -not $Context.User.Identity.IsAuthenticated) {
+                return [pscustomobject]@{
+                    Authorized = $false; StatusCode = 401
+                    User = 'anonymous'; Reason = 'no-windows-identity'
+                }
+            }
+            $userName = $Context.User.Identity.Name
+            $userSid  = $Context.User.Identity.User
+            $groupSids = @()
+            if ($Context.User.Identity.Groups) {
+                $groupSids = @($Context.User.Identity.Groups)
+            }
+            if (-not $AllowedGroupSids) {
+                # Empty config = any authenticated user
+                $AllowedGroupSids = [pscustomobject]@{
+                    AllowSids  = @()
+                    DenySids   = @()
+                    Unresolved = @()
+                }
+            }
+            $decision = Test-IdentityInAllowedGroups `
+                -UserSid       $userSid `
+                -GroupSids     $groupSids `
+                -AllowedGroups $AllowedGroupSids
+            if ($decision.Authorized) {
+                return [pscustomobject]@{
+                    Authorized = $true; StatusCode = 200
+                    User = $userName; Reason = $decision.Reason
+                }
+            }
+            return [pscustomobject]@{
+                Authorized = $false; StatusCode = 403
+                User = $userName; Reason = $decision.Reason
+            }
+        }
+    }
+}
+
+# ===================================================================
+# -AddBasicUser helper mode  (exits after completion)
+#
+# Appends a new entry to AuthBasicUsersFile. The file path comes from CLI
+# parameter or conf/config.conf; we default to conf\dashboard.users when
+# neither is set. The password is read as a SecureString so it never sits
+# in the host's command history or process arg list.
+# ===================================================================
+if ($AddBasicUser) {
+    Write-Host "`n=== Add Basic Auth User ===" -ForegroundColor Cyan
+    Write-Host ''
+    $usersPath = $AuthBasicUsersFile
+    if (-not $usersPath) { $usersPath = Join-Path $ScriptDir 'conf\dashboard.users' }
+    Write-Host "  Users file: $usersPath"
+    Write-Host "  Username  : $AddBasicUser"
+    try {
+        $pwd1 = Read-Host -AsSecureString -Prompt '  Enter password'
+        $pwd2 = Read-Host -AsSecureString -Prompt '  Confirm password'
+        $b1 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwd1)
+        $b2 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwd2)
+        try {
+            $p1 = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($b1)
+            $p2 = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($b2)
+            if ($p1 -ne $p2) { Write-Host '  ERROR: passwords do not match.' -ForegroundColor Red; exit 1 }
+            if (-not $p1)    { Write-Host '  ERROR: password cannot be empty.' -ForegroundColor Red; exit 1 }
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
+        }
+        $written = Add-DashboardBasicUser -Path $usersPath -Username $AddBasicUser -Password $pwd1
+        Write-Host "  Saved: $written" -ForegroundColor Green
+        Write-Host "  Hint : ensure conf/config.conf sets AuthMethod = Basic and AuthBasicUsersFile = $written" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
 }
 
 # ===================================================================
@@ -384,11 +978,11 @@ function Get-DefenderStatus {
             return $result
         }
 
-        $sessionParams = @{ ComputerName = $Computer; ErrorAction = 'Stop' }
+        $sessionParams = @{ ComputerName = $Computer }
         if ($WinRmCredential) { $sessionParams.Credential = $WinRmCredential }
-        $session = New-PSSession @sessionParams
+        $session = New-DefenderRemoteSession @sessionParams
         try {
-            $data = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
+            $data = Invoke-DefenderRemote -Session $session -ScriptBlock {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
@@ -448,9 +1042,15 @@ function Invoke-FleetRefresh {
         [int]$TSeconds,
         [string]$FunctionDef,    # Get-DefenderStatus serialised as a string
         [System.Management.Automation.PSCredential]$WinRmCredential,
-        [bool]$DisableIPv6 = $true
+        [bool]$DisableIPv6 = $true,
+        [string]$LibPath         # Path to lib/Invoke-DefenderRemote.ps1 (passed through
+                                 # to child runspaces so wrapper functions are available)
     )
 
+    # Dot-source the wrapper in this runspace (Invoke-FleetRefresh runs inside
+    # a Start-ThreadJob from Start-BackgroundRefresh, so the parent's lib
+    # dot-source isn't visible here).
+    if ($LibPath) { . $LibPath }
     ${function:Get-DefenderStatus} = [scriptblock]::Create($FunctionDef)
 
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -458,6 +1058,8 @@ function Invoke-FleetRefresh {
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $Computers | ForEach-Object -Parallel {
             $comp = [string]$_
+            # Each parallel runspace is also isolated; re-import the wrapper.
+            if ($using:LibPath) { . $using:LibPath }
             ${function:Get-DefenderStatus} = [scriptblock]::Create($using:FunctionDef)
             $cred = $using:WinRmCredential
             Get-DefenderStatus -Computer $comp `
@@ -886,6 +1488,44 @@ function Send-HttpResponse {
     }
 }
 
+function Start-BackgroundRefresh {
+    if ($script:IsRefreshing) { return }
+    $script:IsRefreshing = $true
+    Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
+
+    $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, $LibInvokeDefenderRemote
+}
+
+function Receive-RefreshIfDone {
+    if (-not $script:RefreshJob) { return }
+    if ($script:RefreshJob.State -notin 'Running','NotStarted') {
+        $newData = Receive-Job $script:RefreshJob -ErrorAction SilentlyContinue
+        Remove-Job $script:RefreshJob -Force
+        $script:RefreshJob   = $null
+        $script:IsRefreshing = $false
+
+        if ($newData) {
+            $script:CachedResults = if ($newData -is [array]) { [System.Collections.Generic.List[pscustomobject]]$newData } else { $newData }
+            $script:CachedAt      = Get-Date
+            $onlineCount  = @($script:CachedResults | Where-Object Online).Count
+            $outdatedCount = @($script:CachedResults | Where-Object VersionStatus -eq 'Outdated').Count
+            Write-DashLog "Refresh complete: $($script:CachedResults.Count) computers | $onlineCount online | $outdatedCount outdated" 'SUCCESS'
+        } else {
+            Write-DashLog 'Refresh job returned no data.' 'WARN'
+        }
+    }
+}
+
+# ===================================================================
+# Main-flow guard
+#
+# When this script is dot-sourced (Pester or interactive testing of
+# individual functions), return here so the banner and HTTP listener
+# below do not run.  Direct invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 # ===================================================================
 # Startup
 # ===================================================================
@@ -894,8 +1534,135 @@ Write-DashLog "Port            : $Port"
 Write-DashLog "Refresh interval: ${RefreshInterval}s"
 Write-DashLog "Parallel threads: $ParallelThreads"
 Write-DashLog "Default theme   : $DashboardTheme"
+Write-DashLog "HTTPS           : $(if ($UseHttps) { "enabled (cert $CertificateThumbprint)" } else { 'disabled' })"
+Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+
+# ===================================================================
+# Authentication validation (early — fail fast for misconfigurations).
+# Runs before HTTPS cert resolution so an auth-config problem surfaces
+# in its own right instead of being masked by an unrelated cert error.
+# ===================================================================
+# Default to an empty allow/deny set so Basic/Token/None code paths can
+# still pass $script:AdGroupResolution into Test-DashboardAuth.
+$script:AdGroupResolution = [pscustomobject]@{
+    AllowSids  = @()
+    DenySids   = @()
+    Unresolved = @()
+}
+switch ($AuthMethod) {
+    'Basic' {
+        if (-not $UseHttps) {
+            Write-DashLog "AuthMethod=Basic over plain HTTP would send credentials in cleartext on every request. Enable UseHttps=true in config.conf, or pick a different AuthMethod." 'ERROR'
+            exit 1
+        }
+        if (-not $AuthBasicUsersFile -or -not (Test-Path -LiteralPath $AuthBasicUsersFile)) {
+            Write-DashLog "AuthMethod=Basic but AuthBasicUsersFile is missing or not found: $AuthBasicUsersFile" 'ERROR'
+            Write-DashLog "Create users via:  .\Start-DefenderDashboard.ps1 -AddBasicUser <username>" 'ERROR'
+            exit 1
+        }
+        $userCount = (Read-DashboardUsersFile -Path $AuthBasicUsersFile).Count
+        if ($userCount -eq 0) {
+            Write-DashLog "AuthMethod=Basic but AuthBasicUsersFile contains no users: $AuthBasicUsersFile" 'ERROR'
+            Write-DashLog "Add at least one user via:  .\Start-DefenderDashboard.ps1 -AddBasicUser <username>" 'ERROR'
+            exit 1
+        }
+        Write-DashLog "Basic auth: $userCount user(s) loaded from $AuthBasicUsersFile" 'INFO'
+    }
+    'Token' {
+        if (-not $AuthToken) {
+            $tokenFile = Join-Path $ScriptDir 'conf\dashboard.token'
+            if (Test-Path -LiteralPath $tokenFile) {
+                $AuthToken = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+                Write-DashLog "Loaded existing dashboard token from $tokenFile" 'INFO'
+            } else {
+                $AuthToken = New-RandomToken -ByteLength 32
+                try {
+                    $AuthToken | Out-File -LiteralPath $tokenFile -Encoding ASCII -NoNewline
+                    # Tighten ACL: disable inheritance, allow only the current
+                    # identity (which is the scheduled-task service account
+                    # when run as a service). Falls back to file-system default
+                    # if any of these calls fail.
+                    try {
+                        $acl = Get-Acl -LiteralPath $tokenFile
+                        $acl.SetAccessRuleProtection($true, $false)
+                        # Remove all inherited / pre-existing rules
+                        @($acl.Access) | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+                        $identity = "$env:USERDOMAIN\$env:USERNAME"
+                        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                            $identity, 'FullControl', 'Allow')
+                        $acl.AddAccessRule($rule)
+                        Set-Acl -LiteralPath $tokenFile -AclObject $acl
+                    } catch {
+                        Write-DashLog "Could not tighten ACL on $tokenFile : $($_.Exception.Message). Falling back to default file permissions." 'WARN'
+                    }
+                    Write-DashLog "Generated new dashboard token and wrote to $tokenFile (restricted to $env:USERDOMAIN\$env:USERNAME)" 'SUCCESS'
+                } catch {
+                    Write-DashLog "Could not write token file $tokenFile : $($_.Exception.Message). Using in-memory token only (will regenerate on restart)." 'WARN'
+                }
+            }
+        }
+    }
+    'ADIntegrated' {
+        # Informational: NTLM still works for local-machine accounts on
+        # workgroup hosts, so this is a warn-don't-block check.
+        try {
+            $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+            if (-not $cs.PartOfDomain) {
+                Write-DashLog "AuthMethod=ADIntegrated on a non-domain-joined host. Only local-machine accounts can authenticate (e.g. AuthAllowedGroups = 'BUILTIN\Administrators')." 'WARN'
+            }
+        } catch {
+            Write-DashLog "Could not determine domain membership ($($_.Exception.Message)). ADIntegrated may not work as expected." 'WARN'
+        }
+        # Resolve allow-list to SIDs once at startup. Per-request membership
+        # checks then avoid any AD round-trip.
+        $script:AdGroupResolution = Resolve-DashboardAllowedGroups -AllowList $AuthAllowedGroups
+        foreach ($u in $script:AdGroupResolution.Unresolved) {
+            Write-DashLog "AuthAllowedGroups: entry '$u' could not be resolved to an SID and will be ignored." 'WARN'
+        }
+        if ($script:AdGroupResolution.AllowSids.Count -eq 0 -and
+            $script:AdGroupResolution.DenySids.Count  -eq 0) {
+            Write-DashLog "ADIntegrated auth: no allow/deny groups configured. Any authenticated user will be permitted." 'INFO'
+        } else {
+            Write-DashLog "ADIntegrated auth: $($script:AdGroupResolution.AllowSids.Count) allow group(s), $($script:AdGroupResolution.DenySids.Count) deny group(s) loaded." 'INFO'
+        }
+    }
+    'None' {
+        Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
+    }
+}
+
+# ===================================================================
+# HTTPS validation (after auth so auth errors surface first).
+# Resolves the cert thumbprint, warns on imminent expiry, and emits
+# EventId 103 if the event source is registered.
+# ===================================================================
+$dashboardCert = $null
+if ($UseHttps) {
+    try {
+        $dashboardCert = Resolve-DashboardCertificate -Thumbprint $CertificateThumbprint
+        Write-DashLog "Certificate    : $($dashboardCert.Subject)" 'INFO'
+        Write-DashLog "Cert expires   : $($dashboardCert.NotAfter.ToString('yyyy-MM-dd')) ($($dashboardCert.DaysUntilExpiry) day(s) from now)" 'INFO'
+    } catch {
+        Write-DashLog $_.Exception.Message 'ERROR'
+        exit 1
+    }
+    if ($dashboardCert.DaysUntilExpiry -lt 30) {
+        $expiryMsg = "Dashboard TLS certificate $($dashboardCert.Thumbprint) expires in $($dashboardCert.DaysUntilExpiry) day(s) (on $($dashboardCert.NotAfter.ToString('yyyy-MM-dd'))). " +
+                     "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate, or replace with a PKI-issued cert."
+        Write-DashLog $expiryMsg 'WARN'
+        try {
+            if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
+                Write-EventLog -LogName Application -Source 'Manage-DefenderOffline' `
+                    -EventId 103 -EntryType Warning -Message $expiryMsg
+                Write-DashLog 'Warning written to Windows Event Log (EventId 103).' 'WARN'
+            }
+        } catch {
+            Write-DashLog "Could not write EventId 103 to Windows Event Log: $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
 
 $TargetComputers = @(Resolve-TargetComputers)
 if ($ExcludeList.Count -gt 0) {
@@ -919,25 +1686,112 @@ if ($AvailableVersionStr) {
     Write-DashLog 'No SourceSharePath provided; version currency check disabled.' 'WARN'
 }
 
-# Resolve port (check availability, fall back if needed)
-$portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
-if ($portResult.IsFallback) {
-    Write-DashLog "Port $($portResult.PrimaryPort) is in use. Binding to fallback port $($portResult.Port) instead." 'WARN'
+# Resolve port. HTTPS does NOT use fallback because netsh sslcert binds the
+# cert to a specific ipport — if the dashboard fell back to a different port,
+# the cert wouldn't be bound there and the listener would fail to start.
+# HTTP mode keeps the existing fallback behavior.
+if ($UseHttps) {
+    if (-not (Test-PortFree $Port)) {
+        Write-DashLog "Port $Port is in use and HTTPS does not support fallback (the TLS certificate is bound to a specific port via netsh)." 'ERROR'
+        Write-DashLog "Stop the conflicting process or change Port in config.conf, then re-run the installer with -RenewCertificate to rebind." 'ERROR'
+        exit 1
+    }
+    $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
+} else {
+    $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
+    if ($portResult.IsFallback) {
+        Write-DashLog "Port $($portResult.PrimaryPort) is in use. Binding to fallback port $($portResult.Port) instead." 'WARN'
+    }
+    $Port = $portResult.Port
 }
-$Port = $portResult.Port
 
-# Start HTTP listener
+# Start primary listener (HTTP or HTTPS depending on -UseHttps)
+$scheme   = if ($UseHttps) { 'https' } else { 'http' }
 $listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add("http://+:$Port/")
+$listener.Prefixes.Add("${scheme}://+:$Port/")
+
+# For ADIntegrated, let HttpListener handle the multi-roundtrip Negotiate
+# protocol (we can't reproduce NTLM/Kerberos ourselves). The selector
+# delegate is consulted per request so /health stays anonymous.
+#
+# We use an Add-Type C# static method (not a PowerShell scriptblock) as
+# the delegate target because HttpListener invokes the selector from a
+# thread-pool thread that has no PowerShell Runspace — a scriptblock
+# bound there throws "no Runspace available", which HttpListener surfaces
+# to the caller as HTTP 500 before any of our user-space code runs.
+if ($AuthMethod -eq 'ADIntegrated') {
+    if (-not ('DashboardAuthSelector' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net;
+public static class DashboardAuthSelector {
+    public static AuthenticationSchemes Decide(HttpListenerRequest req) {
+        if (req != null && req.Url != null && req.Url.LocalPath == "/health") {
+            return AuthenticationSchemes.Anonymous;
+        }
+        return AuthenticationSchemes.Negotiate;
+    }
+}
+'@
+    }
+    $listener.AuthenticationSchemeSelectorDelegate = [System.Delegate]::CreateDelegate(
+        [System.Net.AuthenticationSchemeSelector],
+        [DashboardAuthSelector],
+        'Decide')
+    Write-DashLog 'HttpListener configured for Negotiate authentication (anonymous for /health).' 'INFO'
+}
+
 try {
     $listener.Start()
 } catch {
-    Write-DashLog "Failed to bind to port $Port : $($_.Exception.Message)" 'ERROR'
-    Write-DashLog 'Ensure no other process owns this port and that the account has permission to register HTTP prefixes.' 'ERROR'
+    Write-DashLog "Failed to bind to port $Port (${scheme}): $($_.Exception.Message)" 'ERROR'
+    if ($UseHttps) {
+        Write-DashLog "For HTTPS, the cert must also be bound to the port via:  netsh http add sslcert ipport=0.0.0.0:$Port certhash=$($dashboardCert.Thumbprint) appid={GUID}" 'ERROR'
+        Write-DashLog 'The installer (Install-DefenderDashboard.ps1 -UseHttps) handles this binding automatically.' 'ERROR'
+    } else {
+        Write-DashLog 'Ensure no other process owns this port and that the account has permission to register HTTP prefixes.' 'ERROR'
+    }
     exit 1
 }
-Write-DashLog "HTTP listener started on http://+:$Port/" 'SUCCESS'
-Write-DashLog "Browse to: http://localhost:$Port/defender" 'INFO'
+Write-DashLog "$($scheme.ToUpper()) listener started on ${scheme}://+:$Port/" 'SUCCESS'
+Write-DashLog "Browse to: ${scheme}://localhost:$Port/defender" 'INFO'
+
+# Optional HTTP-to-HTTPS redirect listener. Spun up in a thread job so it
+# runs alongside the main listener; cleaned up in the main finally block.
+$redirectListener = $null
+$redirectJob      = $null
+if ($UseHttps -and $RedirectHttpToHttps) {
+    if ($RedirectHttpPort -eq $Port) {
+        Write-DashLog "RedirectHttpPort ($RedirectHttpPort) collides with HTTPS Port ($Port). Skipping HTTP redirect listener." 'WARN'
+    } else {
+        try {
+            $redirectListener = [System.Net.HttpListener]::new()
+            $redirectListener.Prefixes.Add("http://+:$RedirectHttpPort/")
+            $redirectListener.Start()
+            $redirectJob = Start-ThreadJob -Name 'HttpsRedirect' -ScriptBlock {
+                param($listener, $httpsPort)
+                while ($listener.IsListening) {
+                    try {
+                        $ctx = $listener.GetContext()
+                    } catch {
+                        break  # listener stopped during shutdown
+                    }
+                    try {
+                        $httpsUrl = "https://$($ctx.Request.Url.Host):$httpsPort$($ctx.Request.Url.PathAndQuery)"
+                        $ctx.Response.StatusCode      = 301
+                        $ctx.Response.RedirectLocation = $httpsUrl
+                    } catch {} finally {
+                        try { $ctx.Response.Close() } catch {}
+                    }
+                }
+            } -ArgumentList $redirectListener, $Port
+            Write-DashLog "HTTP redirect listener started on http://+:$RedirectHttpPort/ (301 -> https://+:$Port/)" 'SUCCESS'
+        } catch {
+            Write-DashLog "Could not start HTTP redirect listener on port $RedirectHttpPort : $($_.Exception.Message)" 'WARN'
+            $redirectListener = $null
+            $redirectJob      = $null
+        }
+    }
+}
 
 # Write runtime status file so the installer and administrators can
 # discover the actual bound port without reading through the log.
@@ -993,35 +1847,6 @@ $script:IsRefreshing   = $false
 $script:RefreshJob     = $null
 $FunctionDef           = ${function:Get-DefenderStatus}.ToString()
 
-function Start-BackgroundRefresh {
-    if ($script:IsRefreshing) { return }
-    $script:IsRefreshing = $true
-    Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
-
-    $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
-        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6
-}
-
-function Receive-RefreshIfDone {
-    if (-not $script:RefreshJob) { return }
-    if ($script:RefreshJob.State -notin 'Running','NotStarted') {
-        $newData = Receive-Job $script:RefreshJob -ErrorAction SilentlyContinue
-        Remove-Job $script:RefreshJob -Force
-        $script:RefreshJob   = $null
-        $script:IsRefreshing = $false
-
-        if ($newData) {
-            $script:CachedResults = if ($newData -is [array]) { [System.Collections.Generic.List[pscustomobject]]$newData } else { $newData }
-            $script:CachedAt      = Get-Date
-            $onlineCount  = @($script:CachedResults | Where-Object Online).Count
-            $outdatedCount = @($script:CachedResults | Where-Object VersionStatus -eq 'Outdated').Count
-            Write-DashLog "Refresh complete: $($script:CachedResults.Count) computers | $onlineCount online | $outdatedCount outdated" 'SUCCESS'
-        } else {
-            Write-DashLog 'Refresh job returned no data.' 'WARN'
-        }
-    }
-}
-
 # Do an initial synchronous refresh so the first visitor sees real data
 Write-DashLog 'Performing initial data collection…' 'INFO'
 $initResults = Invoke-FleetRefresh `
@@ -1031,7 +1856,8 @@ $initResults = Invoke-FleetRefresh `
     -TSeconds            $TimeoutSeconds `
     -FunctionDef         $FunctionDef `
     -WinRmCredential     $Credential `
-    -DisableIPv6         $DisableIPv6
+    -DisableIPv6         $DisableIPv6 `
+    -LibPath             $LibInvokeDefenderRemote
 
 $script:CachedResults = $initResults
 $script:CachedAt      = Get-Date
@@ -1075,6 +1901,46 @@ try {
         $context    = $listener.EndGetContext($pendingCtx)
         $pendingCtx = $null
         $path       = $context.Request.Url.AbsolutePath.TrimEnd('/')
+
+        # ----- Authorization check (before any work) -----
+        $authResult = Test-DashboardAuth `
+            -Context           $context `
+            -Method            $AuthMethod `
+            -Token             $AuthToken `
+            -AllowedGroupSids  $script:AdGroupResolution `
+            -UsersFile         $AuthBasicUsersFile
+
+        # Audit fields. Source IP is captured per-request from the HttpListener
+        # context; user identity comes from Test-DashboardAuth (already populated
+        # for all modes — username for Basic, 'token-bearer' for Token, the
+        # WindowsIdentity Name for ADIntegrated, 'anonymous' for None).
+        $auditUser = if ($authResult.User) { $authResult.User } else { 'anonymous' }
+        $auditFrom = 'unknown'
+        try {
+            if ($context.Request.RemoteEndPoint) {
+                $auditFrom = $context.Request.RemoteEndPoint.Address.ToString()
+            }
+        } catch {}
+
+        if (-not $authResult.Authorized) {
+            $context.Response.StatusCode = $authResult.StatusCode
+            if ($authResult.StatusCode -eq 401 -and $AuthMethod -eq 'Basic') {
+                $context.Response.Headers.Add('WWW-Authenticate', 'Basic realm="Defender Dashboard"')
+            }
+            try { $context.Response.OutputStream.Close() } catch {}
+            try { $context.Response.Close() } catch {}
+            # WARN so audit reviewers / SIEM filters can isolate denials at level.
+            Write-DashLog "Denied $path by '$auditUser' from $auditFrom ($($authResult.Reason); HTTP $($authResult.StatusCode))" 'WARN'
+            continue
+        }
+
+        # Successful auth for human-facing paths: log who accessed what, from
+        # where (NIST 800-53 AU-2 / STIG AC-7 auditable events). /health and
+        # /status are excluded because they're polled by monitors and dashboard
+        # auto-refresh, which would flood the log without adding audit value.
+        if ($path -notin '/health', '/status' -and $authResult.Reason -ne 'health-bypass') {
+            Write-DashLog "Authorized $path by '$auditUser' from $auditFrom ($($authResult.Reason))" 'INFO'
+        }
 
         switch ($path) {
             '/defender' {
@@ -1121,6 +1987,14 @@ try {
     Write-DashLog 'Stopping listener…' 'WARN'
     $listener.Stop()
     $listener.Close()
+    if ($redirectListener) {
+        try { $redirectListener.Stop()  } catch {}
+        try { $redirectListener.Close() } catch {}
+    }
+    if ($redirectJob) {
+        Stop-Job   $redirectJob -ErrorAction SilentlyContinue
+        Remove-Job $redirectJob -Force -ErrorAction SilentlyContinue
+    }
     if ($script:RefreshJob) {
         Stop-Job $script:RefreshJob -Force -ErrorAction SilentlyContinue
         Remove-Job $script:RefreshJob -Force -ErrorAction SilentlyContinue
