@@ -1498,15 +1498,18 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     $script:SuppressConsoleOutput = $true
     $savedWarningPref = $WarningPreference
     $WarningPreference = 'SilentlyContinue'
-    $DashTimer  = [System.Diagnostics.Stopwatch]::StartNew()
-    $DashAnchor = $null
+    $DashTimer    = [System.Diagnostics.Stopwatch]::StartNew()
+    $DashAnchor   = $null
+    $FirstDashTick = $true
 
     while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
-        # Dashboard refresh every 5 seconds
+        # Dashboard refresh: print immediately on first iteration so the
+        # operator gets visible feedback, then every 5 seconds after.
         if (-not $DashAnchor) { $DashAnchor = $Host.UI.RawUI.CursorPosition }
 
-        if ($DashTimer.Elapsed.TotalSeconds -ge 5) {
+        if ($FirstDashTick -or $DashTimer.Elapsed.TotalSeconds -ge 5) {
+            $FirstDashTick = $false
             $DashTimer.Restart()
             $Host.UI.RawUI.CursorPosition = $DashAnchor
 
@@ -1674,7 +1677,22 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     if ($wave.IsGate) {
         if ($HealthSettleSeconds -gt 0) {
             Write-Log ("Health settle: pausing {0}s for canary status to stabilize..." -f $HealthSettleSeconds) 'INFO'
-            Start-Sleep -Seconds $HealthSettleSeconds
+            # Heartbeat the settle pause so the operator can see the script
+            # is alive while waiting. Tick every 5s (or 1s for the last 10s)
+            # to give a tighter countdown near the end. Pure UX — does not
+            # affect gate evaluation.
+            $settleEnd = (Get-Date).AddSeconds($HealthSettleSeconds)
+            while ($true) {
+                $remaining = [int][math]::Ceiling(($settleEnd - (Get-Date)).TotalSeconds)
+                if ($remaining -le 0) { break }
+                $tick = if ($remaining -le 10) { 1 } else { 5 }
+                $step = [math]::Min($tick, $remaining)
+                Start-Sleep -Seconds $step
+                $remaining = [int][math]::Ceiling(($settleEnd - (Get-Date)).TotalSeconds)
+                if ($remaining -gt 0) {
+                    Write-Host ("  ...settling ({0}s remaining)" -f $remaining) -ForegroundColor DarkGray
+                }
+            }
         }
         $gate = Test-CanaryGate -WaveResults $waveRows -MaxFailures $MaxCanaryFailures
         Write-Log ("Canary gate : Healthy={0}, Degraded={1}, ProbeFailed={2}, ThreatsDetected={3}, InstallFailed={4} (threshold {5})" `
