@@ -941,6 +941,18 @@ function Invoke-DefenderUpdate {
                         $result.Status     = 'No Update Needed'
                         $result.NewVersion = $currentVerStr
                         $result.Details    = "Already at v$currentVerStr ($hostArch available: v$AvailableVersionStr)"
+                        # Probe before returning — session is still active, host
+                        # is in a deterministic state (no install attempted, so
+                        # the probe captures the steady-state health).
+                        try {
+                            $probe = Get-DefenderHealthProbe -Session $session
+                            $result.HealthStatus      = $probe.OverallStatus
+                            $result.HealthReason      = if ($probe.StatusReason) { $probe.StatusReason } else { '' }
+                            $result.RecentThreatCount = $probe.RecentThreatCount
+                        } catch {
+                            $result.HealthStatus = 'ProbeFailed'
+                            $result.HealthReason = ($_.Exception.Message -replace "`r`n", ' ').Trim()
+                        }
                         return $result
                     }
                 } catch {
