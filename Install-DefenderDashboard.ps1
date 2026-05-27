@@ -184,7 +184,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.9'
+$ScriptVersion = '0.0.10'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Shared helper modules (dot-sourced; same chokepoint pattern as the other scripts).

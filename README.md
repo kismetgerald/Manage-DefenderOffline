@@ -697,7 +697,42 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.9 (2026-05-26) — Current
+### v0.0.10 (2026-05-27) — Current
+
+Health-probe + drill-down family across all three consumer scripts, plus opt-in staged rollout for `Update-DefenderOffline`. Three sub-PRs landed on `feat/v0.0.10` and merged together.
+
+**Post-update health probe (`Update-DefenderOffline.ps1`, shared `lib/Get-DefenderHealthProbe.ps1`):**
+- ✨ After every install (and every No-Update-Needed pass), the script runs `Get-DefenderHealthProbe` over the same WinRM session to classify the host as **Healthy / Degraded / ThreatsDetected / ProbeFailed**
+- ✨ Pure classifier `Get-DefenderHealthClassification` is the single source of truth shared by all three consumer scripts
+- ✨ Six protection toggles checked: RealTimeProtectionEnabled, AMServiceEnabled, AntivirusEnabled, BehaviorMonitorEnabled, IoavProtectionEnabled, OnAccessProtectionEnabled (any disabled → Degraded)
+- ✨ Recent-threat window (`-ThreatWindowHours`, default 24h) and spike threshold (`-ThreatSpikeThreshold`, default 1) — Degraded wins over ThreatsDetected when both apply
+- ✨ HTML report gains `Health` and `Threats(24h)` columns with colored badges (`.h-healthy` green, `.h-degraded` amber, `.h-threats` red `#d13438`, `.h-probefail` grey `#4b5563`)
+- ✨ +18 Pester tests covering classifier + probe paths
+
+**Drill-down modal in interactive monitor (`Show-DefenderStatus.ps1`):**
+- ✨ Right-click any row (or double-click) opens a **Host Details** dialog with Identity, Health Classification pill, all six Defender toggles bool-colored, scan timestamps, threats grid (cross-referenced `Get-MpThreatDetection` + `Get-MpThreat` catalog), and error detail
+- ✨ Color palette refined: `ThreatsDetected = red`, `Offline = dark grey` (`#4b5563`) — Offline no longer steals the red palette from real incidents
+
+**Drill-down modal on the headless dashboard (`Start-DefenderDashboard.ps1`):**
+- ✨ Click any row on `/defender` to open the same Host Details view (vanilla HTML/CSS/JS — no framework)
+- ✨ Per-host data embedded in `<script type="application/json">` (XSS-escaped) — instant modal lookup with no extra HTTP request
+- ✨ Status badge palette mirrors `Show-DefenderStatus`: `b-thr` red for ThreatsDetected, `b-off` grey for Offline
+- ✨ CSS hardening for long PUA resource strings: `table-layout: fixed` + per-column widths + `.r-wrap` div with `max-height: 8em` and internal scroll — modals stay bounded even on hosts with dozens of joined paths
+
+**Staged rollout (`Update-DefenderOffline.ps1`, `lib/Test-CanaryGate.ps1`):**
+- ✨ **`-CanaryComputers`** — explicit subset of the fleet to run first as a *Canary* wave (no count/percent shortcuts; explicit list only)
+- ✨ **`-MaxCanaryFailures`** (default `0`) — number of canary `Degraded + ProbeFailed` failures tolerated before the *Production* wave halts
+- ✨ **`-HealthSettleSeconds`** (default `60`) — pause after the canary wave finishes before the gate is evaluated
+- ✨ Gate is health-only by design: install Failed rows + ThreatsDetected don't count (install is retried 3×; threats pre-existed)
+- ✨ On halt, remaining-wave hosts recorded as `Status='Skipped'` with the gate-halt reason in Details; HTML report gains a purple `Gate Halt` stat card and a `Skipped (gate)` pill
+- ✨ Result rows + console final-table + HTML report gain a `Wave` column **only when staging was used** (zero diff when the param is empty)
+- ✨ Visible heartbeat during the settle pause (5s ticks; 1s in the final 10s) plus immediate first dashboard tick so short canary waves show progress
+- ✨ +8 Pester tests for `Test-CanaryGate` (gate pass/fail, threshold edges, what does-not-count rules)
+
+**Test infrastructure:**
+- ✨ Suite now at **242 tests** (229 active + 13 skipped placeholders) — up from 216 in v0.0.9
+
+### v0.0.9 (2026-05-26)
 
 `Get-DefenderDefinitions.ps1` polish — bandwidth-friendly re-runs, explicit proxy support, and the helper's first unit-test surface. No new operator-facing scripts; all three changes target the internet-side staging workflow introduced in v0.0.8.
 
