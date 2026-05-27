@@ -4,18 +4,20 @@
     Justification = 'Pester test scopes share state via $script:')]
 param()
 <#
-Tests for lib/Test-UrlAclCollision.ps1 — added in v0.0.12 to diagnose
-HTTP redirect-listener bind failures caused by pre-existing URL-ACL
-reservations. Parser is exercised with synthetic netsh output (no
-actual netsh shell-out).
+Tests for lib/Test-UrlAclCollision.ps1 — diagnoses HTTP redirect-listener
+bind failures caused by URL-ACL reservations. Helper queries
+`netsh http show urlacl` (no URL filter) and finds any reservation
+whose prefix targets the requested port — covering the case where the
+operator's bind prefix doesn't exactly match an existing reservation
+shape (e.g. `http://+:8080/` vs `http://*:8080/`).
 #>
 
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent $PSScriptRoot
     . (Join-Path $script:RepoRoot 'lib\Test-UrlAclCollision.ps1')
 
-    # Single-owner reservation (typical case — one process registered the URL ACL).
-    $script:NetshSingleOwner = @(
+    # Single reservation on the requested port — most common case.
+    $script:NetshSingleReservation = @(
         ''
         'URL Reservations:'
         '-----------------'
@@ -28,121 +30,196 @@ BeforeAll {
         ''
     )
 
-    # Two-owner reservation (rare — multiple SIDs in the SDDL).
-    $script:NetshMultiOwner = @(
+    # Multiple reservations across different ports — only one matches 8080.
+    # This is what `netsh http show urlacl` (no filter) typically returns on a
+    # real machine.
+    $script:NetshMultiReservations = @(
         ''
-        '    Reserved URL            : http://+:8080/'
+        'URL Reservations:'
+        '-----------------'
+        ''
+        '    Reserved URL            : http://+:80/Temporary_Listen_Addresses/'
+        '        User: \LocalSystem'
+        '            Listen: Yes'
+        '            Delegate: No'
+        '            SDDL: D:(A;;GX;;;LS)'
+        ''
+        '    Reserved URL            : http://*:8080/legacy-app/'
+        '        User: BUILTIN\Users'
+        '            Listen: Yes'
+        '            Delegate: No'
+        '            SDDL: D:(A;;GA;;;BU)'
+        ''
+        '    Reserved URL            : https://+:8443/api/'
         '        User: BUILTIN\Administrators'
         '            Listen: Yes'
         '            Delegate: No'
+        '            SDDL: D:(A;;GA;;;BA)'
+        ''
+    )
+
+    # Multiple reservations all on the same port — the exact case where
+    # HttpListener's port-level conflict detection bites operators.
+    $script:NetshSamePortDifferentPrefixes = @(
+        ''
+        '    Reserved URL            : http://*:8080/'
+        '        User: BUILTIN\Users'
+        '            Listen: Yes'
+        '            Delegate: No'
+        ''
+        '    Reserved URL            : http://hostname.example.com:8080/api/'
         '        User: NT AUTHORITY\NetworkService'
         '            Listen: Yes'
         '            Delegate: No'
-        '        SDDL: D:(A;;GX;;;BA)(A;;GX;;;NS)'
         ''
     )
 
-    # No matching reservation — netsh returns a friendly "not found" message.
-    $script:NetshNoReservation = @(
+    # No reservations at all (empty machine state).
+    $script:NetshEmpty = @(
         ''
-        'The system cannot find the file specified.'
+        'URL Reservations:'
+        '-----------------'
         ''
     )
 
-    # SDDL-only output with no parseable User line. Should yield no owners.
+    # SDDL-only block (no parseable User: line). We still record the URL but
+    # the Owners list is empty.
     $script:NetshSddlOnly = @(
         ''
-        '    Reserved URL            : http://+:9999/'
+        '    Reserved URL            : http://+:8080/'
         '        SDDL: D:(A;;GX;;;LS)'
         ''
     )
 }
 
-Describe 'Get-NetshUrlAclOwners' {
+Describe 'Get-NetshUrlAclReservations' {
 
-    It 'extracts a single owner from typical netsh output' {
-        $owners = Get-NetshUrlAclOwners -NetshOutput $script:NetshSingleOwner
-        $owners | Should -HaveCount 1
-        $owners[0] | Should -Be 'NT AUTHORITY\NetworkService'
+    It 'parses a single reservation block' {
+        $r = Get-NetshUrlAclReservations -NetshOutput $script:NetshSingleReservation
+        $r | Should -HaveCount 1
+        $r[0].Url       | Should -Be 'http://+:8080/'
+        $r[0].Owners    | Should -HaveCount 1
+        $r[0].Owners[0] | Should -Be 'NT AUTHORITY\NetworkService'
     }
 
-    It 'extracts multiple owners and de-duplicates' {
-        $owners = Get-NetshUrlAclOwners -NetshOutput $script:NetshMultiOwner
-        $owners | Should -HaveCount 2
-        $owners | Should -Contain 'BUILTIN\Administrators'
-        $owners | Should -Contain 'NT AUTHORITY\NetworkService'
+    It 'parses multiple reservations on different ports' {
+        $r = Get-NetshUrlAclReservations -NetshOutput $script:NetshMultiReservations
+        $r | Should -HaveCount 3
+        $r[0].Url | Should -Be 'http://+:80/Temporary_Listen_Addresses/'
+        $r[1].Url | Should -Be 'http://*:8080/legacy-app/'
+        $r[2].Url | Should -Be 'https://+:8443/api/'
     }
 
-    It 'returns an empty array when no reservation exists' {
-        $owners = Get-NetshUrlAclOwners -NetshOutput $script:NetshNoReservation
-        $owners | Should -BeNullOrEmpty
+    It 'parses an SDDL-only block as a reservation with no owners' {
+        $r = Get-NetshUrlAclReservations -NetshOutput $script:NetshSddlOnly
+        $r | Should -HaveCount 1
+        $r[0].Url    | Should -Be 'http://+:8080/'
+        $r[0].Owners | Should -BeNullOrEmpty
     }
 
-    It 'returns an empty array when output is SDDL-only (no User: line)' {
-        $owners = Get-NetshUrlAclOwners -NetshOutput $script:NetshSddlOnly
-        $owners | Should -BeNullOrEmpty
+    It 'returns an empty array when there are no reservations' {
+        $r = Get-NetshUrlAclReservations -NetshOutput $script:NetshEmpty
+        $r.Count | Should -Be 0
     }
 
     It 'returns an empty array for null input' {
-        ,(Get-NetshUrlAclOwners -NetshOutput $null) | Should -BeOfType [string[]]
-        (Get-NetshUrlAclOwners -NetshOutput $null).Count | Should -Be 0
-    }
-
-    It 'returns an empty array for empty input' {
-        (Get-NetshUrlAclOwners -NetshOutput @()).Count | Should -Be 0
+        $r = Get-NetshUrlAclReservations -NetshOutput $null
+        $r.Count | Should -Be 0
     }
 }
 
 Describe 'Test-UrlAclCollision' {
 
     Context 'HasCollision = $true' {
-        It 'reports a single conflicting owner' {
-            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshSingleOwner
-            $r.HasCollision | Should -BeTrue
-            $r.Owners       | Should -HaveCount 1
-            $r.Owners[0]    | Should -Be 'NT AUTHORITY\NetworkService'
-            $r.Url          | Should -Be 'http://+:8080/'
-            $r.Scheme       | Should -Be 'http'
-            $r.Port         | Should -Be 8080
+
+        It 'finds a same-prefix reservation on the requested port' {
+            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshSingleReservation
+            $r.HasCollision        | Should -BeTrue
+            $r.Reservations        | Should -HaveCount 1
+            $r.Reservations[0].Url | Should -Be 'http://+:8080/'
+            $r.Owners              | Should -Contain 'NT AUTHORITY\NetworkService'
+            $r.Url                 | Should -Be 'http://+:8080/'
         }
 
-        It 'reports multiple conflicting owners' {
-            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshMultiOwner
-            $r.HasCollision | Should -BeTrue
-            $r.Owners       | Should -HaveCount 2
+        It 'finds a different-prefix reservation on the requested port' {
+            # The operator wants 'http://+:8080/' but the existing reservation
+            # is 'http://*:8080/legacy-app/'. Same port, different wildcard +
+            # different path — still a port-level conflict for HttpListener.
+            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshMultiReservations
+            $r.HasCollision         | Should -BeTrue
+            $r.Reservations         | Should -HaveCount 1
+            $r.Reservations[0].Url  | Should -Be 'http://*:8080/legacy-app/'
+            $r.Owners               | Should -Contain 'BUILTIN\Users'
+        }
+
+        It 'finds multiple conflicting reservations on the same port' {
+            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshSamePortDifferentPrefixes
+            $r.HasCollision         | Should -BeTrue
+            $r.Reservations         | Should -HaveCount 2
+            $r.Owners               | Should -Contain 'BUILTIN\Users'
+            $r.Owners               | Should -Contain 'NT AUTHORITY\NetworkService'
         }
     }
 
     Context 'HasCollision = $false' {
-        It 'reports no collision when netsh returns the not-found message' {
-            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshNoReservation
-            $r.HasCollision | Should -BeFalse
-            $r.Owners.Count | Should -Be 0
+
+        It 'reports no collision on a port with no reservations' {
+            $r = Test-UrlAclCollision -Port 9999 -NetshOutput $script:NetshMultiReservations
+            $r.HasCollision   | Should -BeFalse
+            $r.Reservations.Count | Should -Be 0
+            $r.Owners.Count       | Should -Be 0
         }
 
-        It 'reports no collision for SDDL-only output' {
-            $r = Test-UrlAclCollision -Port 9999 -NetshOutput $script:NetshSddlOnly
+        It 'reports no collision when input is empty' {
+            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshEmpty
             $r.HasCollision | Should -BeFalse
         }
-    }
 
-    Context 'Scheme handling' {
-        It 'builds the right URL for https' {
-            $r = Test-UrlAclCollision -Port 8443 -Scheme https -NetshOutput @()
-            $r.Url    | Should -Be 'https://+:8443/'
-            $r.Scheme | Should -Be 'https'
+        It 'does not false-positive on a port substring (8080 vs 18080)' {
+            $multiPortMix = @(
+                '    Reserved URL            : http://+:18080/'
+                '        User: BUILTIN\Users'
+                ''
+            )
+            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $multiPortMix
+            $r.HasCollision | Should -BeFalse
         }
     }
 
     Context 'Output shape' {
+
         It 'always emits the same property set' {
             $r = Test-UrlAclCollision -Port 8080 -NetshOutput @()
             $names = $r.PSObject.Properties.Name
             $names | Should -Contain 'HasCollision'
             $names | Should -Contain 'Owners'
+            $names | Should -Contain 'Reservations'
             $names | Should -Contain 'Url'
             $names | Should -Contain 'Port'
             $names | Should -Contain 'Scheme'
         }
+
+        It 'records SDDL-only conflicting reservations even without owners' {
+            $r = Test-UrlAclCollision -Port 8080 -NetshOutput $script:NetshSddlOnly
+            $r.HasCollision         | Should -BeTrue
+            $r.Reservations         | Should -HaveCount 1
+            $r.Reservations[0].Url  | Should -Be 'http://+:8080/'
+            $r.Owners.Count         | Should -Be 0
+        }
+    }
+}
+
+Describe 'Get-NetshUrlAclOwners (backward-compat wrapper)' {
+
+    It 'flattens owners across all reservations in the input' {
+        $owners = Get-NetshUrlAclOwners -NetshOutput $script:NetshMultiReservations
+        $owners | Should -HaveCount 3
+        $owners | Should -Contain '\LocalSystem'
+        $owners | Should -Contain 'BUILTIN\Users'
+        $owners | Should -Contain 'BUILTIN\Administrators'
+    }
+
+    It 'returns an empty array for null input' {
+        (Get-NetshUrlAclOwners -NetshOutput $null).Count | Should -Be 0
     }
 }

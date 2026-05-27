@@ -2180,20 +2180,25 @@ if ($UseHttps -and $RedirectHttpToHttps) {
             Write-DashLog "Could not start HTTP redirect listener on port $RedirectHttpPort : $errMsg" 'WARN'
 
             # When the failure is a URL-ACL reservation conflict (HttpListener's
-            # most common bind failure), surface the holding owner(s) and the
-            # corrective netsh command so the operator doesn't have to dig.
+            # most common bind failure), enumerate every URL-ACL on the same
+            # port and surface the holding prefix + owner so the operator
+            # doesn't have to dig. HttpListener detects conflicts by port,
+            # not by exact prefix, so we report any reservation whose URL
+            # targets the requested port — including different wildcards
+            # (+ vs *), different hostnames, or different path prefixes.
             if ($errMsg -match 'conflicts with an existing registration') {
                 $collision = Test-UrlAclCollision -Port $RedirectHttpPort -Scheme 'http'
                 if ($collision.HasCollision) {
-                    Write-DashLog "  URL-ACL collision: $($collision.Url) is reserved by:" 'WARN'
-                    foreach ($owner in $collision.Owners) {
-                        Write-DashLog "    - $owner" 'WARN'
+                    Write-DashLog "  URL-ACL collision: $($collision.Reservations.Count) reservation(s) found on port $RedirectHttpPort -" 'WARN'
+                    foreach ($r in $collision.Reservations) {
+                        $ownerList = if ($r.Owners.Count -gt 0) { $r.Owners -join ', ' } else { '(no explicit User; SDDL-only)' }
+                        Write-DashLog "    - $($r.Url)  [held by: $ownerList]" 'WARN'
                     }
-                    Write-DashLog "  To free the reservation so the redirect listener can bind, run as Administrator:" 'WARN'
-                    Write-DashLog "    netsh http delete urlacl url=$($collision.Url)" 'WARN'
+                    Write-DashLog "  To free a reservation so the redirect listener can bind, run as Administrator:" 'WARN'
+                    Write-DashLog "    netsh http delete urlacl url=<reserved-url-from-list-above>" 'WARN'
                     Write-DashLog "  Or pick a different port via 'RedirectHttpPort' in conf\config.conf." 'WARN'
                 } else {
-                    Write-DashLog "  URL-ACL diagnostic returned no owners. The conflict may be a different prefix on the same port, or another process binding the port directly." 'WARN'
+                    Write-DashLog "  URL-ACL diagnostic found no reservations on port $RedirectHttpPort. The conflict is likely another process binding the port directly (run 'Get-NetTCPConnection -LocalPort $RedirectHttpPort -State Listen' to identify it) or a stale HttpListener from this same process." 'WARN'
                 }
             }
 
