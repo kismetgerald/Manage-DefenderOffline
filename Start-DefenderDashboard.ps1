@@ -154,6 +154,8 @@ $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
 $LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
 . $LibGetDefenderComputers
+$LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.ps1'
+. $LibGetDefenderHealthProbe
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
 # ===================================================================
@@ -963,19 +965,27 @@ function Get-DefenderStatus {
     )
 
     $result = [pscustomobject]@{
-        ComputerName       = $Computer
-        Online             = $false
-        DefenderService    = 'Unknown'
-        SignatureVersion   = ''
-        AvailableVersion   = $AvailableVersionStr
-        VersionStatus      = 'Unknown'
-        RealTimeProtection = 'Unknown'
-        AntivirusEnabled   = 'Unknown'
-        LastQuickScan      = ''
-        LastFullScan       = ''
-        ThreatCount        = ''
-        QueryDuration      = 0
-        Error              = ''
+        ComputerName              = $Computer
+        Online                    = $false
+        DefenderService           = 'Unknown'
+        SignatureVersion          = ''
+        AvailableVersion          = $AvailableVersionStr
+        VersionStatus             = 'Unknown'
+        RealTimeProtection        = 'Unknown'
+        AntivirusEnabled          = 'Unknown'
+        # Full toggle set surfaced in the /defender drill-down modal (v0.0.10).
+        AmServiceEnabled          = 'Unknown'
+        BehaviorMonitorEnabled    = 'Unknown'
+        IoavProtectionEnabled     = 'Unknown'
+        OnAccessProtectionEnabled = 'Unknown'
+        LastQuickScan             = ''
+        LastFullScan              = ''
+        ThreatCount               = ''
+        ThreatList                = @()
+        HealthStatus              = ''
+        HealthReason              = ''
+        QueryDuration             = 0
+        Error                     = ''
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1013,27 +1023,82 @@ function Get-DefenderStatus {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
+                # Per-threat detail for the row-click modal. Get-MpThreat is
+                # the *catalog* of threat types ever seen — it doesn't reliably
+                # populate InitialDetectionTime / Resources for long-quarantined
+                # PUA items. Get-MpThreatDetection has the per-event timestamps
+                # and resource paths, so we cross-reference both: ThreatID -> Name
+                # from the catalog, plus the most recent detection event's time
+                # and resources from MpThreatDetection. One row per distinct
+                # ThreatID so ThreatCount matches the rendered grid.
+                $threats = @()
+                if ($mp) {
+                    $catalog = @{}
+                    foreach ($t in (Get-MpThreat -ErrorAction SilentlyContinue)) {
+                        $catalog[[int64]$t.ThreatID] = [string]$t.ThreatName
+                    }
+                    $detections = @(Get-MpThreatDetection -ErrorAction SilentlyContinue)
+                    $threats = @($detections | Group-Object ThreatID | ForEach-Object {
+                        $latest = $_.Group | Sort-Object InitialDetectionTime -Descending | Select-Object -First 1
+                        $id     = [int64]$_.Name
+                        [pscustomobject]@{
+                            ThreatName           = if ($catalog.ContainsKey($id)) { $catalog[$id] } else { "ThreatID $id" }
+                            ThreatID             = $id
+                            InitialDetectionTime = $latest.InitialDetectionTime
+                            Resources            = if ($latest.Resources) { [string]($latest.Resources -join '; ') } else { '' }
+                        }
+                    } | Sort-Object InitialDetectionTime -Descending)
+                }
                 [pscustomobject]@{
-                    SvcStatus          = $svc.Status
-                    SignatureVersion   = if ($mp) { $mp.AntivirusSignatureVersion }  else { $null }
-                    RealTimeProtection = if ($mp) { $mp.RealTimeProtectionEnabled } else { $null }
-                    AntivirusEnabled   = if ($mp) { $mp.AntivirusEnabled }          else { $null }
-                    LastQuickScan      = if ($mp) { $mp.QuickScanStartTime }        else { $null }
-                    LastFullScan       = if ($mp) { $mp.FullScanStartTime }         else { $null }
-                    ThreatCount        = if ($mp) {
-                        (Get-MpThreat -ErrorAction SilentlyContinue | Measure-Object).Count
-                    } else { $null }
+                    # Stringify the ServiceController.Status enum so the JSON
+                    # path renders 'Running' rather than '[object Object]'.
+                    SvcStatus            = if ($svc) { [string]$svc.Status } else { 'NotFound' }
+                    SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }  else { $null }
+                    RealTimeProtection   = if ($mp) { $mp.RealTimeProtectionEnabled } else { $null }
+                    AMServiceEnabled     = if ($mp) { $mp.AMServiceEnabled }           else { $null }
+                    AntivirusEnabled     = if ($mp) { $mp.AntivirusEnabled }          else { $null }
+                    BehaviorMonitor      = if ($mp) { $mp.BehaviorMonitorEnabled }     else { $null }
+                    IoavProtection       = if ($mp) { $mp.IoavProtectionEnabled }      else { $null }
+                    OnAccessProtection   = if ($mp) { $mp.OnAccessProtectionEnabled }  else { $null }
+                    LastQuickScan        = if ($mp) { $mp.QuickScanStartTime }        else { $null }
+                    LastFullScan         = if ($mp) { $mp.FullScanStartTime }         else { $null }
+                    ThreatCount          = $threats.Count
+                    ThreatList           = $threats
                 }
             }
 
-            $result.Online             = $true
-            $result.DefenderService    = $data.SvcStatus
-            $result.SignatureVersion   = $data.SignatureVersion
-            $result.RealTimeProtection = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
-            $result.AntivirusEnabled   = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
-            $result.LastQuickScan      = if ($data.LastQuickScan) { $data.LastQuickScan.ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
-            $result.LastFullScan       = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
-            $result.ThreatCount        = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
+            $result.Online                    = $true
+            $result.DefenderService           = $data.SvcStatus
+            $result.SignatureVersion          = $data.SignatureVersion
+            $result.RealTimeProtection        = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
+            $result.AntivirusEnabled          = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
+            $result.AmServiceEnabled          = if ($null -ne $data.AMServiceEnabled)   { $data.AMServiceEnabled.ToString() }   else { 'Unknown' }
+            $result.BehaviorMonitorEnabled    = if ($null -ne $data.BehaviorMonitor)    { $data.BehaviorMonitor.ToString() }    else { 'Unknown' }
+            $result.IoavProtectionEnabled     = if ($null -ne $data.IoavProtection)     { $data.IoavProtection.ToString() }     else { 'Unknown' }
+            $result.OnAccessProtectionEnabled = if ($null -ne $data.OnAccessProtection) { $data.OnAccessProtection.ToString() } else { 'Unknown' }
+            $result.LastQuickScan             = if ($data.LastQuickScan) { $data.LastQuickScan.ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
+            $result.LastFullScan              = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
+            $result.ThreatCount               = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
+            $result.ThreatList                = @($data.ThreatList)
+
+            # Health classification — see lib/Get-DefenderHealthProbe.ps1.
+            if ($null -ne $data.RealTimeProtection -and
+                $null -ne $data.AMServiceEnabled  -and
+                $null -ne $data.AntivirusEnabled  -and
+                $null -ne $data.BehaviorMonitor   -and
+                $null -ne $data.IoavProtection    -and
+                $null -ne $data.OnAccessProtection) {
+                $cls = Get-DefenderHealthClassification `
+                    -RealTimeProtectionEnabled  ([bool]$data.RealTimeProtection) `
+                    -AntimalwareServiceEnabled  ([bool]$data.AMServiceEnabled)   `
+                    -AntivirusEnabled           ([bool]$data.AntivirusEnabled)   `
+                    -BehaviorMonitorEnabled     ([bool]$data.BehaviorMonitor)    `
+                    -IoavProtectionEnabled      ([bool]$data.IoavProtection)     `
+                    -OnAccessProtectionEnabled  ([bool]$data.OnAccessProtection) `
+                    -RecentThreatCount          ([int]($data.ThreatCount ?? 0))
+                $result.HealthStatus = $cls.OverallStatus
+                $result.HealthReason = if ($cls.StatusReason) { $cls.StatusReason } else { '' }
+            }
 
             if ($result.SignatureVersion -and $AvailableVersionStr) {
                 try {
@@ -1070,14 +1135,15 @@ function Invoke-FleetRefresh {
         [string]$FunctionDef,    # Get-DefenderStatus serialised as a string
         [System.Management.Automation.PSCredential]$WinRmCredential,
         [bool]$DisableIPv6 = $true,
-        [string]$LibPath         # Path to lib/Invoke-DefenderRemote.ps1 (passed through
-                                 # to child runspaces so wrapper functions are available)
+        [string[]]$LibPaths      # Paths to lib/*.ps1 helpers — passed through
+                                 # to child runspaces so wrapper functions and
+                                 # the shared health classifier are available.
     )
 
-    # Dot-source the wrapper in this runspace (Invoke-FleetRefresh runs inside
+    # Dot-source the wrappers in this runspace (Invoke-FleetRefresh runs inside
     # a Start-ThreadJob from Start-BackgroundRefresh, so the parent's lib
     # dot-source isn't visible here).
-    if ($LibPath) { . $LibPath }
+    foreach ($lib in $LibPaths) { if ($lib) { . $lib } }
     ${function:Get-DefenderStatus} = [scriptblock]::Create($FunctionDef)
 
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -1085,8 +1151,8 @@ function Invoke-FleetRefresh {
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $Computers | ForEach-Object -Parallel {
             $comp = [string]$_
-            # Each parallel runspace is also isolated; re-import the wrapper.
-            if ($using:LibPath) { . $using:LibPath }
+            # Each parallel runspace is also isolated; re-import the wrappers.
+            foreach ($lib in $using:LibPaths) { if ($lib) { . $lib } }
             ${function:Get-DefenderStatus} = [scriptblock]::Create($using:FunctionDef)
             $cred = $using:WinRmCredential
             Get-DefenderStatus -Computer $comp `
@@ -1134,15 +1200,21 @@ function Build-DashboardHtml {
     $metaRefreshSecs = [math]::Max(5, $secsUntil + 5)
 
     $rows = foreach ($r in $Data | Sort-Object ComputerName) {
+        # Same priority order as Show-DefenderStatus:
+        #   Offline   -> no comms
+        #   Outdated  -> reachable but signature is behind
+        #   else      -> defer to shared health classifier; fall back to legacy
         $status = if (-not $r.Online) { 'Offline' }
                   elseif ($r.VersionStatus -eq 'Outdated') { 'Outdated' }
+                  elseif ($r.HealthStatus) { $r.HealthStatus }
                   elseif ($r.RealTimeProtection -eq 'False' -or $r.AntivirusEnabled -eq 'False') { 'Degraded' }
                   else { 'Healthy' }
         $badge  = switch ($status) {
-            'Offline'  { '<span class="badge b-off">Offline</span>' }
-            'Outdated' { '<span class="badge b-out">Outdated</span>' }
-            'Degraded' { '<span class="badge b-deg">Degraded</span>' }
-            default    { '<span class="badge b-ok">Healthy</span>' }
+            'Offline'         { '<span class="badge b-off">Offline</span>' }
+            'Outdated'        { '<span class="badge b-out">Outdated</span>' }
+            'Degraded'        { '<span class="badge b-deg">Degraded</span>' }
+            'ThreatsDetected' { '<span class="badge b-thr">ThreatsDetected</span>' }
+            default           { '<span class="badge b-ok">Healthy</span>' }
         }
         $tip = if ($r.Error) {
             " title=`"$($r.Error -replace '"','&quot;' -replace '<','&lt;' -replace '>','&gt;')`""
@@ -1153,7 +1225,9 @@ function Build-DashboardHtml {
         $isOutdated = if ($r.VersionStatus -eq 'Outdated') { 'true' } else { 'false' }
         $isRtOff    = if ($r.RealTimeProtection -eq 'False' -and $r.Online) { 'true' } else { 'false' }
 
-        "<tr data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`">
+        # data-host is the key the row-click handler uses to look up the
+        # per-host record in the embedded JSON blob and populate the modal.
+        "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`">
           <td$tip>$($r.ComputerName)</td>
           <td>$badge</td>
           <td>$($r.SignatureVersion)</td>
@@ -1169,6 +1243,45 @@ function Build-DashboardHtml {
     $refreshingBanner = if ($IsRefreshing) {
         '<div class="banner">&#x21BB; Refresh in progress…</div>'
     } else { '' }
+
+    # Embed per-host data as JSON so the row-click modal can populate without
+    # an extra request. Compressed + sorted to keep the page payload small.
+    # `</` is escaped to `<\/` to prevent a malicious threat name with the
+    # literal text "</script>" from prematurely ending the script tag.
+    $hostJsonBlob = @($Data | Sort-Object ComputerName | ForEach-Object {
+        [ordered]@{
+            computerName              = $_.ComputerName
+            online                    = [bool]$_.Online
+            defenderService           = $_.DefenderService
+            signatureVersion          = $_.SignatureVersion
+            availableVersion          = $_.AvailableVersion
+            versionStatus             = $_.VersionStatus
+            realTimeProtection        = $_.RealTimeProtection
+            antivirusEnabled          = $_.AntivirusEnabled
+            amServiceEnabled          = $_.AmServiceEnabled
+            behaviorMonitorEnabled    = $_.BehaviorMonitorEnabled
+            ioavProtectionEnabled     = $_.IoavProtectionEnabled
+            onAccessProtectionEnabled = $_.OnAccessProtectionEnabled
+            lastQuickScan             = $_.LastQuickScan
+            lastFullScan              = $_.LastFullScan
+            threatCount               = $_.ThreatCount
+            threats                   = @($_.ThreatList | ForEach-Object {
+                [ordered]@{
+                    name      = $_.ThreatName
+                    id        = $_.ThreatID
+                    detected  = if ($_.InitialDetectionTime) { $_.InitialDetectionTime.ToString('yyyy-MM-dd HH:mm') } else { '' }
+                    resources = $_.Resources
+                }
+            })
+            healthStatus              = $_.HealthStatus
+            healthReason              = $_.HealthReason
+            queryDurationSec          = $_.QueryDuration
+            error                     = $_.Error
+        }
+    }) | ConvertTo-Json -Compress -Depth 5
+    # Make sure it's an array literal even for a single host.
+    if ($Data.Count -eq 1) { $hostJsonBlob = '[' + $hostJsonBlob + ']' }
+    $hostJsonBlob = $hostJsonBlob -replace '</','<\/'
 
     @"
 <!DOCTYPE html>
@@ -1213,10 +1326,11 @@ function Build-DashboardHtml {
       /* Status colours — identical in both themes for visual continuity
          with the Forms GUI and HTML report. */
       --c-online-bg:   #107c10; --c-online-fg:   #ffffff;
-      --c-offline-bg:  #d13438; --c-offline-fg:  #ffffff;
+      --c-offline-bg:  #4b5563; --c-offline-fg:  #ffffff;
       --c-outdated-bg: #fab387; --c-outdated-fg: #1e1e2e;
       --c-rtoff-bg:    #f9e2af; --c-rtoff-fg:    #1e1e2e;
       --c-degraded-bg: #b8860b; --c-degraded-fg: #ffffff;
+      --c-threats-bg:  #d13438; --c-threats-fg:  #ffffff;
     }
     [data-theme="light"] {
       --bg-page: #f5f7fa;
@@ -1303,6 +1417,90 @@ function Build-DashboardHtml {
     .b-off { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
     .b-out { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
     .b-deg { background: var(--c-degraded-bg); color: var(--c-degraded-fg); }
+    .b-thr { background: var(--c-threats-bg);  color: var(--c-threats-fg); }
+    /* Hostrow click affordance — pointer cursor, hover highlight */
+    tr.hostrow { cursor: pointer; }
+
+    /* Host Details modal — vanilla CSS overlay */
+    .mdo-modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55);
+      display: none; align-items: flex-start; justify-content: center;
+      z-index: 1000; padding: 40px 16px; overflow-y: auto;
+    }
+    .mdo-modal-backdrop.show { display: flex; }
+    .mdo-modal {
+      background: var(--bg-elev); color: var(--text-primary);
+      border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+      max-width: 800px; width: 100%; padding: 24px 28px;
+      border: 1px solid var(--border);
+    }
+    .mdo-modal h2 {
+      margin: 0 0 4px 0; font-size: 1.4em; color: var(--text-primary);
+    }
+    .mdo-modal .mdo-sub {
+      color: var(--text-muted); font-size: .9em; margin-bottom: 18px;
+    }
+    .mdo-modal h3 {
+      margin: 18px 0 8px 0; font-size: .85em; text-transform: uppercase;
+      color: var(--accent); letter-spacing: .04em; border-bottom: 1px solid var(--border);
+      padding-bottom: 4px;
+    }
+    .mdo-kv { display: grid; grid-template-columns: 220px 1fr; gap: 4px 12px; font-size: .9em; }
+    .mdo-kv .k { color: var(--text-muted); }
+    .mdo-kv .v { color: var(--text-primary); word-break: break-word; }
+    .mdo-kv .v.bool-true  { color: #4ade80; font-weight: 600; }
+    .mdo-kv .v.bool-false { color: #f87171; font-weight: 600; }
+    .mdo-threats {
+      width: 100%; margin-top: 8px; border-collapse: collapse;
+      background: var(--bg-page); border-radius: 6px; overflow: hidden;
+      /* Fixed table layout + explicit column widths so a long Resource
+         string can't expand the cell beyond the modal's content area. */
+      table-layout: fixed;
+    }
+    .mdo-threats th, .mdo-threats td {
+      padding: 6px 10px; text-align: left; font-size: .85em;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+    .mdo-threats th:nth-child(1), .mdo-threats td:nth-child(1) { width: 28%; }
+    .mdo-threats th:nth-child(2), .mdo-threats td:nth-child(2) { width: 16%; white-space: nowrap; }
+    .mdo-threats th:nth-child(3), .mdo-threats td:nth-child(3) { width: 56%; }
+    /* Cap really-long Resource cells with internal scroll instead of letting
+       one threat row balloon the modal vertically. Inner div is required
+       because <td> ignores max-height. */
+    .mdo-threats .r-wrap {
+      max-height: 8em;
+      overflow-y: auto;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+    .mdo-threats th { background: var(--th-bg); color: var(--th-text); }
+    .mdo-threats tr:last-child td { border-bottom: none; }
+    .mdo-modal .mdo-err {
+      background: rgba(209,52,56,.15); border: 1px solid #d13438;
+      color: #fca5a5; padding: 10px 12px; border-radius: 6px; font-size: .9em;
+    }
+    .mdo-modal-footer {
+      display: flex; justify-content: flex-end; margin-top: 20px;
+      padding-top: 14px; border-top: 1px solid var(--border);
+    }
+    .mdo-btn {
+      background: var(--accent); color: #1e1e2e; border: none;
+      padding: 8px 22px; border-radius: 6px; font-weight: 600;
+      cursor: pointer; font-size: .95em;
+    }
+    .mdo-btn:hover { opacity: .9; }
+    .mdo-modal .mdo-pill {
+      display: inline-block; padding: 3px 12px; border-radius: 12px;
+      font-size: .9em; font-weight: 600;
+    }
+    .mdo-pill.p-ok  { background: var(--c-online-bg);   color: var(--c-online-fg); }
+    .mdo-pill.p-off { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
+    .mdo-pill.p-out { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
+    .mdo-pill.p-deg { background: var(--c-degraded-bg); color: var(--c-degraded-fg); }
+    .mdo-pill.p-thr { background: var(--c-threats-bg);  color: var(--c-threats-fg); }
 
     .footer { text-align: center; padding: 16px 28px; font-size: .78em;
               color: var(--text-faint); border-top: 1px solid var(--border); }
@@ -1368,6 +1566,19 @@ function Build-DashboardHtml {
     $($Data.Count) computers &nbsp;|&nbsp; $onlineCount online &nbsp;|&nbsp; $offlineCount offline
   </div>
 
+  <!-- Host Details modal (hidden until a row is clicked) -->
+  <div class="mdo-modal-backdrop" id="mdoModal" onclick="if(event.target===this)closeHostModal()">
+    <div class="mdo-modal" role="dialog" aria-modal="true" aria-labelledby="mdoTitle">
+      <h2 id="mdoTitle">—</h2>
+      <div class="mdo-sub" id="mdoSub">—</div>
+      <div id="mdoBody"></div>
+      <div class="mdo-modal-footer">
+        <button class="mdo-btn" onclick="closeHostModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script id="mdo-hosts-json" type="application/json">$hostJsonBlob</script>
   <script>
     // Theme handling.  The <head> early-load script already applied the
     // localStorage preference (if any), so here we just sync the button
@@ -1454,6 +1665,131 @@ function Build-DashboardHtml {
       });
       rows.forEach(function(r) { tb.appendChild(r); });
     }
+
+    // ----- Host Details modal -----------------------------------------
+    // Embedded JSON drives the modal contents — no extra HTTP round-trip
+    // is needed when a row is clicked. Schema mirrors /status's per-host
+    // shape so the same modal could be ported to a JSON-only consumer.
+    var MDO_HOSTS = (function() {
+      try {
+        var el = document.getElementById('mdo-hosts-json');
+        return el ? JSON.parse(el.textContent) : [];
+      } catch (e) { return []; }
+    })();
+    var MDO_BY_NAME = (function() {
+      var m = {};
+      for (var i = 0; i < MDO_HOSTS.length; i++) m[MDO_HOSTS[i].computerName] = MDO_HOSTS[i];
+      return m;
+    })();
+
+    function esc(s) {
+      if (s === null || s === undefined) return '';
+      return String(s).replace(/[&<>"']/g, function(c) {
+        return ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[c];
+      });
+    }
+    function boolClass(v) {
+      if (v === 'True')  return 'bool-true';
+      if (v === 'False') return 'bool-false';
+      return '';
+    }
+    function pillClass(s) {
+      switch (s) {
+        case 'Healthy':         return 'p-ok';
+        case 'Offline':         return 'p-off';
+        case 'Outdated':        return 'p-out';
+        case 'Degraded':        return 'p-deg';
+        case 'ThreatsDetected': return 'p-thr';
+        default:                return 'p-off';
+      }
+    }
+    function effectiveStatus(h) {
+      if (!h.online)                       return 'Offline';
+      if (h.versionStatus === 'Outdated')  return 'Outdated';
+      if (h.healthStatus)                  return h.healthStatus;
+      if (h.realTimeProtection === 'False' || h.antivirusEnabled === 'False') return 'Degraded';
+      return 'Healthy';
+    }
+    function kv(k, v, cls) {
+      cls = cls || '';
+      return '<div class="k">' + esc(k) + ' :</div><div class="v ' + cls + '">' + esc(v || '—') + '</div>';
+    }
+
+    function renderHostModal(h) {
+      var status = effectiveStatus(h);
+      var pill   = '<span class="mdo-pill ' + pillClass(status) + '">' + esc(status) + '</span>';
+
+      var threatRows = '';
+      if (h.threats && h.threats.length > 0) {
+        for (var i = 0; i < h.threats.length; i++) {
+          var t = h.threats[i];
+          threatRows += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.detected) + '</td><td><div class="r-wrap">' + esc(t.resources) + '</div></td></tr>';
+        }
+      }
+      var threatBlock = h.threats && h.threats.length > 0
+        ? '<table class="mdo-threats"><thead><tr><th>Threat</th><th>Detected</th><th>Resource</th></tr></thead><tbody>' + threatRows + '</tbody></table>'
+        : '<div class="mdo-kv">' + kv('No threats reported', '') + '</div>';
+
+      var errBlock = h.error
+        ? '<h3>Error / Detail</h3><div class="mdo-err">' + esc(h.error) + '</div>'
+        : '';
+
+      return ''
+        + '<h3>Identity</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Computer',       h.computerName)
+        +   kv('Online',         h.online ? 'Yes' : 'No', h.online ? 'bool-true' : 'bool-false')
+        +   kv('Query duration', (h.queryDurationSec != null ? h.queryDurationSec + 's' : '—'))
+        + '</div>'
+        + '<h3>Health Classification</h3>'
+        + '<div class="mdo-kv">'
+        +   '<div class="k">Status :</div><div class="v">' + pill + '</div>'
+        +   kv('Reason', (h.healthReason || '—'))
+        + '</div>'
+        + '<h3>Defender State</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('WinDefend service',     h.defenderService)
+        +   kv('Signature version',     h.signatureVersion + (h.versionStatus ? ' (' + h.versionStatus + ')' : ''))
+        +   kv('Available version',     h.availableVersion)
+        +   kv('Real-time protection',  h.realTimeProtection,        boolClass(h.realTimeProtection))
+        +   kv('Antimalware service',   h.amServiceEnabled,          boolClass(h.amServiceEnabled))
+        +   kv('Antivirus engine',      h.antivirusEnabled,          boolClass(h.antivirusEnabled))
+        +   kv('Behavior monitor',      h.behaviorMonitorEnabled,    boolClass(h.behaviorMonitorEnabled))
+        +   kv('IOAV protection',       h.ioavProtectionEnabled,     boolClass(h.ioavProtectionEnabled))
+        +   kv('On-access protection',  h.onAccessProtectionEnabled, boolClass(h.onAccessProtectionEnabled))
+        + '</div>'
+        + '<h3>Scans</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Last quick scan', h.lastQuickScan)
+        +   kv('Last full scan',  h.lastFullScan)
+        + '</div>'
+        + '<h3>Threats (' + (h.threats ? h.threats.length : 0) + ')</h3>'
+        + threatBlock
+        + errBlock;
+    }
+
+    function openHostModal(name) {
+      var h = MDO_BY_NAME[name];
+      if (!h) return;
+      document.getElementById('mdoTitle').textContent = h.computerName;
+      document.getElementById('mdoSub').textContent   = 'Last refreshed ' + (h.queryDurationSec || 0) + 's';
+      document.getElementById('mdoBody').innerHTML    = renderHostModal(h);
+      document.getElementById('mdoModal').classList.add('show');
+    }
+    function closeHostModal() {
+      document.getElementById('mdoModal').classList.remove('show');
+    }
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeHostModal();
+    });
+    // Delegate row clicks (avoids re-binding after DOM mutations from sort).
+    var tbl = document.getElementById('tbl');
+    if (tbl) {
+      tbl.tBodies[0].addEventListener('click', function(e) {
+        var tr = e.target.closest('tr.hostrow');
+        if (tr && tr.dataset.host) openHostModal(tr.dataset.host);
+      });
+    }
   </script>
 </body>
 </html>
@@ -1474,19 +1810,26 @@ function ConvertTo-DashboardJson {
         outdatedCount    = @($Data | Where-Object VersionStatus -eq 'Outdated').Count
         computers        = @($Data | Sort-Object ComputerName | ForEach-Object {
             [ordered]@{
-                computerName       = $_.ComputerName
-                online             = $_.Online
-                defenderService    = $_.DefenderService
-                signatureVersion   = $_.SignatureVersion
-                availableVersion   = $_.AvailableVersion
-                versionStatus      = $_.VersionStatus
-                realTimeProtection = $_.RealTimeProtection
-                antivirusEnabled   = $_.AntivirusEnabled
-                lastQuickScan      = $_.LastQuickScan
-                lastFullScan       = $_.LastFullScan
-                threatCount        = $_.ThreatCount
-                queryDurationSec   = $_.QueryDuration
-                error              = $_.Error
+                computerName              = $_.ComputerName
+                online                    = $_.Online
+                defenderService           = $_.DefenderService
+                signatureVersion          = $_.SignatureVersion
+                availableVersion          = $_.AvailableVersion
+                versionStatus             = $_.VersionStatus
+                realTimeProtection        = $_.RealTimeProtection
+                antivirusEnabled          = $_.AntivirusEnabled
+                amServiceEnabled          = $_.AmServiceEnabled
+                behaviorMonitorEnabled    = $_.BehaviorMonitorEnabled
+                ioavProtectionEnabled     = $_.IoavProtectionEnabled
+                onAccessProtectionEnabled = $_.OnAccessProtectionEnabled
+                lastQuickScan             = $_.LastQuickScan
+                lastFullScan              = $_.LastFullScan
+                threatCount               = $_.ThreatCount
+                threats                   = @($_.ThreatList)
+                healthStatus              = $_.HealthStatus
+                healthReason              = $_.HealthReason
+                queryDurationSec          = $_.QueryDuration
+                error                     = $_.Error
             }
         })
     }
@@ -1521,7 +1864,7 @@ function Start-BackgroundRefresh {
     Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
 
     $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
-        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, $LibInvokeDefenderRemote
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
 }
 
 function Receive-RefreshIfDone {
@@ -1884,7 +2227,7 @@ $initResults = Invoke-FleetRefresh `
     -FunctionDef         $FunctionDef `
     -WinRmCredential     $Credential `
     -DisableIPv6         $DisableIPv6 `
-    -LibPath             $LibInvokeDefenderRemote
+    -LibPaths            @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
 
 $script:CachedResults = $initResults
 $script:CachedAt      = Get-Date
