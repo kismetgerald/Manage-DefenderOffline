@@ -4,9 +4,9 @@
     Justification = 'Pester test scopes share state via $script:')]
 param()
 <#
-Tests for v0.0.8 multi-architecture support.
+Tests for the multi-architecture support introduced in v0.0.8.
 
-Two surfaces are exercised here:
+Three surfaces are exercised here:
 
   1. Get-AvailableMpamFiles (in Update-DefenderOffline.ps1) — walks a share
      and classifies mpam-fe.exe files by version + architecture. Supports both
@@ -16,11 +16,14 @@ Two surfaces are exercised here:
   2. Get-LatestMpamFile — thin wrapper that returns the latest entry, with
      an optional -Architecture filter for per-host dispatch.
 
-The Get-DefenderDefinitions.ps1 helper itself talks to the public Microsoft
-download endpoint; that's exercised in live-fire, not Pester. We do test
-its Resolve-Architectures helper logic by dot-sourcing the script and
-re-exposing the internal function — that lets us cover the input-parsing
-paths without making real HTTP calls.
+  3. Resolve-Architectures (in Get-DefenderDefinitions.ps1) — input parser
+     for the -Architecture parameter. Handles 'All', single values, array
+     form, comma-separated strings, dedup, case-insensitivity, whitespace,
+     and invalid input. Reachable via dot-source because the script gates
+     its main flow on $MyInvocation.InvocationName -eq '.' (v0.0.9).
+
+The download loop itself talks to the public Microsoft download endpoint
+and is exercised in live-fire rather than Pester.
 #>
 
 BeforeAll {
@@ -169,35 +172,122 @@ Describe 'Get-LatestMpamFile — wrapper with optional arch filter' {
     }
 }
 
-Describe 'Get-DefenderDefinitions.ps1 — architecture argument parsing (dot-source only)' {
-    # The full download flow is integration-only (live-fire). What's
-    # unit-testable here is Resolve-Architectures, which is private to the
-    # script. We dot-source the script with -OutputPath pointing at a
-    # throwaway directory so the script gets past param-binding without
-    # actually downloading anything. Then we directly invoke
-    # Resolve-Architectures via the script's runtime.
+Describe 'Get-DefenderDefinitions.ps1 — Resolve-Architectures' {
+    # Get-DefenderDefinitions is gated on $MyInvocation.InvocationName -eq '.'
+    # so dot-sourcing brings the function definitions into scope without
+    # firing the banner / download loop.
 
     BeforeAll {
-        # The script exits if its main flow runs end-to-end without an Architecture
-        # value; we can't dot-source it because it doesn't expose
-        # Resolve-Architectures at script scope (it's a local function defined
-        # before main flow). Pester would need to capture it via a different
-        # mechanism. For now, test the contract by spinning up a subprocess
-        # and parsing its banner output.
-        #
-        # Keeping this as an integration-only block to mark the intent without
-        # forcing brittle subprocess gymnastics into the unit-test surface.
+        . (Join-Path $script:RepoRoot 'Get-DefenderDefinitions.ps1')
     }
 
-    It 'unsupported architecture is rejected with a clear error' -Skip {
-        # Live-fire only: .\Get-DefenderDefinitions.ps1 -Architecture invalid
-        # Expected: ERROR "Unknown architecture 'invalid'..." + non-zero exit
+    Context "'All' / empty / null inputs expand to every supported arch" {
+        It "returns x64 + x86 + arm64 when -Spec is 'All'" {
+            $r = Resolve-Architectures -Spec 'All'
+            @($r) | Should -Be @('x64','x86','arm64')
+        }
+
+        It 'returns x64 + x86 + arm64 when -Spec is an empty array' {
+            $r = Resolve-Architectures -Spec @()
+            @($r) | Should -Be @('x64','x86','arm64')
+        }
+
+        It "is case-insensitive on 'ALL'" {
+            $r = Resolve-Architectures -Spec 'ALL'
+            @($r) | Should -Be @('x64','x86','arm64')
+        }
     }
 
-    It "'All' expands to x64 + x86 + arm64" -Skip {
-        # Live-fire only: validates the Architectures-resolved log line
+    Context 'Single-architecture inputs' {
+        It "honors a single 'x64'" {
+            $r = Resolve-Architectures -Spec 'x64'
+            @($r) | Should -Be @('x64')
+        }
+
+        It 'normalizes uppercase to lowercase' {
+            $r = Resolve-Architectures -Spec 'X64'
+            @($r) | Should -Be @('x64')
+        }
+
+        It 'trims surrounding whitespace' {
+            $r = Resolve-Architectures -Spec '  arm64  '
+            @($r) | Should -Be @('arm64')
+        }
     }
 
-    It "comma-separated subset 'x64,arm64' is honored" -Skip {
+    Context 'Multi-architecture inputs' {
+        It 'honors array form @(x64, arm64)' {
+            $r = Resolve-Architectures -Spec @('x64','arm64')
+            @($r) | Should -Be @('x64','arm64')
+        }
+
+        It "honors comma-separated single string 'x64,arm64'" {
+            $r = Resolve-Architectures -Spec 'x64,arm64'
+            @($r) | Should -Be @('x64','arm64')
+        }
+
+        It 'flattens array of comma-separated strings' {
+            $r = Resolve-Architectures -Spec @('x64,x86','arm64')
+            @($r) | Should -Be @('x64','x86','arm64')
+        }
+
+        It 'dedupes repeated entries while preserving first-seen order' {
+            $r = Resolve-Architectures -Spec 'x64,x64,arm64,x64'
+            @($r) | Should -Be @('x64','arm64')
+        }
+
+        It "treats whitespace around commas correctly: 'x64 , arm64'" {
+            $r = Resolve-Architectures -Spec 'x64 , arm64'
+            @($r) | Should -Be @('x64','arm64')
+        }
+    }
+
+    Context 'Invalid inputs' {
+        It 'throws on an unknown architecture name' {
+            { Resolve-Architectures -Spec 'invalid' } |
+                Should -Throw -ExpectedMessage "*Unknown architecture 'invalid'*"
+        }
+
+        It 'throws when any value in a multi-arch list is invalid' {
+            { Resolve-Architectures -Spec 'x64,bogus' } |
+                Should -Throw -ExpectedMessage "*Unknown architecture 'bogus'*"
+        }
+
+        It 'error message lists the supported architectures' {
+            { Resolve-Architectures -Spec 'sparc' } |
+                Should -Throw -ExpectedMessage '*Supported: x64, x86, ARM64, All*'
+        }
+    }
+}
+
+Describe 'Get-DefenderDefinitions.ps1 — parameter surface' {
+    # Static parameter-existence checks. Verifies the script exposes the
+    # documented parameters so renames or accidental deletions are caught
+    # at unit-test time, not by an operator hitting "param not found" in
+    # the field.
+
+    BeforeAll {
+        $script:CmdInfo = Get-Command (Join-Path $script:RepoRoot 'Get-DefenderDefinitions.ps1')
+    }
+
+    It 'declares -Proxy as a [string]' {
+        $script:CmdInfo.Parameters.ContainsKey('Proxy') | Should -BeTrue
+        $script:CmdInfo.Parameters['Proxy'].ParameterType | Should -Be ([string])
+    }
+
+    It 'declares -ProxyCredential as a [pscredential]' {
+        $script:CmdInfo.Parameters.ContainsKey('ProxyCredential') | Should -BeTrue
+        $script:CmdInfo.Parameters['ProxyCredential'].ParameterType | Should -Be ([pscredential])
+    }
+
+    It 'declares -Force as a [switch]' {
+        $script:CmdInfo.Parameters['Force'].ParameterType | Should -Be ([switch])
+    }
+
+    It 'declares -Architecture as [string[]]' {
+        # Regression: v0.0.8 PR-Download originally bound this as [string],
+        # so unquoted commas on the CLI (-Architecture x64,arm64) failed
+        # parameter binding. Must remain [string[]].
+        $script:CmdInfo.Parameters['Architecture'].ParameterType | Should -Be ([string[]])
     }
 }

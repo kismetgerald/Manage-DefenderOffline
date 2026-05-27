@@ -37,9 +37,32 @@
     for testing — production downloads must remain signed.
 
 .PARAMETER Force
-    Overwrite an existing version subfolder. Without -Force, an existing
-    folder for the resolved version+architecture is left untouched and
-    re-using existing files when integrity verifies.
+    Bypass the bandwidth-saving fast-path and overwrite any existing
+    version subfolder. Without -Force, the script first checks today's
+    date folder for an existing copy of each requested architecture; if
+    one is found, the download is skipped (saves ~200 MB per arch), and
+    the existing file's SHA-256 + signature are re-verified and recorded
+    in the manifest. With -Force, every architecture is fetched fresh
+    from Microsoft and any matching existing folder is overwritten.
+
+    Trade-off: the fast-path will miss a Microsoft mid-day publish until
+    tomorrow's first run. Use -Force when you specifically need to pull
+    the latest Microsoft has published right now.
+
+.PARAMETER Proxy
+    Explicit HTTP proxy URL passed to Invoke-WebRequest. Example:
+    'http://proxy.corp.example.com:8080'. When omitted, the script
+    falls back to the standard $env:HTTPS_PROXY / $env:HTTP_PROXY
+    environment variables (which Invoke-WebRequest honors automatically).
+    Use this when running in an environment that does not export the
+    proxy env vars, or when you need to override them per-run.
+
+.PARAMETER ProxyCredential
+    PSCredential for proxy authentication. Required for proxies that
+    enforce credential-based auth (NTLM, Basic). Build via Get-Credential
+    or load from a saved XML:
+        \$cred = Import-Clixml .\Config\proxy.xml
+        .\Get-DefenderDefinitions.ps1 -Proxy 'http://proxy:8080' -ProxyCredential \$cred
 
 .PARAMETER ConfigPath
     Path to a config.conf with an optional [Download] section.
@@ -61,7 +84,7 @@
     Author         : Kismet Agbasi (GitHub: kismetgerald | Email: KismetG17@gmail.com)
     AI Contributors: Claude AI, Grok
     Requires       : PowerShell 5.1+; internet access to go.microsoft.com
-    Version        : 0.0.8
+    Version        : 0.0.9
     Last Updated   : 2026-05-26
 #>
 
@@ -80,10 +103,14 @@ param(
 
     [switch]$Force,
 
+    [string]$Proxy,
+
+    [pscredential]$ProxyCredential,
+
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.8'
+$ScriptVersion = '0.0.9'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # ===================================================================
@@ -104,24 +131,6 @@ function Read-ConfigFile {
     }
     return $cfg
 }
-
-if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
-$cfg = Read-ConfigFile $ConfigPath
-
-# Config-merge: parameters provided on the CLI win; config fills in the
-# rest; otherwise defaults apply.
-if (-not $PSBoundParameters.ContainsKey('OutputPath')    -and $cfg['DefaultOutputPath'])    { $OutputPath    = $cfg['DefaultOutputPath'] }
-if (-not $PSBoundParameters.ContainsKey('Architecture')  -and $cfg['DefaultArchitecture'])  { $Architecture  = $cfg['DefaultArchitecture'] }
-if (-not $OutputPath) { $OutputPath = Join-Path $ScriptDir 'definitions' }
-
-# Resolve the OutputPath against the script directory if a relative path
-# is supplied — same convention as the dashboard's AuthBasicUsersFile.
-# GetFullPath canonicalises '.\foo' style segments so the operator-facing
-# log lines don't show ugly mid-path '.\' fragments.
-if (-not [System.IO.Path]::IsPathRooted($OutputPath)) {
-    $OutputPath = Join-Path $ScriptDir $OutputPath
-}
-$OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 
 # ===================================================================
 # Architecture resolution
@@ -160,26 +169,6 @@ function Resolve-Architectures {
     return $valid.ToArray()
 }
 
-$Architectures = Resolve-Architectures -Spec $Architecture
-if ($Architectures.Count -eq 0) {
-    Write-Host 'ERROR: No architectures to download.' -ForegroundColor Red
-    exit 1
-}
-
-# ===================================================================
-# Banner
-# ===================================================================
-Write-Host ''
-Write-Host '  ============================================================' -ForegroundColor Cyan
-Write-Host "   Microsoft Defender Definitions Downloader v$ScriptVersion" -ForegroundColor Cyan
-Write-Host '  ============================================================' -ForegroundColor Cyan
-Write-Host ''
-Write-Host "  Output path     : $OutputPath" -ForegroundColor White
-Write-Host "  Architectures   : $($Architectures -join ', ')" -ForegroundColor White
-Write-Host "  Signature check : $(if ($SkipSignatureCheck) { 'SKIPPED' } else { 'Enabled' })" -ForegroundColor $(if ($SkipSignatureCheck) { 'Yellow' } else { 'White' })
-Write-Host "  Force overwrite : $($Force.IsPresent)" -ForegroundColor White
-Write-Host ''
-
 # ===================================================================
 # Helpers
 # ===================================================================
@@ -217,6 +206,73 @@ function Get-FileVersionString {
 }
 
 # ===================================================================
+# Main-flow guard
+#
+# When dot-sourced (Pester / interactive testing) return here so the
+# config-load, banner, and download engine below do not run. Direct
+# invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ===================================================================
+# Configuration load + parameter merge
+# ===================================================================
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+$cfg = Read-ConfigFile $ConfigPath
+
+# Config-merge: parameters provided on the CLI win; config fills in the
+# rest; otherwise defaults apply.
+if (-not $PSBoundParameters.ContainsKey('OutputPath')    -and $cfg['DefaultOutputPath'])    { $OutputPath    = $cfg['DefaultOutputPath'] }
+if (-not $PSBoundParameters.ContainsKey('Architecture')  -and $cfg['DefaultArchitecture'])  { $Architecture  = $cfg['DefaultArchitecture'] }
+if (-not $PSBoundParameters.ContainsKey('Proxy')         -and $cfg['DefaultProxy'])         { $Proxy         = $cfg['DefaultProxy'] }
+# ProxyCredential is loaded from an Export-Clixml DPAPI blob if the config
+# points at one. The file is decryptable only by the same Windows identity
+# that exported it.
+if (-not $PSBoundParameters.ContainsKey('ProxyCredential') -and $cfg['DefaultProxyCredentialPath']) {
+    $credPath = $cfg['DefaultProxyCredentialPath']
+    if (-not [System.IO.Path]::IsPathRooted($credPath)) { $credPath = Join-Path $ScriptDir $credPath }
+    if (Test-Path $credPath) {
+        try { $ProxyCredential = Import-Clixml -Path $credPath } catch {
+            Write-Host "WARNING: DefaultProxyCredentialPath='$credPath' could not be loaded: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+if (-not $OutputPath) { $OutputPath = Join-Path $ScriptDir 'definitions' }
+
+# Resolve the OutputPath against the script directory if a relative path
+# is supplied — same convention as the dashboard's AuthBasicUsersFile.
+# GetFullPath canonicalises '.\foo' style segments so the operator-facing
+# log lines don't show ugly mid-path '.\' fragments.
+if (-not [System.IO.Path]::IsPathRooted($OutputPath)) {
+    $OutputPath = Join-Path $ScriptDir $OutputPath
+}
+$OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
+
+$Architectures = Resolve-Architectures -Spec $Architecture
+if ($Architectures.Count -eq 0) {
+    Write-Host 'ERROR: No architectures to download.' -ForegroundColor Red
+    exit 1
+}
+
+# ===================================================================
+# Banner
+# ===================================================================
+Write-Host ''
+Write-Host '  ============================================================' -ForegroundColor Cyan
+Write-Host "   Microsoft Defender Definitions Downloader v$ScriptVersion" -ForegroundColor Cyan
+Write-Host '  ============================================================' -ForegroundColor Cyan
+Write-Host ''
+Write-Host "  Output path     : $OutputPath" -ForegroundColor White
+Write-Host "  Architectures   : $($Architectures -join ', ')" -ForegroundColor White
+Write-Host "  Signature check : $(if ($SkipSignatureCheck) { 'SKIPPED' } else { 'Enabled' })" -ForegroundColor $(if ($SkipSignatureCheck) { 'Yellow' } else { 'White' })
+Write-Host "  Force overwrite : $($Force.IsPresent)" -ForegroundColor White
+if ($Proxy) {
+    $credNote = if ($ProxyCredential) { " (auth: $($ProxyCredential.UserName))" } else { '' }
+    Write-Host "  Proxy           : $Proxy$credNote" -ForegroundColor White
+}
+Write-Host ''
+
+# ===================================================================
 # Download loop
 # ===================================================================
 $dateStamp     = Get-Date -Format 'yyyyMMdd'
@@ -238,12 +294,80 @@ try {
 
         Write-Host "  ━━ $arch ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
         Write-Host "     Source : $url" -ForegroundColor DarkGray
+
+        # Bandwidth-saving fast-path: today's folder already has this arch?
+        # If so, re-verify hash + signature on the existing file and add to
+        # the manifest without re-downloading. -Force disables this.
+        if (-not $Force -and (Test-Path $dateFolder)) {
+            $existingArchFolder = $null
+            $existingVersion    = $null
+            $candidates = @(
+                Get-ChildItem -LiteralPath $dateFolder -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^v(\d+\.\d+\.\d+\.\d+)$' } |
+                    ForEach-Object {
+                        $verStr = $_.Name -replace '^v',''
+                        $archDir = Join-Path $_.FullName $arch
+                        $exeFile = Join-Path $archDir 'mpam-fe.exe'
+                        if (Test-Path $exeFile) {
+                            [pscustomobject]@{ Folder = $archDir; Version = [version]$verStr; ExeFile = $exeFile }
+                        }
+                    }
+            )
+            if ($candidates.Count -gt 0) {
+                $best = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+                $existingArchFolder = $best.Folder
+                $existingVersion    = $best.Version.ToString()
+            }
+            if ($existingArchFolder) {
+                Write-Host "     [FAST-PATH] Found existing $arch v$existingVersion in today's folder; skipping download." -ForegroundColor Green
+                Write-Host '                 Re-run with -Force to fetch fresh from Microsoft.' -ForegroundColor DarkGray
+
+                $existingFile = Join-Path $existingArchFolder 'mpam-fe.exe'
+                $sigInfo = $null
+                try {
+                    $sigInfo = Test-MpamSignature -Path $existingFile -Skip:$SkipSignatureCheck
+                } catch {
+                    Write-Host "     [FAIL] $($_.Exception.Message)" -ForegroundColor Red
+                    [void]$failedArchs.Add($arch)
+                    continue
+                }
+
+                $existingHash = Get-Sha256 -Path $existingFile
+                [void]$manifestItems.Add([pscustomobject]@{
+                    architecture     = $arch
+                    fwlink           = $url
+                    filename         = 'mpam-fe.exe'
+                    relativePath     = (Resolve-Path $existingFile).Path.Substring($OutputPath.Length).TrimStart('\','/')
+                    version          = $existingVersion
+                    sizeBytes        = (Get-Item -LiteralPath $existingFile).Length
+                    sha256           = $existingHash
+                    signerSubject    = $sigInfo.SignerSubject
+                    signerThumbprint = $sigInfo.SignerThumbprint
+                    downloadedAt     = $null
+                    reusedExisting   = $true
+                })
+                Write-Host ''
+                continue
+            }
+        }
+
         Write-Host '     Downloading…' -ForegroundColor White
 
         try {
             # -UseBasicParsing keeps the IE engine out of the loop (deprecated
             # on PowerShell 7+). -OutFile streams directly to disk.
-            Invoke-WebRequest -Uri $url -OutFile $tempFile -UseBasicParsing -ErrorAction Stop
+            # Proxy args are splatted only when set so the default behavior
+            # (use $env:HTTPS_PROXY) is preserved for callers who haven't
+            # opted into explicit proxy config.
+            $iwrArgs = @{
+                Uri             = $url
+                OutFile         = $tempFile
+                UseBasicParsing = $true
+                ErrorAction     = 'Stop'
+            }
+            if ($Proxy)           { $iwrArgs['Proxy']           = $Proxy }
+            if ($ProxyCredential) { $iwrArgs['ProxyCredential'] = $ProxyCredential }
+            Invoke-WebRequest @iwrArgs
         } catch {
             Write-Host "     [FAIL] Download error: $($_.Exception.Message)" -ForegroundColor Red
             [void]$failedArchs.Add($arch)
