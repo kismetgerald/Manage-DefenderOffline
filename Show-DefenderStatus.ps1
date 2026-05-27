@@ -600,10 +600,10 @@ function ConvertTo-StatusHtml {
                   elseif ($r.RealTimeProtection -eq 'False' -or $r.AntivirusEnabled -eq 'False') { 'Degraded' }
                   else { 'Healthy' }
         $cls = switch ($status) {
-            'Offline'         { 'failed'  }
+            'Offline'         { 'offline' }
             'Outdated'        { 'skipped' }
             'Degraded'        { 'warn'    }
-            'ThreatsDetected' { 'threats' }
+            'ThreatsDetected' { 'failed'  }
             default           { 'success' }
         }
         $tip = if ($r.Error) {
@@ -642,7 +642,7 @@ tr:nth-child(even) td { background: #f9f9f9; }
 .tag { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .82em; font-weight: 700; color: #fff; }
 .success { background: #107c10; } .failed { background: #d13438; }
 .skipped { background: #9c5100; } .warn { background: #b8860b; }
-.threats { background: #8338ec; }
+.offline { background: #4b5563; }
 .footer { margin-top: 40px; color: #888; font-size: .85em; text-align: center; border-top: 1px solid #ddd; padding-top: 16px; }
 </style>
 '@
@@ -739,10 +739,10 @@ $clrRowAlt        = [System.Drawing.Color]::FromArgb(249, 249, 249)  # #f9f9f9
 $clrSelection     = [System.Drawing.Color]::FromArgb(220, 233, 248)  # selection tint
 # Status colours (match HTML .tag classes and stat cards)
 $clrSuccess       = [System.Drawing.Color]::FromArgb(16,  124, 16)   # #107c10 - Healthy/Online
-$clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 - Offline (no comms — operator can't see it)
+$clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 - ThreatsDetected (critical — Defender flagged threats on this host)
 $clrOutdatedPill  = [System.Drawing.Color]::FromArgb(156, 81,  0)    # #9c5100 - Outdated pill (HTML .skipped)
 $clrWarn          = [System.Drawing.Color]::FromArgb(184, 134, 11)   # #b8860b - Degraded pill (HTML .warn)
-$clrThreats       = [System.Drawing.Color]::FromArgb(131, 56,  236)  # #8338ec - ThreatsDetected (anomaly — host is visible, Defender flagged threats)
+$clrOffline       = [System.Drawing.Color]::FromArgb(75,  85,  99)   # #4b5563 - Offline (no comms — informational, not a critical signal)
 $clrOutdatedCard  = [System.Drawing.Color]::FromArgb(250, 179, 135)  # #fab387 - Outdated stat card (HTML .s3)
 $clrRtOffCard     = [System.Drawing.Color]::FromArgb(249, 226, 175)  # #f9e2af - RT Off stat card (HTML .s4)
 $clrWhite         = [System.Drawing.Color]::White
@@ -842,7 +842,7 @@ function New-StatCard ([string]$Label, [System.Drawing.Color]$Bg, [System.Drawin
 }
 
 $statOnline   = New-StatCard 'ONLINE'   $clrSuccess      $clrWhite
-$statOffline  = New-StatCard 'OFFLINE'  $clrError        $clrWhite
+$statOffline  = New-StatCard 'OFFLINE'  $clrOffline      $clrWhite
 $statOutdated = New-StatCard 'OUTDATED' $clrOutdatedCard $clrTextDark
 $statRtOff    = New-StatCard 'RT OFF'   $clrRtOffCard    $clrTextDark
 
@@ -1052,10 +1052,10 @@ $grid.add_CellPainting({
 
     $pillBg = switch ($statusText) {
         'Healthy'         { $clrSuccess }
-        'Offline'         { $clrError }
+        'Offline'         { $clrOffline }
         'Outdated'        { $clrOutdatedPill }
         'Degraded'        { $clrWarn }
-        'ThreatsDetected' { $clrThreats }
+        'ThreatsDetected' { $clrError }
         default           { [System.Drawing.Color]::Gray }
     }
     $pillFg = $clrWhite
