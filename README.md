@@ -305,6 +305,9 @@ See `conf\config.conf` for full documentation of every setting.
 | `-To` | *(required if -SendEmail)* | Recipient address(es) |
 | `-SmtpCredential` | *(optional)* | PSCredential for SMTP authentication |
 | `-SaveSmtpCredential` | — | Interactive helper; saves encrypted SMTP credentials to `.\conf\SmtpCredential.xml` |
+| `-CanaryComputers` | *(off)* | Comma-separated subset of the fleet to run first as a Canary wave. The Production wave runs only if the canary health gate passes. |
+| `-MaxCanaryFailures` | `0` | Number of canary-wave health failures (Degraded + ProbeFailed) allowed before the Production wave is halted. |
+| `-HealthSettleSeconds` | `60` | Pause between the canary wave finishing and the gate being evaluated. Gives Defender telemetry time to stabilize. |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
 ### Email Setup
@@ -343,7 +346,21 @@ $cred = Import-Clixml ".\conf\SmtpCredential.xml"
 
 # Maximum parallel threads
 .\Update-DefenderOffline.ps1 -ParallelThreads 32
+
+# Staged rollout — push to two canary hosts first, then halt-or-proceed
+.\Update-DefenderOffline.ps1 `
+    -CanaryComputers "LAB-PC01","LAB-PC02" `
+    -MaxCanaryFailures 0 `
+    -HealthSettleSeconds 120
 ```
+
+**Staged rollout behaviour**
+- `-CanaryComputers` partitions the fleet into a **Canary** wave and a **Production** wave.
+- After the Canary wave finishes, the script waits `-HealthSettleSeconds`, then evaluates the post-update health probe.
+- If the number of canary hosts ending in `HealthStatus = Degraded` or `ProbeFailed` exceeds `-MaxCanaryFailures`, the Production wave is **skipped**; those hosts appear as `Skipped (gate)` in the report.
+- Install failures, ThreatsDetected, and Healthy rows do **not** count against the gate (install failures are already retried 3×; pre-existing threats were not caused by the update).
+- Names in `-CanaryComputers` not in the resolved target fleet are warned and dropped.
+- Leave the parameter empty to disable staging (script runs the full fleet in a single wave — identical to pre-v0.0.10 behaviour).
 
 ### Execution Flow
 
@@ -827,8 +844,6 @@ The project follows a three-train versioning scheme:
 
 - Integration with Windows Update Service API
 - Support for multiple definition file formats (FEP, NIS)
-- Staged rollout with canary group and per-wave halt-on-health-failure
-- Post-update health probe (RT-protection check + quarantine-event collection)
 - Integration with monitoring systems (SCOM, Splunk)
 
 ---
