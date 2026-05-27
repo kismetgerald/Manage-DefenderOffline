@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.8-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.9-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 ## Overview
 
@@ -19,7 +19,7 @@
 - 📝 **Audit-grade access logging** — every authentication decision logged with user identity + source IP + reason (NIST 800-53 AU-2 / STIG AC-7)
 - 🔄 **Auto-discovery** of computers from Active Directory
 - 🔧 **Email notifications** with HTML reports and CSV attachments
-- 🛡️ **Safe & tested** — 201-test Pester suite + GitHub Actions CI + dry-run mode + automatic retry logic
+- 🛡️ **Safe & tested** — 216-test Pester suite + GitHub Actions CI + dry-run mode + automatic retry logic
 - ⚙️ **Enterprise-ready** for scheduled tasks, service accounts, and gMSA
 - 📈 **Version analytics** with fleet-wide statistics and CSV exports
 - ⬇️ **Definition download helper** — `Get-DefenderDefinitions.ps1` pulls mpam-fe.exe (x64 / x86 / arm64) from Microsoft on a staging host, with SHA-256 sidecars, Authenticode verification, and a transfer manifest
@@ -680,7 +680,31 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.8 (2026-05-26) — Current
+### v0.0.9 (2026-05-26) — Current
+
+`Get-DefenderDefinitions.ps1` polish — bandwidth-friendly re-runs, explicit proxy support, and the helper's first unit-test surface. No new operator-facing scripts; all three changes target the internet-side staging workflow introduced in v0.0.8.
+
+**Bandwidth-saving fast-path (`Get-DefenderDefinitions.ps1`):**
+- ✨ Pre-flight check: if today's date folder already contains the requested architecture under any version subfolder, the existing file's hash + signature are re-verified and recorded in the manifest without re-downloading
+- ✨ Saves ~200 MB per architecture on re-runs (~600 MB for the default `All`); logs `[FAST-PATH]` per arch
+- ✨ Multiple staged versions for the same arch are resolved by picking the highest `[version]`
+- ✨ `-Force` disables the fast-path entirely (every arch downloads fresh, matching version folders are overwritten)
+- ✨ Trade-off documented: the fast-path will miss a Microsoft mid-day publish until the date folder rolls over the next day; operators wanting the very latest use `-Force`
+
+**Proxy support (`Get-DefenderDefinitions.ps1`):**
+- ✨ **`-Proxy`** — explicit HTTP proxy URL (e.g. `http://proxy.corp.example.com:8080`)
+- ✨ **`-ProxyCredential`** — `[pscredential]` for proxies enforcing credential-based auth (NTLM, Basic)
+- ✨ Config keys `DefaultProxy` + `DefaultProxyCredentialPath` in `[Download]` (DPAPI-encrypted XML — same pattern as SMTP / AD creds)
+- ✨ Splat-conditional plumbing into `Invoke-WebRequest` — default behavior (fall back to `$env:HTTPS_PROXY`) is preserved for callers who haven't opted in
+- ✨ Banner surfaces the active proxy + username when set
+
+**Test infrastructure:**
+- ✨ Main-flow guard added to `Get-DefenderDefinitions.ps1` (matches the existing pattern in `Update-DefenderOffline.ps1`) so the script can be dot-sourced safely from Pester
+- ✨ +14 active `Resolve-Architectures` tests covering `'All'` / empty / array form / comma-separated string / dedup / case-insensitivity / whitespace / invalid input — eliminates the three `-Skip` placeholders from v0.0.8
+- ✨ +4 parameter-surface assertions including a regression guard for the v0.0.8 `[string]` vs `[string[]]` `-Architecture` binding bug
+- ✨ Full suite now at **216 tests** (203 active + 13 skipped placeholders)
+
+### v0.0.8 (2026-05-26)
 
 AD OU scoping for discovery + a complete internet-side → air-gap-share staging workflow. `Update-DefenderOffline` now picks the right binary for each endpoint's actual architecture instead of pushing a single x64 file at every host.
 

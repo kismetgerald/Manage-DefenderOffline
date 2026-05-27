@@ -84,7 +84,7 @@
     Author         : Kismet Agbasi (GitHub: kismetgerald | Email: KismetG17@gmail.com)
     AI Contributors: Claude AI, Grok
     Requires       : PowerShell 5.1+; internet access to go.microsoft.com
-    Version        : 0.0.8
+    Version        : 0.0.9
     Last Updated   : 2026-05-26
 #>
 
@@ -110,7 +110,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.8'
+$ScriptVersion = '0.0.9'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # ===================================================================

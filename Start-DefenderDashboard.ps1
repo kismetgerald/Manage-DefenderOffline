@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.8'
+$ScriptVersion = '0.0.9'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread

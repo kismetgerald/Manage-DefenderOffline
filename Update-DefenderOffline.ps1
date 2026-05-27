@@ -222,7 +222,7 @@ param(
 # ===================================================================
 # Constants
 # ===================================================================
-$ScriptVersion   = '0.0.8'
+$ScriptVersion   = '0.0.9'
 $ScriptStartTime = Get-Date
 $ScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
