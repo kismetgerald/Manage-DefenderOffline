@@ -603,7 +603,7 @@ function ConvertTo-StatusHtml {
             'Offline'         { 'failed'  }
             'Outdated'        { 'skipped' }
             'Degraded'        { 'warn'    }
-            'ThreatsDetected' { 'failed'  }
+            'ThreatsDetected' { 'threats' }
             default           { 'success' }
         }
         $tip = if ($r.Error) {
@@ -642,6 +642,7 @@ tr:nth-child(even) td { background: #f9f9f9; }
 .tag { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .82em; font-weight: 700; color: #fff; }
 .success { background: #107c10; } .failed { background: #d13438; }
 .skipped { background: #9c5100; } .warn { background: #b8860b; }
+.threats { background: #8338ec; }
 .footer { margin-top: 40px; color: #888; font-size: .85em; text-align: center; border-top: 1px solid #ddd; padding-top: 16px; }
 </style>
 '@
@@ -738,9 +739,10 @@ $clrRowAlt        = [System.Drawing.Color]::FromArgb(249, 249, 249)  # #f9f9f9
 $clrSelection     = [System.Drawing.Color]::FromArgb(220, 233, 248)  # selection tint
 # Status colours (match HTML .tag classes and stat cards)
 $clrSuccess       = [System.Drawing.Color]::FromArgb(16,  124, 16)   # #107c10 - Healthy/Online
-$clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 - Offline
+$clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 - Offline (no comms — operator can't see it)
 $clrOutdatedPill  = [System.Drawing.Color]::FromArgb(156, 81,  0)    # #9c5100 - Outdated pill (HTML .skipped)
 $clrWarn          = [System.Drawing.Color]::FromArgb(184, 134, 11)   # #b8860b - Degraded pill (HTML .warn)
+$clrThreats       = [System.Drawing.Color]::FromArgb(131, 56,  236)  # #8338ec - ThreatsDetected (anomaly — host is visible, Defender flagged threats)
 $clrOutdatedCard  = [System.Drawing.Color]::FromArgb(250, 179, 135)  # #fab387 - Outdated stat card (HTML .s3)
 $clrRtOffCard     = [System.Drawing.Color]::FromArgb(249, 226, 175)  # #f9e2af - RT Off stat card (HTML .s4)
 $clrWhite         = [System.Drawing.Color]::White
@@ -1053,7 +1055,7 @@ $grid.add_CellPainting({
         'Offline'         { $clrError }
         'Outdated'        { $clrOutdatedPill }
         'Degraded'        { $clrWarn }
-        'ThreatsDetected' { $clrError }
+        'ThreatsDetected' { $clrThreats }
         default           { [System.Drawing.Color]::Gray }
     }
     $pillFg = $clrWhite
