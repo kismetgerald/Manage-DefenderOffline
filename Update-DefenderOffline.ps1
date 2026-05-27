@@ -235,7 +235,7 @@ param(
 # ===================================================================
 # Constants
 # ===================================================================
-$ScriptVersion   = '0.0.10'
+$ScriptVersion   = '0.0.11'
 $ScriptStartTime = Get-Date
 $ScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
@@ -485,8 +485,14 @@ function Write-Log {
         $Global:LogMutex.ReleaseMutex()
     }
 
-    if (-not $script:SuppressConsoleOutput -and
-        [System.Threading.Thread]::CurrentThread.ManagedThreadId -eq 1) {
+    # ThreadJob runspaces don't inherit Write-Log from the parent scope, so
+    # there's no risk of stray console output from worker threads. The
+    # $script:SuppressConsoleOutput flag is toggled $true during the parallel
+    # wave loop and back to $false before/after — that's the only gate
+    # needed. The earlier ManagedThreadId -eq 1 check broke console output
+    # entirely on terminals where the main script flow runs on a non-1
+    # thread (e.g. VS Code's PS7 integrated terminal).
+    if (-not $script:SuppressConsoleOutput) {
         $color = switch ($Level) {
             'INFO'    { 'Cyan'    }
             'WARN'    { 'Yellow'  }

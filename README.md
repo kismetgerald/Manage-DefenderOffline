@@ -697,7 +697,26 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.10 (2026-05-27) — Current
+### v0.0.11 (2026-05-27) — Current
+
+Two operator-quality fixes surfaced during v0.0.10 live-fire. No new operator-facing parameters; behaviour change is limited to console visibility and an HTTPS startup pre-flight check.
+
+**`Update-DefenderOffline.ps1` — main-flow log output now visible on the console:**
+- 🐛 Dropped the `[Thread]::CurrentThread.ManagedThreadId -eq 1` gate from `Write-Log`. On terminals where the main script flow runs on a non-1 thread (notably VS Code's PS7 integrated terminal), the gate suppressed **all** main-flow console output — pre-wave config, AD discovery, wave headers, gate decisions, and the settle-pause heartbeat were going to the log file only.
+- 🐛 ThreadJob worker runspaces don't inherit `Write-Log` from the parent scope, so the gate was defending against an impossible case while breaking the common case. `$script:SuppressConsoleOutput` (still toggled `$true` around the parallel wave loop) is the only gate needed.
+
+**`Start-DefenderDashboard.ps1` — HTTPS pre-flight cert-binding check:**
+- ✨ Before `HttpListener.Start()` runs, the dashboard now verifies via `netsh http show sslcert ipport=0.0.0.0:<Port>` that the configured certificate is actually bound to the listener port.
+- ✨ Previous failure mode: `HttpListener.Start()` succeeded silently when no cert was bound; every TLS handshake then failed at the browser with `NS_ERROR_NET_INADEQUATE_SECURITY` and no signal in the dashboard log.
+- ✨ When the binding is missing or the wrong thumbprint is bound, the dashboard now logs an actionable error including the exact `netsh http add sslcert` command needed to fix the binding (and the `Install-DefenderDashboard.ps1 -UseHttps` alternative), then exits 1.
+- ✨ Happy path logs `HTTPS pre-flight: Cert <THUMBPRINT> is bound to 0.0.0.0:<Port>.` before the listener starts.
+
+**Test infrastructure:**
+- ✨ New helper `lib/Test-HttpsCertBinding.ps1` with `Get-NetshSslcertHash` (parser) and `Test-HttpsCertBinding` (decision wrapper). netsh shell-out is optional and substitutable via `-NetshOutput` for unit testing.
+- ✨ +11 Pester tests in `tests/HttpsCertBinding.Tests.ps1` covering case-insensitive hash extraction, happy/wrong-cert/no-binding decisions, and output-shape stability.
+- ✨ Full suite now at **253 tests** (240 active + 13 skipped placeholders) — up from 242 in v0.0.10.
+
+### v0.0.10 (2026-05-27)
 
 Health-probe + drill-down family across all three consumer scripts, plus opt-in staged rollout for `Update-DefenderOffline`. Three sub-PRs landed on `feat/v0.0.10` and merged together.
 
