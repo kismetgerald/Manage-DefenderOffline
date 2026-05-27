@@ -6,6 +6,8 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
 [![Version](https://img.shields.io/badge/Version-0.0.9-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
+> 👉 **New here?** Read [QUICKSTART.md](QUICKSTART.md) — dashboard running and reachable from a remote workstation in under 10 minutes.
+
 ## Overview
 
 **Manage-DefenderOffline** is a PowerShell toolkit for managing Microsoft Defender antivirus definitions on Windows 10/11 and Windows Server 2016+ endpoints that cannot reach the internet directly. It covers the full lifecycle: deploying updates, monitoring fleet health, and reporting — without requiring MECM, Intune, or any commercial AV management platform.
