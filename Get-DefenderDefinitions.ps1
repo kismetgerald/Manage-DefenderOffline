@@ -49,6 +49,21 @@
     tomorrow's first run. Use -Force when you specifically need to pull
     the latest Microsoft has published right now.
 
+.PARAMETER Proxy
+    Explicit HTTP proxy URL passed to Invoke-WebRequest. Example:
+    'http://proxy.corp.example.com:8080'. When omitted, the script
+    falls back to the standard $env:HTTPS_PROXY / $env:HTTP_PROXY
+    environment variables (which Invoke-WebRequest honors automatically).
+    Use this when running in an environment that does not export the
+    proxy env vars, or when you need to override them per-run.
+
+.PARAMETER ProxyCredential
+    PSCredential for proxy authentication. Required for proxies that
+    enforce credential-based auth (NTLM, Basic). Build via Get-Credential
+    or load from a saved XML:
+        \$cred = Import-Clixml .\Config\proxy.xml
+        .\Get-DefenderDefinitions.ps1 -Proxy 'http://proxy:8080' -ProxyCredential \$cred
+
 .PARAMETER ConfigPath
     Path to a config.conf with an optional [Download] section.
     Default: .\conf\config.conf
@@ -87,6 +102,10 @@ param(
     [switch]$SkipSignatureCheck,
 
     [switch]$Force,
+
+    [string]$Proxy,
+
+    [pscredential]$ProxyCredential,
 
     [string]$ConfigPath
 )
@@ -205,6 +224,19 @@ $cfg = Read-ConfigFile $ConfigPath
 # rest; otherwise defaults apply.
 if (-not $PSBoundParameters.ContainsKey('OutputPath')    -and $cfg['DefaultOutputPath'])    { $OutputPath    = $cfg['DefaultOutputPath'] }
 if (-not $PSBoundParameters.ContainsKey('Architecture')  -and $cfg['DefaultArchitecture'])  { $Architecture  = $cfg['DefaultArchitecture'] }
+if (-not $PSBoundParameters.ContainsKey('Proxy')         -and $cfg['DefaultProxy'])         { $Proxy         = $cfg['DefaultProxy'] }
+# ProxyCredential is loaded from an Export-Clixml DPAPI blob if the config
+# points at one. The file is decryptable only by the same Windows identity
+# that exported it.
+if (-not $PSBoundParameters.ContainsKey('ProxyCredential') -and $cfg['DefaultProxyCredentialPath']) {
+    $credPath = $cfg['DefaultProxyCredentialPath']
+    if (-not [System.IO.Path]::IsPathRooted($credPath)) { $credPath = Join-Path $ScriptDir $credPath }
+    if (Test-Path $credPath) {
+        try { $ProxyCredential = Import-Clixml -Path $credPath } catch {
+            Write-Host "WARNING: DefaultProxyCredentialPath='$credPath' could not be loaded: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
 if (-not $OutputPath) { $OutputPath = Join-Path $ScriptDir 'definitions' }
 
 # Resolve the OutputPath against the script directory if a relative path
@@ -234,6 +266,10 @@ Write-Host "  Output path     : $OutputPath" -ForegroundColor White
 Write-Host "  Architectures   : $($Architectures -join ', ')" -ForegroundColor White
 Write-Host "  Signature check : $(if ($SkipSignatureCheck) { 'SKIPPED' } else { 'Enabled' })" -ForegroundColor $(if ($SkipSignatureCheck) { 'Yellow' } else { 'White' })
 Write-Host "  Force overwrite : $($Force.IsPresent)" -ForegroundColor White
+if ($Proxy) {
+    $credNote = if ($ProxyCredential) { " (auth: $($ProxyCredential.UserName))" } else { '' }
+    Write-Host "  Proxy           : $Proxy$credNote" -ForegroundColor White
+}
 Write-Host ''
 
 # ===================================================================
@@ -320,7 +356,18 @@ try {
         try {
             # -UseBasicParsing keeps the IE engine out of the loop (deprecated
             # on PowerShell 7+). -OutFile streams directly to disk.
-            Invoke-WebRequest -Uri $url -OutFile $tempFile -UseBasicParsing -ErrorAction Stop
+            # Proxy args are splatted only when set so the default behavior
+            # (use $env:HTTPS_PROXY) is preserved for callers who haven't
+            # opted into explicit proxy config.
+            $iwrArgs = @{
+                Uri             = $url
+                OutFile         = $tempFile
+                UseBasicParsing = $true
+                ErrorAction     = 'Stop'
+            }
+            if ($Proxy)           { $iwrArgs['Proxy']           = $Proxy }
+            if ($ProxyCredential) { $iwrArgs['ProxyCredential'] = $ProxyCredential }
+            Invoke-WebRequest @iwrArgs
         } catch {
             Write-Host "     [FAIL] Download error: $($_.Exception.Message)" -ForegroundColor Red
             [void]$failedArchs.Add($arch)

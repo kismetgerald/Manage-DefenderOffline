@@ -259,3 +259,35 @@ Describe 'Get-DefenderDefinitions.ps1 — Resolve-Architectures' {
         }
     }
 }
+
+Describe 'Get-DefenderDefinitions.ps1 — parameter surface' {
+    # Static parameter-existence checks. Verifies the script exposes the
+    # documented parameters so renames or accidental deletions are caught
+    # at unit-test time, not by an operator hitting "param not found" in
+    # the field.
+
+    BeforeAll {
+        $script:CmdInfo = Get-Command (Join-Path $script:RepoRoot 'Get-DefenderDefinitions.ps1')
+    }
+
+    It 'declares -Proxy as a [string]' {
+        $script:CmdInfo.Parameters.ContainsKey('Proxy') | Should -BeTrue
+        $script:CmdInfo.Parameters['Proxy'].ParameterType | Should -Be ([string])
+    }
+
+    It 'declares -ProxyCredential as a [pscredential]' {
+        $script:CmdInfo.Parameters.ContainsKey('ProxyCredential') | Should -BeTrue
+        $script:CmdInfo.Parameters['ProxyCredential'].ParameterType | Should -Be ([pscredential])
+    }
+
+    It 'declares -Force as a [switch]' {
+        $script:CmdInfo.Parameters['Force'].ParameterType | Should -Be ([switch])
+    }
+
+    It 'declares -Architecture as [string[]]' {
+        # Regression: v0.0.8 PR-Download originally bound this as [string],
+        # so unquoted commas on the CLI (-Architecture x64,arm64) failed
+        # parameter binding. Must remain [string[]].
+        $script:CmdInfo.Parameters['Architecture'].ParameterType | Should -Be ([string[]])
+    }
+}
