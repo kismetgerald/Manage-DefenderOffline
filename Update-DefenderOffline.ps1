@@ -1092,8 +1092,8 @@ function New-HtmlReport {
   .excluded      { background: #6b7280; }
   .h-healthy     { background: #107c10; }
   .h-degraded    { background: #ca5010; }
-  .h-threats     { background: #c50f1f; }
-  .h-probefail   { background: #6b7280; }
+  .h-threats     { background: #d13438; }
+  .h-probefail   { background: #4b5563; }
   .stat-card     { display: inline-block; padding: 14px 28px; border-radius: 10px; margin: 6px 8px 6px 0;
                    font-size: 1.1em; font-weight: 700; color: #fff; min-width: 120px; text-align: center;
                    cursor: pointer; user-select: none; }

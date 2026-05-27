@@ -180,6 +180,61 @@ Describe 'Get-DefenderHealthProbe — classification' {
     }
 }
 
+Describe 'Get-DefenderHealthClassification — pure classifier' {
+    # Direct tests on the extracted classifier. Get-DefenderHealthProbe
+    # delegates here; Show-DefenderStatus calls it on its own inline-collected
+    # data. Single source of truth — these tests are the contract.
+
+    It 'returns Healthy when all six toggles are on and no threats' {
+        $r = Get-DefenderHealthClassification `
+            -RealTimeProtectionEnabled  $true  -AntimalwareServiceEnabled  $true `
+            -AntivirusEnabled           $true  -BehaviorMonitorEnabled     $true `
+            -IoavProtectionEnabled      $true  -OnAccessProtectionEnabled  $true `
+            -RecentThreatCount          0
+        $r.OverallStatus | Should -Be 'Healthy'
+        $r.StatusReason  | Should -BeNullOrEmpty
+    }
+
+    It 'returns Degraded with a list of disabled protections' {
+        $r = Get-DefenderHealthClassification `
+            -RealTimeProtectionEnabled  $false -AntimalwareServiceEnabled  $true `
+            -AntivirusEnabled           $true  -BehaviorMonitorEnabled     $false `
+            -IoavProtectionEnabled      $true  -OnAccessProtectionEnabled  $true `
+            -RecentThreatCount          0
+        $r.OverallStatus | Should -Be 'Degraded'
+        $r.StatusReason  | Should -Match 'real-time protection'
+        $r.StatusReason  | Should -Match 'behavior monitor'
+    }
+
+    It 'returns ThreatsDetected when threat count meets threshold' {
+        $r = Get-DefenderHealthClassification `
+            -RealTimeProtectionEnabled  $true  -AntimalwareServiceEnabled  $true `
+            -AntivirusEnabled           $true  -BehaviorMonitorEnabled     $true `
+            -IoavProtectionEnabled      $true  -OnAccessProtectionEnabled  $true `
+            -RecentThreatCount          3      -ThreatSpikeThreshold       3
+        $r.OverallStatus | Should -Be 'ThreatsDetected'
+        $r.StatusReason  | Should -Match '3 threat'
+    }
+
+    It 'prefers Degraded over ThreatsDetected when both apply' {
+        $r = Get-DefenderHealthClassification `
+            -RealTimeProtectionEnabled  $false -AntimalwareServiceEnabled  $true `
+            -AntivirusEnabled           $true  -BehaviorMonitorEnabled     $true `
+            -IoavProtectionEnabled      $true  -OnAccessProtectionEnabled  $true `
+            -RecentThreatCount          10     -ThreatSpikeThreshold       1
+        $r.OverallStatus | Should -Be 'Degraded'
+    }
+
+    It 'returns Healthy when threats are below threshold' {
+        $r = Get-DefenderHealthClassification `
+            -RealTimeProtectionEnabled  $true  -AntimalwareServiceEnabled  $true `
+            -AntivirusEnabled           $true  -BehaviorMonitorEnabled     $true `
+            -IoavProtectionEnabled      $true  -OnAccessProtectionEnabled  $true `
+            -RecentThreatCount          2      -ThreatSpikeThreshold       5
+        $r.OverallStatus | Should -Be 'Healthy'
+    }
+}
+
 Describe 'Get-DefenderHealthProbe — parameter surface' {
 
     It 'requires either -ComputerName or -Session' {
