@@ -454,21 +454,27 @@ function Get-DefenderStatus {
     )
 
     $result = [pscustomobject]@{
-        ComputerName       = $Computer
-        Online             = $false
-        DefenderService    = 'Unknown'
-        SignatureVersion   = ''
-        AvailableVersion   = $AvailableVersionStr
-        VersionStatus      = 'Unknown'
-        RealTimeProtection = 'Unknown'
-        AntivirusEnabled   = 'Unknown'
-        LastQuickScan      = ''
-        LastFullScan       = ''
-        ThreatCount        = ''
-        HealthStatus       = ''
-        HealthReason       = ''
-        QueryDuration      = 0
-        Error              = ''
+        ComputerName              = $Computer
+        Online                    = $false
+        DefenderService           = 'Unknown'
+        SignatureVersion          = ''
+        AvailableVersion          = $AvailableVersionStr
+        VersionStatus             = 'Unknown'
+        RealTimeProtection        = 'Unknown'
+        AntivirusEnabled          = 'Unknown'
+        # Full toggle set surfaced in the Host Details dialog (v0.0.10).
+        AmServiceEnabled          = 'Unknown'
+        BehaviorMonitorEnabled    = 'Unknown'
+        IoavProtectionEnabled     = 'Unknown'
+        OnAccessProtectionEnabled = 'Unknown'
+        LastQuickScan             = ''
+        LastFullScan              = ''
+        ThreatCount               = ''
+        ThreatList                = @()
+        HealthStatus              = ''
+        HealthReason              = ''
+        QueryDuration             = 0
+        Error                     = ''
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -506,6 +512,18 @@ function Get-DefenderStatus {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
+                # Collect the full Get-MpThreat list (not just count) so the
+                # Host Details drill-in can render per-threat info. Select
+                # only safe primitive fields so the objects round-trip cleanly
+                # across the WinRM serialization boundary.
+                $threats = @()
+                if ($mp) {
+                    $threats = @(Get-MpThreat -ErrorAction SilentlyContinue |
+                        Select-Object @{N='ThreatName';          E={ [string]$_.ThreatName }},
+                                      @{N='ThreatID';            E={ [int64]$_.ThreatID }},
+                                      @{N='InitialDetectionTime';E={ $_.InitialDetectionTime }},
+                                      @{N='Resources';           E={ ($_.Resources -join '; ') }})
+                }
                 [pscustomobject]@{
                     SvcStatus            = $svc.Status
                     SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }   else { $null }
@@ -517,20 +535,24 @@ function Get-DefenderStatus {
                     OnAccessProtection   = if ($mp) { $mp.OnAccessProtectionEnabled }   else { $null }
                     LastQuickScan        = if ($mp) { $mp.QuickScanStartTime }          else { $null }
                     LastFullScan         = if ($mp) { $mp.FullScanStartTime }           else { $null }
-                    ThreatCount          = if ($mp) {
-                        (Get-MpThreat -ErrorAction SilentlyContinue | Measure-Object).Count
-                    } else { $null }
+                    ThreatCount          = $threats.Count
+                    ThreatList           = $threats
                 }
             }
 
-            $result.Online             = $true
-            $result.DefenderService    = $data.SvcStatus
-            $result.SignatureVersion   = $data.SignatureVersion
-            $result.RealTimeProtection = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
-            $result.AntivirusEnabled   = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
-            $result.LastQuickScan      = if ($data.LastQuickScan) { $data.LastQuickScan.ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
-            $result.LastFullScan       = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
-            $result.ThreatCount        = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
+            $result.Online                    = $true
+            $result.DefenderService           = $data.SvcStatus
+            $result.SignatureVersion          = $data.SignatureVersion
+            $result.RealTimeProtection        = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
+            $result.AntivirusEnabled          = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
+            $result.AmServiceEnabled          = if ($null -ne $data.AMServiceEnabled)   { $data.AMServiceEnabled.ToString() }   else { 'Unknown' }
+            $result.BehaviorMonitorEnabled    = if ($null -ne $data.BehaviorMonitor)    { $data.BehaviorMonitor.ToString() }    else { 'Unknown' }
+            $result.IoavProtectionEnabled     = if ($null -ne $data.IoavProtection)     { $data.IoavProtection.ToString() }     else { 'Unknown' }
+            $result.OnAccessProtectionEnabled = if ($null -ne $data.OnAccessProtection) { $data.OnAccessProtection.ToString() } else { 'Unknown' }
+            $result.LastQuickScan             = if ($data.LastQuickScan) { $data.LastQuickScan.ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
+            $result.LastFullScan              = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
+            $result.ThreatCount               = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
+            $result.ThreatList                = @($data.ThreatList)
 
             # Classify via the shared helper if Get-MpComputerStatus returned
             # the full toggle set. If any toggle is $null (Defender service
@@ -983,6 +1005,226 @@ $statusLabel.ForeColor  = $clrTextDark
 $statusStrip.Items.Add($statusLabel) | Out-Null
 #endregion
 
+#region Host Details dialog  (right-click / double-click drill-in)
+# Modal dialog showing the full Defender state for one host. Surfaces fields
+# that aren't in the grid (HealthReason, all 6 protection toggles, last full
+# scan, full Error text) plus the per-threat list collected by Get-MpThreat.
+
+function Show-HostDetailsDialog {
+    param([Parameter(Mandatory)][pscustomobject]$HostData)
+
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text          = "Host Details – $($HostData.ComputerName)"
+    $dlg.Size          = [System.Drawing.Size]::new(760, 720)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimumSize   = [System.Drawing.Size]::new(640, 480)
+    $dlg.BackColor     = $clrBackground
+    $dlg.Font          = [System.Drawing.Font]::new('Segoe UI', 9)
+    $dlg.ShowIcon      = $false
+
+    # Recompute the same Status pill text the grid uses so the dialog matches
+    # what the operator just clicked on.
+    $pillStatus = if (-not $HostData.Online) { 'Offline' }
+                  elseif ($HostData.VersionStatus -eq 'Outdated') { 'Outdated' }
+                  elseif ($HostData.HealthStatus) { $HostData.HealthStatus }
+                  elseif ($HostData.RealTimeProtection -eq 'False' -or $HostData.AntivirusEnabled -eq 'False') { 'Degraded' }
+                  else { 'Healthy' }
+    $pillBg = switch ($pillStatus) {
+        'Healthy'         { $clrSuccess }
+        'Offline'         { $clrOffline }
+        'Outdated'        { $clrOutdatedPill }
+        'Degraded'        { $clrWarn }
+        'ThreatsDetected' { $clrError }
+        default           { [System.Drawing.Color]::Gray }
+    }
+
+    # Root scroll container so longer error text or threat lists don't get
+    # clipped on small dialog sizes.
+    $scroll = [System.Windows.Forms.Panel]::new()
+    $scroll.Dock       = 'Fill'
+    $scroll.AutoScroll = $true
+    $scroll.Padding    = [System.Windows.Forms.Padding]::new(16)
+
+    $stack = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $stack.Dock          = 'Top'
+    $stack.AutoSize      = $true
+    $stack.FlowDirection = 'TopDown'
+    $stack.WrapContents  = $false
+    $stack.Width         = 700
+
+    # ---- Helpers ---------------------------------------------------------
+    $addSectionHeader = {
+        param([string]$Text)
+        $lbl = [System.Windows.Forms.Label]::new()
+        $lbl.Text      = $Text.ToUpper()
+        $lbl.Font      = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+        $lbl.ForeColor = $clrPrimary
+        $lbl.AutoSize  = $true
+        $lbl.Margin    = [System.Windows.Forms.Padding]::new(0, 14, 0, 4)
+        $stack.Controls.Add($lbl)
+    }
+    $addKeyValue = {
+        param([string]$Key, [string]$Value, [System.Drawing.Color]$ValueColor = $clrTextDark)
+        $row = [System.Windows.Forms.TableLayoutPanel]::new()
+        $row.ColumnCount = 2
+        $row.RowCount    = 1
+        $row.AutoSize    = $true
+        $row.Width       = 680
+        $row.Margin      = [System.Windows.Forms.Padding]::new(8, 1, 0, 1)
+        [void]$row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Absolute', 200))
+        [void]$row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 100))
+
+        $lblK = [System.Windows.Forms.Label]::new()
+        $lblK.Text      = "$Key :"
+        $lblK.AutoSize  = $true
+        $lblK.ForeColor = $clrTextMuted
+        $row.Controls.Add($lblK, 0, 0)
+
+        $lblV = [System.Windows.Forms.Label]::new()
+        $lblV.Text      = if ([string]::IsNullOrWhiteSpace($Value)) { '—' } else { $Value }
+        $lblV.AutoSize  = $true
+        $lblV.ForeColor = $ValueColor
+        $row.Controls.Add($lblV, 1, 0)
+
+        $stack.Controls.Add($row)
+    }
+    $boolColor = {
+        param($Value)
+        if ($Value -eq 'True')  { return $clrSuccess }
+        if ($Value -eq 'False') { return $clrError }
+        return $clrTextDark
+    }
+
+    # ---- Identity --------------------------------------------------------
+    & $addSectionHeader 'Identity'
+    & $addKeyValue 'Computer'        $HostData.ComputerName
+    & $addKeyValue 'Online'          $(if ($HostData.Online) { 'Yes' } else { 'No' }) (& $boolColor ($HostData.Online.ToString()))
+    & $addKeyValue 'Query duration'  ("{0}s" -f $HostData.QueryDuration)
+
+    # ---- Health classification (with pill) -------------------------------
+    & $addSectionHeader 'Health Classification'
+    $pillRow = [System.Windows.Forms.TableLayoutPanel]::new()
+    $pillRow.ColumnCount = 2
+    $pillRow.RowCount    = 1
+    $pillRow.AutoSize    = $true
+    $pillRow.Width       = 680
+    $pillRow.Margin      = [System.Windows.Forms.Padding]::new(8, 1, 0, 1)
+    [void]$pillRow.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Absolute', 200))
+    [void]$pillRow.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 100))
+    $lblPillKey = [System.Windows.Forms.Label]::new()
+    $lblPillKey.Text = 'Status :'; $lblPillKey.AutoSize = $true; $lblPillKey.ForeColor = $clrTextMuted
+    $pillRow.Controls.Add($lblPillKey, 0, 0)
+    $pill = [System.Windows.Forms.Label]::new()
+    $pill.Text      = $pillStatus
+    $pill.AutoSize  = $true
+    $pill.BackColor = $pillBg
+    $pill.ForeColor = $clrWhite
+    $pill.Font      = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $pill.Padding   = [System.Windows.Forms.Padding]::new(10, 3, 10, 3)
+    $pillRow.Controls.Add($pill, 1, 0)
+    $stack.Controls.Add($pillRow)
+    & $addKeyValue 'Reason' (if ($HostData.HealthReason) { $HostData.HealthReason } else { '—' })
+
+    # ---- Defender state --------------------------------------------------
+    & $addSectionHeader 'Defender State'
+    & $addKeyValue 'WinDefend service' $HostData.DefenderService
+    $verLabel = $HostData.SignatureVersion
+    if ($HostData.VersionStatus) { $verLabel = "$($HostData.SignatureVersion) ($($HostData.VersionStatus))" }
+    & $addKeyValue 'Signature version' $verLabel
+    & $addKeyValue 'Available version' $HostData.AvailableVersion
+    & $addKeyValue 'Real-time protection'  $HostData.RealTimeProtection         (& $boolColor $HostData.RealTimeProtection)
+    & $addKeyValue 'Antimalware service'   $HostData.AmServiceEnabled           (& $boolColor $HostData.AmServiceEnabled)
+    & $addKeyValue 'Antivirus engine'      $HostData.AntivirusEnabled           (& $boolColor $HostData.AntivirusEnabled)
+    & $addKeyValue 'Behavior monitor'      $HostData.BehaviorMonitorEnabled     (& $boolColor $HostData.BehaviorMonitorEnabled)
+    & $addKeyValue 'IOAV protection'       $HostData.IoavProtectionEnabled      (& $boolColor $HostData.IoavProtectionEnabled)
+    & $addKeyValue 'On-access protection'  $HostData.OnAccessProtectionEnabled  (& $boolColor $HostData.OnAccessProtectionEnabled)
+
+    # ---- Scans -----------------------------------------------------------
+    & $addSectionHeader 'Scans'
+    & $addKeyValue 'Last quick scan' $HostData.LastQuickScan
+    & $addKeyValue 'Last full scan'  $HostData.LastFullScan
+
+    # ---- Threats ---------------------------------------------------------
+    $threatList = @($HostData.ThreatList)
+    & $addSectionHeader ("Threats ({0})" -f $threatList.Count)
+    if ($threatList.Count -gt 0) {
+        $threatGrid = [System.Windows.Forms.DataGridView]::new()
+        $threatGrid.Width                 = 680
+        $threatGrid.Height                = [Math]::Min(40 + 24 * $threatList.Count, 240)
+        $threatGrid.Margin                = [System.Windows.Forms.Padding]::new(8, 4, 0, 4)
+        $threatGrid.ReadOnly              = $true
+        $threatGrid.AllowUserToAddRows    = $false
+        $threatGrid.AllowUserToResizeRows = $false
+        $threatGrid.RowHeadersVisible     = $false
+        $threatGrid.BackgroundColor       = $clrCardBg
+        $threatGrid.BorderStyle           = 'FixedSingle'
+        $threatGrid.AutoSizeColumnsMode   = 'Fill'
+        $threatGrid.SelectionMode         = 'FullRowSelect'
+        $threatGrid.EnableHeadersVisualStyles = $false
+        $threatGrid.ColumnHeadersDefaultCellStyle.BackColor = $clrPrimary
+        $threatGrid.ColumnHeadersDefaultCellStyle.ForeColor = $clrWhite
+        $threatGrid.ColumnHeadersDefaultCellStyle.Font      = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+        $threatGrid.RowTemplate.Height                      = 22
+
+        foreach ($c in @(
+            @{ Name='Threat';    Weight=22 },
+            @{ Name='Detected';  Weight=18 },
+            @{ Name='Resource';  Weight=60 }
+        )) {
+            $col = [System.Windows.Forms.DataGridViewTextBoxColumn]::new()
+            $col.HeaderText = $c.Name
+            $col.FillWeight = $c.Weight
+            $col.ReadOnly   = $true
+            [void]$threatGrid.Columns.Add($col)
+        }
+
+        foreach ($t in $threatList) {
+            $detected = if ($t.InitialDetectionTime) { $t.InitialDetectionTime.ToString('yyyy-MM-dd HH:mm') } else { '—' }
+            [void]$threatGrid.Rows.Add($t.ThreatName, $detected, $t.Resources)
+        }
+        $stack.Controls.Add($threatGrid)
+    } else {
+        & $addKeyValue 'No threats reported' ''
+    }
+
+    # ---- Error / Detail --------------------------------------------------
+    if ($HostData.Error) {
+        & $addSectionHeader 'Error / Detail'
+        $errLbl = [System.Windows.Forms.Label]::new()
+        $errLbl.Text      = $HostData.Error
+        $errLbl.AutoSize  = $true
+        $errLbl.MaximumSize = [System.Drawing.Size]::new(680, 0)
+        $errLbl.ForeColor = $clrError
+        $errLbl.Margin    = [System.Windows.Forms.Padding]::new(8, 1, 0, 1)
+        $stack.Controls.Add($errLbl)
+    }
+
+    $scroll.Controls.Add($stack)
+
+    # ---- Bottom button bar ----------------------------------------------
+    $btnPanel = [System.Windows.Forms.Panel]::new()
+    $btnPanel.Dock      = 'Bottom'
+    $btnPanel.Height    = 48
+    $btnPanel.BackColor = $clrToolbarBg
+    $btnClose = [System.Windows.Forms.Button]::new()
+    $btnClose.Text         = 'Close'
+    $btnClose.Width        = 100
+    $btnClose.Height       = 30
+    $btnClose.Top          = 9
+    $btnClose.Left         = $dlg.ClientSize.Width - $btnClose.Width - 16
+    $btnClose.Anchor       = 'Top,Right'
+    $btnClose.DialogResult = 'OK'
+    $btnPanel.Controls.Add($btnClose)
+    $dlg.AcceptButton = $btnClose
+    $dlg.CancelButton = $btnClose
+
+    $dlg.Controls.Add($scroll)
+    $dlg.Controls.Add($btnPanel)
+    [void]$dlg.ShowDialog()
+    $dlg.Dispose()
+}
+#endregion
+
 #region DataGridView
 $grid                       = [System.Windows.Forms.DataGridView]::new()
 $grid.Dock                  = 'Fill'
@@ -1110,6 +1352,42 @@ $grid.add_CellPainting({
 
     $e.Graphics.SmoothingMode = $prevSmoothing
     $e.Handled = $true
+})
+
+# Right-click + double-click → Host Details drill-in dialog.
+# Grid filtering is non-destructive (only changes which rows are displayed),
+# so we look up the per-host record from $script:AllResults by ComputerName
+# rather than relying on the visible row index.
+$ctxMenu  = [System.Windows.Forms.ContextMenuStrip]::new()
+$ctxView  = $ctxMenu.Items.Add('View Details…')
+$grid.ContextMenuStrip = $ctxMenu
+
+$openDetails = {
+    param([int]$RowIndex)
+    if ($RowIndex -lt 0 -or $RowIndex -ge $grid.Rows.Count) { return }
+    $comp = $grid.Rows[$RowIndex].Cells[0].Value
+    if (-not $comp) { return }
+    $rec = $script:AllResults | Where-Object { $_.ComputerName -eq $comp } | Select-Object -First 1
+    if ($rec) { Show-HostDetailsDialog -HostData $rec }
+}
+
+# Right-click on a row should select it before the context menu fires so the
+# menu acts on the row under the cursor (matches standard Explorer behaviour).
+$grid.add_CellMouseDown({
+    param($src, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right -and $e.RowIndex -ge 0) {
+        $grid.ClearSelection()
+        $grid.Rows[$e.RowIndex].Selected = $true
+    }
+})
+
+$ctxView.add_Click({
+    if ($grid.SelectedRows.Count -gt 0) { & $openDetails $grid.SelectedRows[0].Index }
+})
+
+$grid.add_CellDoubleClick({
+    param($src, $e)
+    & $openDetails $e.RowIndex
 })
 #endregion
 
