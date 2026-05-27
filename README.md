@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.7-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.8-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 ## Overview
 
@@ -19,14 +19,17 @@
 - 📝 **Audit-grade access logging** — every authentication decision logged with user identity + source IP + reason (NIST 800-53 AU-2 / STIG AC-7)
 - 🔄 **Auto-discovery** of computers from Active Directory
 - 🔧 **Email notifications** with HTML reports and CSV attachments
-- 🛡️ **Safe & tested** — 174-test Pester suite + GitHub Actions CI + dry-run mode + automatic retry logic
+- 🛡️ **Safe & tested** — 201-test Pester suite + GitHub Actions CI + dry-run mode + automatic retry logic
 - ⚙️ **Enterprise-ready** for scheduled tasks, service accounts, and gMSA
 - 📈 **Version analytics** with fleet-wide statistics and CSV exports
+- ⬇️ **Definition download helper** — `Get-DefenderDefinitions.ps1` pulls mpam-fe.exe (x64 / x86 / arm64) from Microsoft on a staging host, with SHA-256 sidecars, Authenticode verification, and a transfer manifest
+- 🏗️ **Per-host architecture dispatch** — `Update-DefenderOffline.ps1` auto-detects each endpoint's OS architecture and sends the matching binary (`x64` / `x86` / `arm64`) in a single fleet pass
 
 ## Scripts
 
 | Script | Purpose | Run by |
 |---|---|---|
+| `Get-DefenderDefinitions.ps1` | Downloads mpam-fe.exe (x64 / x86 / arm64) from Microsoft for transfer into the air-gapped share | Admin, on an internet-connected staging machine |
 | `Update-DefenderOffline.ps1` | Deploys definition updates to all endpoints | Admin (manual or scheduled task) |
 | `Show-DefenderStatus.ps1` | Interactive Windows Forms fleet health monitor | Admin, interactively |
 | `Start-DefenderDashboard.ps1` | Headless HTTP dashboard service | Scheduled task (service account / gMSA) |
@@ -63,35 +66,63 @@ Invoke-Command -ComputerName TARGETPC -ScriptBlock {
 
 ## Quick Start: Update-DefenderOffline.ps1
 
-### Step 1: Download Latest Definitions
+### Step 1: Download Latest Definitions (use the helper)
 
-On an **internet-connected** machine, download from Microsoft:
+On an **internet-connected** staging machine, run:
+
+```powershell
+.\Get-DefenderDefinitions.ps1
+```
+
+That single command downloads `mpam-fe.exe` for **x64, x86, and arm64** from Microsoft, verifies each binary's Authenticode signature, reads the embedded version from the file resource, computes SHA-256 hashes (sidecar `mpam-fe.sha256` per architecture), and lays everything out in the directory structure the air-gapped consumer expects (see Step 2). A `transfer-manifest.json` is generated alongside so the data-diode / one-way-transfer workflow has a checksum-attested record of what was pulled.
+
+Selective architecture download:
+
+```powershell
+.\Get-DefenderDefinitions.ps1 -Architecture x64           # x64 only
+.\Get-DefenderDefinitions.ps1 -Architecture x64,arm64     # subset
+.\Get-DefenderDefinitions.ps1 -OutputPath D:\Staging      # custom output dir
+.\Get-DefenderDefinitions.ps1 -Force                      # overwrite existing version folder
+```
+
+Microsoft fwlink endpoints (for reference; the helper uses these automatically):
 
 | Architecture | URL |
 |---|---|
-| x64 (most common) | https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64 |
+| x64 | https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64 |
 | x86 | https://go.microsoft.com/fwlink/?LinkID=121721&arch=x86 |
 | ARM64 | https://go.microsoft.com/fwlink/?LinkID=121721&arch=arm64 |
 
-The downloaded file is always named `mpam-fe.exe`.
-
 ### Step 2: Place the File on the Network Share
 
-The share **must** follow this folder structure:
+The share **must** follow this folder structure (per-arch subfolders, introduced in v0.0.8):
 
 ```
-<SourceSharePath>\<YYYYMMDD>\v#.###.###.#\mpam-fe.exe
+<SourceSharePath>\<YYYYMMDD>\v#.###.###.#\<arch>\mpam-fe.exe
 ```
+
+where `<arch>` is `x64`, `x86`, or `arm64`.
 
 **Example:**
 ```
 \\NAS01\DataShare\Software Installers\_AVDefinitions\Microsoft_Defender\
     20260520\
-        v1.449.681.0\
-            mpam-fe.exe
+        v1.451.85.0\
+            x64\
+                mpam-fe.exe
+            x86\
+                mpam-fe.exe
+            arm64\
+                mpam-fe.exe
 ```
 
-The script discovers the available version by parsing the `v#.###.###.#` folder name — not by file modification date. Creating a new date/version subfolder for each download keeps the history clean and makes rollback straightforward.
+**Backward-compatible flat layout** (legacy shares from v0.0.7 and earlier) is still supported — files at `<version>\mpam-fe.exe` (no arch subfolder) are treated as x64 for compatibility:
+
+```
+\\NAS01\...\20260520\v1.451.85.0\mpam-fe.exe         ← classified as x64
+```
+
+`Update-DefenderOffline.ps1` auto-detects each endpoint's OS architecture over WinRM and dispatches the matching file. To override, set `Architecture = x64` in `[Update]` of `config.conf` (or pass `-Architecture x64` on the CLI).
 
 ### Step 3: Configure
 
@@ -649,7 +680,36 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.7 (2026-05-25) — Current
+### v0.0.8 (2026-05-26) — Current
+
+AD OU scoping for discovery + a complete internet-side → air-gap-share staging workflow. `Update-DefenderOffline` now picks the right binary for each endpoint's actual architecture instead of pushing a single x64 file at every host.
+
+**Discovery (`Update-DefenderOffline.ps1`, `Show-DefenderStatus.ps1`, `Start-DefenderDashboard.ps1`):**
+- ✨ **`-ADSearchBase`** — restrict AD auto-discovery to one or more OU DNs (semicolon-separated; commas are valid inside DNs). All three scripts share a centralized `lib/Get-DefenderComputers.ps1` helper
+- ✨ **Hybrid validation** — partial resolution warns and continues with the subset that resolved; all-bad fails fast with a clear error
+- ✨ `hosts.conf` is bypassed (read + auto-write) when `-ADSearchBase` is set, so a scoped result isn't cached as the fleet default
+- 🐛 Discovery failures now `exit 1` with a friendly help block instead of dumping an exception trace
+- 🐛 Success paths set `exit 0` explicitly so `$LASTEXITCODE` is reliable for scheduled-task health checks
+
+**Definition staging (`Get-DefenderDefinitions.ps1` — NEW):**
+- ✨ Internet-side helper that downloads `mpam-fe.exe` for **x64, x86, and arm64** from Microsoft fwlinks
+- ✨ `-Architecture x64,arm64` (or `All`, the default) — comma-separated selector
+- ✨ Authenticode signature verification (Microsoft signer) before publishing
+- ✨ Per-file `.sha256` sidecars + `transfer-manifest.json` to drive integrity checks on the air-gap side
+- ✨ Output layout: `<OutputPath>\<YYYYMMDD>\v<version>\<arch>\mpam-fe.exe` — consumable directly by `Update-DefenderOffline`
+- ✨ `-SkipSignatureCheck` and `-Force` escape hatches for lab use
+
+**Update dispatch (`Update-DefenderOffline.ps1`):**
+- ✨ **Per-host architecture dispatch** — each endpoint's `Win32_OperatingSystem.OSArchitecture` is queried inside the existing pre-transfer probe (no extra WinRM round-trip) and the matching binary is selected
+- ✨ Pre-flight log now shows a per-arch breakdown of what's available in the share
+- ✨ `-Architecture <arch>` operator override — force a single architecture for every host (auto-detection disabled)
+- ✨ Backward-compatible — legacy flat-layout shares (`<version>\mpam-fe.exe`, no arch subfolder) are still accepted and classified as x64
+- ✨ Fails fast with a CRITICAL error and clean exit code when a forced `-Architecture` isn't present in the share
+
+**Test infrastructure:**
+- ✨ +30 Pester tests across `tests/AdOuFilter.Tests.ps1` and `tests/DownloadHelper.Tests.ps1` — full suite now at 201 tests
+
+### v0.0.7 (2026-05-25)
 
 Auth + HTTPS + audit logging. Dashboard goes from "trust the network" to "trust the user." Test infrastructure added so regressions get caught before they ship.
 

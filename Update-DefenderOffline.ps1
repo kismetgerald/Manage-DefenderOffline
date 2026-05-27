@@ -193,6 +193,12 @@ param(
     [pscredential]$ADCredential,
     [switch]$SaveADCredential,
 
+    # Restrict AD auto-discovery to one or more OU subtrees. Distinguished-name
+    # format; multiple DNs separated by semicolons (commas are valid inside DNs).
+    # Empty = whole-domain search (default).
+    #   Example: 'OU=Workstations,OU=Endpoints,DC=contoso,DC=com;OU=ServersUS,DC=contoso,DC=com'
+    [string]$ADSearchBase,
+
     # Endpoint classification
     [ValidateSet('AD','Pattern','Single')]
     [string]$ClassificationMethod,
@@ -202,6 +208,13 @@ param(
     # Skip IPv6 in endpoint reachability tests. See conf/config.conf for details.
     [bool]$DisableIPv6 = $true,
 
+    # Force a specific architecture for ALL hosts instead of auto-detecting
+    # per-host via WinRM. Default is empty = auto-detect per host. Use this
+    # when you want to roll a specific arch out to a subset of the fleet,
+    # or when the per-host CIM call is unreliable.
+    [ValidateSet('', 'x64', 'x86', 'arm64')]
+    [string]$Architecture,
+
     # Path to configuration file. Defaults to .\conf\config.conf relative to the script.
     [string]$ConfigPath
 )
@@ -209,7 +222,7 @@ param(
 # ===================================================================
 # Constants
 # ===================================================================
-$ScriptVersion   = '0.0.7'
+$ScriptVersion   = '0.0.8'
 $ScriptStartTime = Get-Date
 $ScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
@@ -219,6 +232,8 @@ $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
 # is available there too.
 $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
+$LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
+. $LibGetDefenderComputers
 $RunAsUser       = "$env:USERDOMAIN\$env:USERNAME"
 $RunFromHost     = $env:COMPUTERNAME
 $RunFromIP       = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -362,6 +377,8 @@ $cfg = Read-ConfigFile $ConfigPath
 # Apply config values for parameters not explicitly passed on the command line.
 # Command-line parameters always win; config fills in what was omitted.
 if (-not $PSBoundParameters.ContainsKey('SourceSharePath')    -and $cfg['SourceSharePath'])    { $SourceSharePath    = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ADSearchBase')       -and $cfg['ADSearchBase'])       { $ADSearchBase       = $cfg['ADSearchBase'] }
+if (-not $PSBoundParameters.ContainsKey('Architecture')       -and $cfg['Architecture'])       { $Architecture       = $cfg['Architecture'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('LogPath')            -and $cfg['LogPath'])            { $LogPath            = $cfg['LogPath'] }
 if (-not $PSBoundParameters.ContainsKey('ReportPath')         -and $cfg['ReportPath'])         { $ReportPath         = $cfg['ReportPath'] }
 if (-not $PSBoundParameters.ContainsKey('TempFolderOnTarget') -and $cfg['TempFolderOnTarget']) { $TempFolderOnTarget = $cfg['TempFolderOnTarget'] }
@@ -473,17 +490,28 @@ function Resolve-TargetComputers {
         return $list
     }
 
-    # 2. hosts.conf in script directory
-    if (Test-Path $HostsFile) {
+    # 2. hosts.conf in script directory.
+    #    Skipped when -ADSearchBase is set: the operator is explicitly asking
+    #    for a scoped AD query, so a cached snapshot from a previous (possibly
+    #    differently-scoped) run is semantically wrong. Otherwise hosts.conf
+    #    is the preferred path because it's both faster and lets operators
+    #    manually curate the list (exclude lab boxes, add workgroup hosts).
+    $hostsExists = Test-Path $HostsFile
+    if (-not $ADSearchBase -and $hostsExists) {
         $list = Get-Content $HostsFile |
             Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\S' } |
             ForEach-Object { $_.Trim().ToUpper() }
         Write-Log "Loaded $($list.Count) computers from hosts.conf" 'SUCCESS'
         return $list
     }
+    if ($ADSearchBase -and $hostsExists) {
+        Write-Log "Ignoring hosts.conf because ADSearchBase is set; querying AD with that scope." 'INFO'
+    }
 
     # 3. Active Directory auto-discovery
-    Write-Log 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
+    if (-not $hostsExists) {
+        Write-Log 'hosts.conf not found – attempting Active Directory auto-discovery...' 'WARN'
+    }
     $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
     if (-not $hasAdModule) {
         Write-Log 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' 'INFO'
@@ -491,41 +519,43 @@ function Resolve-TargetComputers {
     if ($ADCredential) {
         Write-Log "Using -ADCredential for LDAP bind: $($ADCredential.UserName)" 'INFO'
     }
+    if ($ADSearchBase) {
+        Write-Log "Restricting AD discovery to: $ADSearchBase" 'INFO'
+    }
     try {
-        if ($hasAdModule) {
-            Import-Module ActiveDirectory -ErrorAction Stop
-            $adParams = @{
-                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
-                Properties = 'Name'
+        $discovery = Get-DefenderComputers -SearchBase $ADSearchBase -ADCredential $ADCredential
+
+        # Log per-DN status (hybrid validation reporting)
+        if ($discovery.WasFiltered) {
+            foreach ($s in $discovery.SearchBases) {
+                if ($s.Resolved) {
+                    Write-Log "  AD search base '$($s.DN)' -> $($s.Count) computer(s)" 'INFO'
+                } else {
+                    Write-Log "  AD search base '$($s.DN)' could not be resolved: $($s.Error)" 'WARN'
+                }
             }
-            if ($ADCredential) { $adParams.Credential = $ADCredential }
-            $computers = Get-ADComputer @adParams |
-                Sort-Object Name |
-                Select-Object -ExpandProperty Name
-        } else {
-            # ADSI fallback.  When -ADCredential is supplied we bind via
-            # DirectoryEntry with explicit credentials; otherwise we use
-            # [adsisearcher] which binds as the current process identity.
-            $domain   = (Get-CimInstance Win32_ComputerSystem).Domain
-            $filter   = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            if ($ADCredential) {
-                $de = [System.DirectoryServices.DirectoryEntry]::new(
-                    "LDAP://$domain",
-                    $ADCredential.UserName,
-                    $ADCredential.GetNetworkCredential().Password)
-                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
-                $searcher.Filter = $filter
-            } else {
-                $searcher = [adsisearcher]$filter
-                $searcher.SearchRoot = "LDAP://$domain"
+            $resolved = @($discovery.SearchBases | Where-Object Resolved).Count
+            $total    = $discovery.SearchBases.Count
+            if ($resolved -eq 0) {
+                throw "All $total AD search base(s) failed to resolve. Check ADSearchBase syntax / AD reachability."
             }
-            $computers = $searcher.FindAll() |
-                ForEach-Object { $_.Properties.name[0] } |
-                Sort-Object
-            if ($ADCredential) { $de.Dispose() }
+            if ($resolved -lt $total) {
+                Write-Log "Partial AD search-base resolution: $resolved of $total succeeded. Continuing with the resolved subset." 'WARN'
+            }
         }
 
-        $header = @"
+        $computers = $discovery.Computers
+        if (-not $computers -or $computers.Count -eq 0) {
+            throw 'AD discovery returned no computers.'
+        }
+
+        # Auto-write hosts.conf only when this run was an UNFILTERED
+        # whole-domain discovery. Caching a scoped (ADSearchBase) result would
+        # silently override a later whole-domain run, and operators changing
+        # ADSearchBase between runs would see stale results until they
+        # remembered to delete the cache.
+        if (-not $ADSearchBase) {
+            $header = @"
 # =============================================================================
 # hosts.conf – AUTO-GENERATED by Update-DefenderOffline.ps1 v$ScriptVersion
 # Generated  : $(Get-Date)
@@ -536,9 +566,12 @@ function Resolve-TargetComputers {
 # =============================================================================
 
 "@
-        ($header + ($computers -join "`r`n")) |
-            Out-File -FilePath $HostsFile -Encoding UTF8 -Force
-        Write-Log "Auto-generated hosts.conf with $($computers.Count) computers" 'SUCCESS'
+            ($header + ($computers -join "`r`n")) |
+                Out-File -FilePath $HostsFile -Encoding UTF8 -Force
+            Write-Log "Auto-generated hosts.conf with $($computers.Count) computers" 'SUCCESS'
+        } else {
+            Write-Log "hosts.conf was NOT auto-written because ADSearchBase is set (would cache a scoped result)." 'INFO'
+        }
         return $computers
 
     } catch {
@@ -588,15 +621,29 @@ You have four ways to proceed:
 ==============================================================================
 "@
         Write-Host $help -ForegroundColor Yellow
-        throw 'Cannot proceed without a target list.'
+        # exit (not throw): the friendly help block above is the operator-facing
+        # message — letting throw bubble up would print the exception text on top
+        # of that, doubling the noise. Exit 1 preserves the non-zero status for
+        # scheduled-task wrappers without the duplicated error display.
+        exit 1
     }
 }
 
 # ===================================================================
 # Source File Discovery
-# Expects: <SourceSharePath>\<YYYYMMDD>\v#.###.###.#\mpam-fe.exe
+#
+# Supports two share layouts:
+#   Flat (legacy)   : <SourceSharePath>\<YYYYMMDD>\v#.#.#.#\mpam-fe.exe
+#   Per-arch (v0.0.8): <SourceSharePath>\<YYYYMMDD>\v#.#.#.#\<arch>\mpam-fe.exe
+#                       where <arch> is x64, x86, or arm64
+#
+# Flat-layout files are classified as x64 so existing shares keep working.
+# Get-AvailableMpamFiles returns every file found (one per arch per version);
+# Get-LatestMpamFile is a thin wrapper that returns the single latest entry,
+# optionally filtered by architecture (used for per-host dispatch).
 # ===================================================================
-function Get-LatestMpamFile {
+function Get-AvailableMpamFiles {
+    [OutputType([pscustomobject[]])]
     param([string]$Root)
 
     $files = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
@@ -604,24 +651,59 @@ function Get-LatestMpamFile {
 
     if (-not $files) {
         throw "No mpam-fe.exe files found under '$Root'. " +
-              "Expected folder structure: <base>\<YYYYMMDD>\v#.#.#.#\mpam-fe.exe"
+              "Expected: <base>\<YYYYMMDD>\v#.#.#.#\[<arch>\]mpam-fe.exe (arch = x64|x86|arm64)"
     }
 
-    $versioned = foreach ($f in $files) {
-        if ($f.Directory.Name -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+    $entries = foreach ($f in $files) {
+        $parent      = $f.Directory.Name
+        $grandparent = if ($f.Directory.Parent) { $f.Directory.Parent.Name } else { '' }
+
+        # Per-arch layout: <version>\<arch>\mpam-fe.exe
+        if ($parent -match '^(?i)(x64|x86|arm64)$' -and
+            $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
             [pscustomobject]@{
-                File    = $f.FullName
-                Version = [version]$Matches[1]
+                File         = $f.FullName
+                Version      = [version]$Matches[1]
+                Architecture = $parent.ToLower()
+                IsFlatLayout = $false
+            }
+        }
+        # Flat legacy layout: <version>\mpam-fe.exe (classified as x64)
+        elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+            [pscustomobject]@{
+                File         = $f.FullName
+                Version      = [version]$Matches[1]
+                Architecture = 'x64'
+                IsFlatLayout = $true
             }
         }
     }
 
-    if (-not $versioned) {
+    if (-not $entries) {
         throw "mpam-fe.exe files were found but none reside in a 'v#.#.#.#' versioned folder. " +
               "Rename the containing folder to match the pattern (e.g. v1.449.681.0)."
     }
 
-    return $versioned | Sort-Object Version -Descending | Select-Object -First 1
+    return $entries | Sort-Object Version -Descending
+}
+
+function Get-LatestMpamFile {
+    param(
+        [string]$Root,
+        # Optional. When supplied returns the latest file FOR THAT ARCHITECTURE
+        # (caller pattern: per-host dispatch). When omitted returns the absolute
+        # latest across all architectures (preserves v0.0.7 behavior).
+        [ValidateSet('', 'x64', 'x86', 'arm64')]
+        [string]$Architecture = ''
+    )
+    $all = Get-AvailableMpamFiles -Root $Root
+    if ($Architecture) {
+        $all = @($all | Where-Object Architecture -eq $Architecture)
+        if (-not $all -or $all.Count -eq 0) {
+            throw "No mpam-fe.exe found for architecture '$Architecture' under '$Root'."
+        }
+    }
+    return $all | Select-Object -First 1
 }
 
 # ===================================================================
@@ -721,9 +803,14 @@ function Resolve-WinRmCredential ([string]$Tier) {
 function Invoke-DefenderUpdate {
     param(
         [string]$Computer,
-        [string]$SourceFile,
+        # Map of architecture (x64|x86|arm64) -> [pscustomobject]@{ File; Version }.
+        # The right entry is selected per host using either WinRM-detected OS
+        # architecture or the operator-supplied $ForcedArchitecture override.
+        [hashtable]$AvailableByArch,
+        # Optional. When set, ALL hosts use this architecture (no per-host
+        # CIM call). Empty string = auto-detect per host.
+        [string]$ForcedArchitecture,
         [string]$TempFolderOnTarget,
-        [string]$AvailableVersionStr,
         [bool]$WhatIfMode,
         [string]$LogSharePath,
         [System.Management.Automation.PSCredential]$WinRmCredential,
@@ -807,19 +894,48 @@ function Invoke-DefenderUpdate {
                 throw "Windows Defender service is not running (Status: $svcStatus)"
             }
 
-            # --- Current version check (pre-transfer) ---
-            $currentVerStr = Invoke-DefenderRemote -Session $session -ScriptBlock {
-                try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion }
-                catch { $null }
+            # --- Combined pre-transfer probe: current Defender signature + OS arch ---
+            # One WinRM round-trip instead of two: we need the host's OS
+            # architecture to pick the right mpam-fe.exe variant before
+            # comparing versions, so we fold both queries into one call.
+            $probe = Invoke-DefenderRemote -Session $session -ScriptBlock {
+                $sig = try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion } catch { $null }
+                $osa = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture } catch { $null }
+                @{ SignatureVersion = $sig; OSArchitecture = $osa }
             }
+            $currentVerStr = $probe.SignatureVersion
             $result.OldVersion = $currentVerStr
+
+            # --- Per-host architecture dispatch ---
+            # If the operator forced a specific arch, use that. Otherwise map
+            # Win32_OperatingSystem.OSArchitecture to the share's subfolder
+            # convention. Fail fast and clearly if either step yields nothing.
+            $archMap = @{ '64-bit' = 'x64'; '32-bit' = 'x86'; 'ARM 64-bit' = 'arm64' }
+            $hostArch = if ($ForcedArchitecture) {
+                $ForcedArchitecture
+            } elseif ($probe.OSArchitecture -and $archMap.ContainsKey($probe.OSArchitecture)) {
+                $archMap[$probe.OSArchitecture]
+            } else {
+                $null
+            }
+
+            if (-not $hostArch) {
+                throw "Could not determine host architecture (OSArchitecture: '$($probe.OSArchitecture)')"
+            }
+            if (-not $AvailableByArch.ContainsKey($hostArch)) {
+                throw "No mpam-fe.exe found for architecture '$hostArch' in the source share. Run Get-DefenderDefinitions.ps1 with -Architecture $hostArch on the staging host."
+            }
+
+            $archInfo = $AvailableByArch[$hostArch]
+            $SourceFile          = $archInfo.File
+            $AvailableVersionStr = $archInfo.Version.ToString()
 
             if ($currentVerStr -and $AvailableVersionStr) {
                 try {
                     if ([version]$currentVerStr -ge [version]$AvailableVersionStr) {
                         $result.Status     = 'No Update Needed'
                         $result.NewVersion = $currentVerStr
-                        $result.Details    = "Already at v$currentVerStr (available: v$AvailableVersionStr)"
+                        $result.Details    = "Already at v$currentVerStr ($hostArch available: v$AvailableVersionStr)"
                         return $result
                     }
                 } catch {
@@ -1001,12 +1117,18 @@ function New-HtmlReport {
   <h1>Microsoft Defender Antivirus – Definitions Update Report</h1>
   <p>
     <strong>Run Date:</strong> $ScriptStartTime &nbsp;|&nbsp;
-    <strong>Available Version:</strong> v$AvailableVersionStr &nbsp;|&nbsp;
+    <strong>Available Version:</strong> v$AvailableVersionStr$(
+        if ($AvailableByArch -and $AvailableByArch.Keys.Count -gt 1) {
+            ' (' + (@($AvailableByArch.Keys | Sort-Object | ForEach-Object {
+                "$_=v$($AvailableByArch[$_].Version)"
+            }) -join ' · ') + ')'
+        }
+    ) &nbsp;|&nbsp;
     <strong>Total Duration:</strong> $($RunTime.ToString('hh\:mm\:ss')) &nbsp;|&nbsp;
     <strong>Run By:</strong> $RunAsUser @ $RunFromHost ($RunFromIP)
   </p>
   <p style="font-size:.9em; color:#555; margin-top:-6px;">
-    <strong>Source File:</strong> $SourceFile
+    <strong>Source Share:</strong> $SourceSharePath
   </p>
 
   <div id="statusCards">
@@ -1167,15 +1289,45 @@ if (-not (Test-Path $SourceSharePath -PathType Container)) {
     throw "SourceSharePath not found or inaccessible: $SourceSharePath"
 }
 
-$latest = Get-LatestMpamFile -Root $SourceSharePath
+# Build the per-architecture index. For each architecture present in the
+# share we keep the latest version available. The script-scope $AvailableByArch
+# is consumed by Invoke-DefenderUpdate at per-host dispatch time.
+$AvailableFiles  = @(Get-AvailableMpamFiles -Root $SourceSharePath)
+$AvailableByArch = @{}
+foreach ($arch in 'x64','x86','arm64') {
+    $forArch = @($AvailableFiles | Where-Object Architecture -eq $arch) | Sort-Object Version -Descending
+    if ($forArch.Count -gt 0) {
+        $AvailableByArch[$arch] = $forArch[0]
+    }
+}
+
+# Headline version = absolute latest across all archs (used in HTML report,
+# email subject, log banner). Per-host comparisons use the host's own arch's
+# latest, not this value.
+$latest              = $AvailableFiles | Sort-Object Version -Descending | Select-Object -First 1
 $SourceFile          = $latest.File
 $AvailableVersionStr = $latest.Version.ToString()
-Write-Log "Latest definition version: v$AvailableVersionStr" 'SUCCESS'
-Write-Log "Source file              : $SourceFile" 'INFO'
+
+Write-Log 'Available definition versions (per architecture):' 'SUCCESS'
+foreach ($arch in 'x64','x86','arm64') {
+    if ($AvailableByArch.ContainsKey($arch)) {
+        $entry = $AvailableByArch[$arch]
+        $note  = if ($entry.IsFlatLayout) { ' (flat layout — classified as x64)' } else { '' }
+        Write-Log ("  {0,-5} = v{1,-12}  -> {2}{3}" -f $arch, $entry.Version, $entry.File, $note) 'INFO'
+    }
+}
+
+if ($Architecture) {
+    if (-not $AvailableByArch.ContainsKey($Architecture)) {
+        Write-Log "CRITICAL: -Architecture $Architecture forced, but no mpam-fe.exe found for that architecture under '$SourceSharePath'." 'ERROR'
+        exit 1
+    }
+    Write-Log "Forcing architecture '$Architecture' for all hosts (auto-detection disabled)." 'WARN'
+}
 
 if (-not (Test-Path $SourceFile)) {
     Write-Log "CRITICAL: Source file is not accessible: $SourceFile" 'ERROR'
-    throw 'Source file missing or share not reachable.'
+    exit 1
 }
 
 # ===================================================================
@@ -1240,9 +1392,9 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
             $item = $Queue.Dequeue()
             $job  = Start-ThreadJob -ScriptBlock ${function:Invoke-DefenderUpdate} -ArgumentList @(
                 $item.Computer,
-                $SourceFile,
+                $AvailableByArch,
+                $Architecture,
                 $TempFolderOnTarget,
-                $AvailableVersionStr,
                 [bool]$WhatIfMode,
                 $LogSharePath,
                 $item.Credential,
@@ -1349,9 +1501,9 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
         $r = Invoke-DefenderUpdate `
             -Computer            $comp `
-            -SourceFile          $SourceFile `
+            -AvailableByArch     $AvailableByArch `
+            -ForcedArchitecture  $Architecture `
             -TempFolderOnTarget  $TempFolderOnTarget `
-            -AvailableVersionStr $AvailableVersionStr `
             -WhatIfMode          ([bool]$WhatIfMode) `
             -LogSharePath        $LogSharePath `
             -WinRmCredential     $HostCredentials[$comp] `
@@ -1478,3 +1630,9 @@ if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
         if ($smtp) { $smtp.Dispose() }
     }
 }
+
+# Explicit success exit so $LASTEXITCODE is reliably 0 for callers
+# (scheduled tasks, CI). PowerShell scripts that end naturally without
+# `exit` retain the previous $LASTEXITCODE, which leads to surprising
+# results when a clean run follows a failed one in the same shell.
+exit 0

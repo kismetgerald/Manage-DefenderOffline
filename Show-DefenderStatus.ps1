@@ -99,6 +99,10 @@ param(
     [pscredential]$ADCredential,
     [switch]$SaveADCredential,
 
+    # Restrict AD auto-discovery to one or more OU subtrees. Distinguished-name
+    # format; multiple DNs separated by semicolons. Empty = whole-domain search.
+    [string]$ADSearchBase,
+
     [ValidateSet('AD','Pattern','Single')]
     [string]$ClassificationMethod,
     [string]$WorkstationPattern,
@@ -109,9 +113,13 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.7'
+$ScriptVersion = '0.0.8'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# Shared discovery helper used by all three discovery-aware scripts.
+$LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
+if (Test-Path $LibGetDefenderComputers) { . $LibGetDefenderComputers }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
 # runspaces (see Invoke-FleetRefresh) so the wrapper is available there too.
@@ -203,6 +211,7 @@ function Read-ConfigFile {
 
 $cfg = Read-ConfigFile $ConfigPath
 if (-not $PSBoundParameters.ContainsKey('SourceSharePath')         -and $cfg['SourceSharePath'])         { $SourceSharePath         = $cfg['SourceSharePath'] }
+if (-not $PSBoundParameters.ContainsKey('ADSearchBase')            -and $cfg['ADSearchBase'])            { $ADSearchBase            = $cfg['ADSearchBase'] }
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads')         -and $cfg['ParallelThreads'])         { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')          -and $cfg['TimeoutSeconds'])          { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['ClassificationMethod'])    { $ClassificationMethod    = $cfg['ClassificationMethod'] }
@@ -246,48 +255,49 @@ function Resolve-TargetComputers {
     if ($ComputerName) {
         return $ComputerName | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim().ToUpper() }
     }
-    if (Test-Path $HostsFile) {
+    # hosts.conf is skipped when -ADSearchBase is set so a cached snapshot
+    # from a previous (possibly differently-scoped) run does not override the
+    # operator's explicit AD scope.
+    $hostsExists = Test-Path $HostsFile
+    if (-not $ADSearchBase -and $hostsExists) {
         return Get-Content $HostsFile |
             Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\S' } |
             ForEach-Object { $_.Trim().ToUpper() }
     }
-    Write-Warning 'hosts.conf not found – attempting Active Directory auto-discovery...'
-    $hasAdModule = [bool](Get-Module -ListAvailable ActiveDirectory -ErrorAction SilentlyContinue)
-    if (-not $hasAdModule) {
-        Write-Host 'ActiveDirectory PowerShell module is not installed; trying ADSI fallback.' -ForegroundColor DarkCyan
+    if ($ADSearchBase -and $hostsExists) {
+        Write-Host 'Ignoring hosts.conf because ADSearchBase is set; querying AD with that scope.' -ForegroundColor DarkCyan
+    }
+    if (-not $hostsExists) {
+        Write-Warning 'hosts.conf not found – attempting Active Directory auto-discovery...'
     }
     if ($ADCredential) {
         Write-Host "Using saved AD credential for LDAP bind: $($ADCredential.UserName)" -ForegroundColor DarkCyan
     }
+    if ($ADSearchBase) {
+        Write-Host "Restricting AD discovery to: $ADSearchBase" -ForegroundColor DarkCyan
+    }
     try {
-        if ($hasAdModule) {
-            Import-Module ActiveDirectory -ErrorAction Stop
-            $adParams = @{
-                Filter     = 'OperatingSystem -like "*Windows*" -and Enabled -eq $true'
-                Properties = 'Name'
-            }
-            if ($ADCredential) { $adParams.Credential = $ADCredential }
-            return Get-ADComputer @adParams | Sort-Object Name | Select-Object -ExpandProperty Name
-        } else {
-            # ADSI fallback.  When -ADCredential is supplied, bind via
-            # DirectoryEntry with explicit credentials.
-            $domain = (Get-CimInstance Win32_ComputerSystem).Domain
-            $filter = '(&(objectCategory=computer)(operatingSystem=*Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-            if ($ADCredential) {
-                $de = [System.DirectoryServices.DirectoryEntry]::new(
-                    "LDAP://$domain",
-                    $ADCredential.UserName,
-                    $ADCredential.GetNetworkCredential().Password)
-                $searcher = [System.DirectoryServices.DirectorySearcher]::new($de)
-                $searcher.Filter = $filter
-            } else {
-                $searcher = [adsisearcher]$filter
-                $searcher.SearchRoot = "LDAP://$domain"
-            }
-            $result = $searcher.FindAll() | ForEach-Object { $_.Properties.name[0] } | Sort-Object
-            if ($ADCredential) { $de.Dispose() }
-            return $result
+        $discovery = Get-DefenderComputers -SearchBase $ADSearchBase -ADCredential $ADCredential
+        if (-not $discovery.UsedAdModule) {
+            Write-Host 'ActiveDirectory PowerShell module is not installed; used ADSI fallback.' -ForegroundColor DarkCyan
         }
+        if ($discovery.WasFiltered) {
+            foreach ($s in $discovery.SearchBases) {
+                if ($s.Resolved) {
+                    Write-Host "  AD search base '$($s.DN)' -> $($s.Count) computer(s)" -ForegroundColor DarkGreen
+                } else {
+                    Write-Warning "  AD search base '$($s.DN)' could not be resolved: $($s.Error)"
+                }
+            }
+            $resolved = @($discovery.SearchBases | Where-Object Resolved).Count
+            if ($resolved -eq 0) {
+                throw "All $($discovery.SearchBases.Count) AD search base(s) failed to resolve."
+            }
+        }
+        if (-not $discovery.Computers -or $discovery.Computers.Count -eq 0) {
+            throw 'AD discovery returned no computers.'
+        }
+        return $discovery.Computers
     } catch {
         $adErr = $_.Exception.Message
         $help = @"
@@ -334,7 +344,8 @@ You have four ways to proceed:
 ==============================================================================
 "@
         Write-Host $help -ForegroundColor Yellow
-        throw 'Cannot resolve target list.'
+        # exit (not throw): see comment in Update-DefenderOffline's matching block.
+        exit 1
     }
 }
 
@@ -344,11 +355,21 @@ You have four ways to proceed:
 function Get-LatestAvailableVersion {
     param([string]$Root)
     if (-not $Root -or -not (Test-Path $Root -ErrorAction SilentlyContinue)) { return $null }
-    $versioned = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
+    # Supports two layouts (v0.0.8 introduced the per-arch subfolder layout):
+    #   Flat (legacy)   : <version>\mpam-fe.exe                  -> parent matches ^v\d+...
+    #   Per-arch (new)  : <version>\<arch>\mpam-fe.exe           -> parent is x64/x86/arm64; grandparent is ^v\d+...
+    $versions = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
-        Where-Object { $_.Directory.Name -match '^v(\d+\.\d+\.\d+\.\d+)$' } |
-        ForEach-Object { [version]$_.Directory.Name.TrimStart('v') }
-    return $versioned | Sort-Object -Descending | Select-Object -First 1
+        ForEach-Object {
+            $parent      = $_.Directory.Name
+            $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
+            if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                [version]$Matches[1]
+            } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                [version]$Matches[1]
+            }
+        }
+    return $versions | Sort-Object -Descending | Select-Object -First 1
 }
 
 # ===================================================================
@@ -1416,3 +1437,6 @@ $form.add_FormClosing({
     })
 
 [System.Windows.Forms.Application]::Run($form)
+
+# Explicit success exit so $LASTEXITCODE is reliably 0 after the form closes.
+exit 0
