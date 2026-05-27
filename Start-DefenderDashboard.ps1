@@ -1023,19 +1023,36 @@ function Get-DefenderStatus {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
-                # Full Get-MpThreat list (not just count) so the row-click
-                # modal on /defender can show per-threat info. Select to
-                # primitives for clean WinRM serialization.
+                # Per-threat detail for the row-click modal. Get-MpThreat is
+                # the *catalog* of threat types ever seen — it doesn't reliably
+                # populate InitialDetectionTime / Resources for long-quarantined
+                # PUA items. Get-MpThreatDetection has the per-event timestamps
+                # and resource paths, so we cross-reference both: ThreatID -> Name
+                # from the catalog, plus the most recent detection event's time
+                # and resources from MpThreatDetection. One row per distinct
+                # ThreatID so ThreatCount matches the rendered grid.
                 $threats = @()
                 if ($mp) {
-                    $threats = @(Get-MpThreat -ErrorAction SilentlyContinue |
-                        Select-Object @{N='ThreatName';          E={ [string]$_.ThreatName }},
-                                      @{N='ThreatID';            E={ [int64]$_.ThreatID }},
-                                      @{N='InitialDetectionTime';E={ $_.InitialDetectionTime }},
-                                      @{N='Resources';           E={ ($_.Resources -join '; ') }})
+                    $catalog = @{}
+                    foreach ($t in (Get-MpThreat -ErrorAction SilentlyContinue)) {
+                        $catalog[[int64]$t.ThreatID] = [string]$t.ThreatName
+                    }
+                    $detections = @(Get-MpThreatDetection -ErrorAction SilentlyContinue)
+                    $threats = @($detections | Group-Object ThreatID | ForEach-Object {
+                        $latest = $_.Group | Sort-Object InitialDetectionTime -Descending | Select-Object -First 1
+                        $id     = [int64]$_.Name
+                        [pscustomobject]@{
+                            ThreatName           = if ($catalog.ContainsKey($id)) { $catalog[$id] } else { "ThreatID $id" }
+                            ThreatID             = $id
+                            InitialDetectionTime = $latest.InitialDetectionTime
+                            Resources            = if ($latest.Resources) { [string]($latest.Resources -join '; ') } else { '' }
+                        }
+                    } | Sort-Object InitialDetectionTime -Descending)
                 }
                 [pscustomobject]@{
-                    SvcStatus            = $svc.Status
+                    # Stringify the ServiceController.Status enum so the JSON
+                    # path renders 'Running' rather than '[object Object]'.
+                    SvcStatus            = if ($svc) { [string]$svc.Status } else { 'NotFound' }
                     SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }  else { $null }
                     RealTimeProtection   = if ($mp) { $mp.RealTimeProtectionEnabled } else { $null }
                     AMServiceEnabled     = if ($mp) { $mp.AMServiceEnabled }           else { $null }
