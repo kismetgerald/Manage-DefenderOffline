@@ -789,6 +789,16 @@ Auth + HTTPS + audit logging. Dashboard goes from "trust the network" to "trust 
 - Parallel mode with PS 7+ thread jobs
 - HTML reports and optional email notification
 
+### Roadmap
+
+The project follows a three-train versioning scheme:
+
+| Train | Status | Meaning |
+|---|---|---|
+| `v0.0.x` | **Development / alpha** (current) | Active feature work. Breaking changes allowed between point releases. Validated via live-fire on the maintainer's home lab but **not** production-ready. All v0.0.x releases are marked as pre-release on GitHub. |
+| `v0.1.x` | **Beta** (planned) | Feature-frozen for the v1.0 milestone. Bug fixes and hardening only. Wider testing encouraged before GA. Also marked as pre-release. |
+| `v1.0.0` | **GA — first production release** (planned) | First officially supported release. Backward-compatibility commitments begin here. |
+
 ### Planned Features
 
 - Integration with Windows Update Service API
