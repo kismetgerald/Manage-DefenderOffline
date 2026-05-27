@@ -932,11 +932,21 @@ function Resolve-TargetComputers {
 function Get-LatestAvailableVersion {
     param([string]$Root)
     if (-not $Root -or -not (Test-Path $Root -ErrorAction SilentlyContinue)) { return $null }
-    $versioned = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
+    # Supports two layouts (v0.0.8 introduced the per-arch subfolder layout):
+    #   Flat (legacy)   : <version>\mpam-fe.exe                  -> parent matches ^v\d+...
+    #   Per-arch (new)  : <version>\<arch>\mpam-fe.exe           -> parent is x64/x86/arm64; grandparent is ^v\d+...
+    $versions = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
-        Where-Object { $_.Directory.Name -match '^v(\d+\.\d+\.\d+\.\d+)$' } |
-        ForEach-Object { [version]$_.Directory.Name.TrimStart('v') }
-    return $versioned | Sort-Object -Descending | Select-Object -First 1
+        ForEach-Object {
+            $parent      = $_.Directory.Name
+            $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
+            if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                [version]$Matches[1]
+            } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                [version]$Matches[1]
+            }
+        }
+    return $versions | Sort-Object -Descending | Select-Object -First 1
 }
 
 # ===================================================================
