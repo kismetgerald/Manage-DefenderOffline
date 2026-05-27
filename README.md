@@ -827,7 +827,8 @@ The project follows a three-train versioning scheme:
 
 - Integration with Windows Update Service API
 - Support for multiple definition file formats (FEP, NIS)
-- Rollback capability for failed updates
+- Staged rollout with canary group and per-wave halt-on-health-failure
+- Post-update health probe (RT-protection check + quarantine-event collection)
 - Integration with monitoring systems (SCOM, Splunk)
 
 ---
