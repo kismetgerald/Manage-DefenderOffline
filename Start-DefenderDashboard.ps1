@@ -156,6 +156,8 @@ $LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
 . $LibGetDefenderComputers
 $LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.ps1'
 . $LibGetDefenderHealthProbe
+$LibTestHttpsCertBinding   = Join-Path $ScriptDir 'lib\Test-HttpsCertBinding.ps1'
+. $LibTestHttpsCertBinding
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
 # ===================================================================
@@ -2066,6 +2068,22 @@ if ($UseHttps) {
         Write-DashLog "Stop the conflicting process or change Port in config.conf, then re-run the installer with -RenewCertificate to rebind." 'ERROR'
         exit 1
     }
+
+    # HTTPS pre-flight: confirm the cert is bound to the listener port via
+    # netsh sslcert. Without a binding, HttpListener.Start() succeeds but
+    # every TLS handshake fails — the browser sees a "Secure Connection
+    # Failed" with no signal in the dashboard log to point the way.
+    $bindingCheck = Test-HttpsCertBinding -Port $Port -ExpectedThumbprint $CertificateThumbprint
+    if (-not $bindingCheck.IsBound) {
+        Write-DashLog "HTTPS pre-flight FAILED: $($bindingCheck.Reason)" 'ERROR'
+        Write-DashLog "TLS handshake would fail at first request. Bind the cert with:" 'ERROR'
+        Write-DashLog "  netsh http add sslcert ipport=0.0.0.0:$Port certhash=$CertificateThumbprint appid='{12345678-DB90-4B66-8B01-88F7AF2A1234}'" 'ERROR'
+        Write-DashLog "Or re-run the installer to bind automatically:" 'ERROR'
+        Write-DashLog "  .\Install-DefenderDashboard.ps1 -UseHttps" 'ERROR'
+        exit 1
+    }
+    Write-DashLog "HTTPS pre-flight: $($bindingCheck.Reason)" 'SUCCESS'
+
     $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
 } else {
     $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
