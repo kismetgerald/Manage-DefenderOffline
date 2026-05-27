@@ -234,6 +234,8 @@ $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
 $LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
 . $LibGetDefenderComputers
+$LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.ps1'
+. $LibGetDefenderHealthProbe
 $RunAsUser       = "$env:USERDOMAIN\$env:USERNAME"
 $RunFromHost     = $env:COMPUTERNAME
 $RunFromIP       = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -815,30 +817,33 @@ function Invoke-DefenderUpdate {
         [string]$LogSharePath,
         [System.Management.Automation.PSCredential]$WinRmCredential,
         [bool]$DisableIPv6 = $true,
-        [string]$LibPath              # Path to lib/Invoke-DefenderRemote.ps1.
-                                      # Required when this function runs inside a
-                                      # Start-ThreadJob runspace (PS7 parallel mode).
-                                      # Optional in PS 5.1 serial mode where the
-                                      # main runspace's dot-source is inherited.
+        [string[]]$LibPaths            # Paths to lib/*.ps1 helpers (Invoke-DefenderRemote,
+                                       # Get-DefenderHealthProbe, etc.). Required when this
+                                       # function runs inside a Start-ThreadJob runspace
+                                       # (PS7 parallel mode) since runspaces don't inherit
+                                       # functions from the parent.
     )
 
     $WarningPreference = 'SilentlyContinue'
 
     # Make wrapper functions available in this runspace. The Start-ThreadJob
     # runspace doesn't inherit functions from the parent, so we re-import here.
-    if ($LibPath -and (Test-Path $LibPath)) {
-        . $LibPath
+    foreach ($lib in $LibPaths) {
+        if ($lib -and (Test-Path $lib)) { . $lib }
     }
 
     $result = [pscustomobject]@{
-        ComputerName = $Computer
-        Status       = 'Unknown'
-        OldVersion   = ''
-        NewVersion   = ''
-        DurationSec  = 0
-        Details      = ''
-        Attempt      = 1
-        Timeout      = $false
+        ComputerName       = $Computer
+        Status             = 'Unknown'
+        OldVersion         = ''
+        NewVersion         = ''
+        DurationSec        = 0
+        Details            = ''
+        Attempt            = 1
+        Timeout            = $false
+        HealthStatus       = ''
+        HealthReason       = ''
+        RecentThreatCount  = 0
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -936,6 +941,18 @@ function Invoke-DefenderUpdate {
                         $result.Status     = 'No Update Needed'
                         $result.NewVersion = $currentVerStr
                         $result.Details    = "Already at v$currentVerStr ($hostArch available: v$AvailableVersionStr)"
+                        # Probe before returning — session is still active, host
+                        # is in a deterministic state (no install attempted, so
+                        # the probe captures the steady-state health).
+                        try {
+                            $probe = Get-DefenderHealthProbe -Session $session
+                            $result.HealthStatus      = $probe.OverallStatus
+                            $result.HealthReason      = if ($probe.StatusReason) { $probe.StatusReason } else { '' }
+                            $result.RecentThreatCount = $probe.RecentThreatCount
+                        } catch {
+                            $result.HealthStatus = 'ProbeFailed'
+                            $result.HealthReason = ($_.Exception.Message -replace "`r`n", ' ').Trim()
+                        }
                         return $result
                     }
                 } catch {
@@ -1007,6 +1024,22 @@ function Invoke-DefenderUpdate {
                 $result.Details = "Installer exit code: $($install.ExitCode)"
             }
 
+            # --- Post-install health probe ---
+            # Runs only when the host completed its update path (Success, or
+            # already current). On Failed we don't probe — the host state may
+            # be transient and the operator already has a clear failure signal.
+            if ($result.Status -in 'Success','No Update Needed') {
+                try {
+                    $probe = Get-DefenderHealthProbe -Session $session
+                    $result.HealthStatus      = $probe.OverallStatus
+                    $result.HealthReason      = if ($probe.StatusReason) { $probe.StatusReason } else { '' }
+                    $result.RecentThreatCount = $probe.RecentThreatCount
+                } catch {
+                    $result.HealthStatus = 'ProbeFailed'
+                    $result.HealthReason = ($_.Exception.Message -replace "`r`n", ' ').Trim()
+                }
+            }
+
         } finally {
             if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
         }
@@ -1057,6 +1090,10 @@ function New-HtmlReport {
   .skipped       { background: #9c5100; }
   .whatif        { background: #0078d4; }
   .excluded      { background: #6b7280; }
+  .h-healthy     { background: #107c10; }
+  .h-degraded    { background: #ca5010; }
+  .h-threats     { background: #c50f1f; }
+  .h-probefail   { background: #6b7280; }
   .stat-card     { display: inline-block; padding: 14px 28px; border-radius: 10px; margin: 6px 8px 6px 0;
                    font-size: 1.1em; font-weight: 700; color: #fff; min-width: 120px; text-align: center;
                    cursor: pointer; user-select: none; }
@@ -1089,7 +1126,7 @@ function New-HtmlReport {
 
     # Build table rows and inject status badges
     $rows = $Data | Sort-Object ComputerName |
-        ConvertTo-Html -Fragment -Property ComputerName, Status, OldVersion, NewVersion, DurationSec, Delta, Attempt, Timeout, Details
+        ConvertTo-Html -Fragment -Property ComputerName, Status, OldVersion, NewVersion, DurationSec, Delta, Attempt, Timeout, HealthStatus, RecentThreatCount, Details
 
     # Add table id for the JS badge filter
     if ($rows.Count -gt 0) { $rows[0] = $rows[0] -replace '<table>', '<table id="resultsTable">' }
@@ -1101,8 +1138,19 @@ function New-HtmlReport {
             -replace '<td>No Update Needed</td>', '<td><span class="tag skipped">No Update Needed</span></td>' `
             -replace '<td>WhatIf</td>',           '<td><span class="tag whatif">WhatIf</span></td>' `
             -replace '<td>Excluded</td>',         '<td><span class="tag excluded">Excluded</span></td>' `
+            -replace '<td>Healthy</td>',          '<td><span class="tag h-healthy">Healthy</span></td>' `
+            -replace '<td>Degraded</td>',         '<td><span class="tag h-degraded">Degraded</span></td>' `
+            -replace '<td>ThreatsDetected</td>',  '<td><span class="tag h-threats">Threats Detected</span></td>' `
+            -replace '<td>ProbeFailed</td>',      '<td><span class="tag h-probefail">Probe Failed</span></td>' `
             -replace '<td>True</td>',             '<td><strong style="color:#d13438">Yes</strong></td>' `
             -replace '<td>False</td>',            '<td>No</td>'
+    }
+    # Rename column headers to operator-friendly labels (after badge injection so the
+    # <th>HealthStatus</th> doesn't match the row-level pattern).
+    if ($rows.Count -gt 0) {
+        $rows[0] = $rows[0] `
+            -replace '<th>HealthStatus</th>',      '<th>Health</th>' `
+            -replace '<th>RecentThreatCount</th>', '<th>Threats (24h)</th>'
     }
 
     @"
@@ -1246,14 +1294,17 @@ if ($ExcludeList.Count -gt 0) {
         if ($TargetComputers -contains $ex) {
             Write-Log "EXCLUDED (administrative): $ex — listed in ExcludeComputers in config.conf" 'WARN'
             $Results.Add([pscustomobject]@{
-                ComputerName = $ex
-                Status       = 'Excluded'
-                OldVersion   = ''
-                NewVersion   = ''
-                DurationSec  = 0
-                Details      = 'Administrative exclusion (ExcludeComputers in config.conf)'
-                Attempt      = 0
-                Timeout      = $false
+                ComputerName      = $ex
+                Status            = 'Excluded'
+                OldVersion        = ''
+                NewVersion        = ''
+                DurationSec       = 0
+                Details           = 'Administrative exclusion (ExcludeComputers in config.conf)'
+                Attempt           = 0
+                Timeout           = $false
+                HealthStatus      = ''
+                HealthReason      = ''
+                RecentThreatCount = 0
             })
         }
     }
@@ -1399,7 +1450,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 $LogSharePath,
                 $item.Credential,
                 [bool]$DisableIPv6,
-                $LibInvokeDefenderRemote
+                @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
             )
             $ActiveJobs[$job.Id] = @{
                 Job        = $job
@@ -1423,6 +1474,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                         ComputerName = $meta.Computer; Status = 'Failed'
                         OldVersion = ''; NewVersion = ''; DurationSec = 0
                         Details = 'Job produced no output'; Attempt = $meta.Attempt; Timeout = $false
+                        HealthStatus = ''; HealthReason = ''; RecentThreatCount = 0
                     }
                 } elseif ($r -is [array]) {
                     $r = $r[-1]
@@ -1466,6 +1518,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                     OldVersion = ''; NewVersion = ''
                     DurationSec = [math]::Round($elapsed, 2)
                     Details = 'Timeout'; Attempt = $meta.Attempt; Timeout = $true
+                    HealthStatus = ''; HealthReason = ''; RecentThreatCount = 0
                 })
                 Remove-Job $meta.Job -Force -ErrorAction SilentlyContinue
                 [void]$ActiveJobs.Remove($id)
@@ -1480,7 +1533,10 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     Write-Host ''
     Write-Host '=== Final Results ===' -ForegroundColor Magenta
     $Results | Sort-Object ComputerName |
-        Select-Object ComputerName, Status, OldVersion, NewVersion, DurationSec,
+        Select-Object ComputerName, Status,
+            @{n='Health';     e={ $_.HealthStatus }},
+            @{n='Threats24h'; e={ $_.RecentThreatCount }},
+            OldVersion, NewVersion, DurationSec,
             @{n='Attempt#'; e={ $_.Attempt }},
             @{n='Timeout?'; e={ $_.Timeout }},
             Details |
@@ -1508,7 +1564,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
             -LogSharePath        $LogSharePath `
             -WinRmCredential     $HostCredentials[$comp] `
             -DisableIPv6         $DisableIPv6 `
-            -LibPath             $LibInvokeDefenderRemote
+            -LibPaths            @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
         $Results.Add($r)
     }
     Write-Progress -Activity 'Done' -Completed
