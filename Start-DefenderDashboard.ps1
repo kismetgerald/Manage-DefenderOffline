@@ -2194,8 +2194,10 @@ if ($UseHttps -and $RedirectHttpToHttps) {
                         $ownerList = if ($r.Owners.Count -gt 0) { $r.Owners -join ', ' } else { '(no explicit User; SDDL-only)' }
                         Write-DashLog "    - $($r.Url)  [held by: $ownerList]" 'WARN'
                     }
-                    Write-DashLog "  To free a reservation so the redirect listener can bind, run as Administrator:" 'WARN'
-                    Write-DashLog "    netsh http delete urlacl url=<reserved-url-from-list-above>" 'WARN'
+                    Write-DashLog "  To free the reservation(s) so the redirect listener can bind, run as Administrator:" 'WARN'
+                    foreach ($r in $collision.Reservations) {
+                        Write-DashLog "    netsh http delete urlacl url=$($r.Url)" 'WARN'
+                    }
                     Write-DashLog "  Or pick a different port via 'RedirectHttpPort' in conf\config.conf." 'WARN'
                 } else {
                     Write-DashLog "  URL-ACL diagnostic found no reservations on port $RedirectHttpPort. The conflict is likely another process binding the port directly (run 'Get-NetTCPConnection -LocalPort $RedirectHttpPort -State Listen' to identify it) or a stale HttpListener from this same process." 'WARN'
