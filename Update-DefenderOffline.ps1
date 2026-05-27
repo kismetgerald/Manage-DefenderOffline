@@ -215,6 +215,19 @@ param(
     [ValidateSet('', 'x64', 'x86', 'arm64')]
     [string]$Architecture,
 
+    # Staged rollout — when -CanaryComputers is supplied, the script runs that
+    # subset first ("Canary" wave), waits -HealthSettleSeconds, then evaluates
+    # the post-update health probe results. If the number of Degraded/ProbeFailed
+    # canary hosts exceeds -MaxCanaryFailures the "Production" wave is skipped
+    # and its hosts are recorded as Status='Skipped' in the report.
+    # Install failures, ThreatsDetected, and Healthy rows do not count against
+    # the gate (see lib/Test-CanaryGate.ps1).
+    [string[]]$CanaryComputers,
+    [ValidateRange(0, 10000)]
+    [int]$MaxCanaryFailures = 0,
+    [ValidateRange(0, 3600)]
+    [int]$HealthSettleSeconds = 60,
+
     # Path to configuration file. Defaults to .\conf\config.conf relative to the script.
     [string]$ConfigPath
 )
@@ -222,7 +235,7 @@ param(
 # ===================================================================
 # Constants
 # ===================================================================
-$ScriptVersion   = '0.0.9'
+$ScriptVersion   = '0.0.10'
 $ScriptStartTime = Get-Date
 $ScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile       = Join-Path $ScriptDir 'hosts.conf'
@@ -234,6 +247,10 @@ $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
 $LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
 . $LibGetDefenderComputers
+$LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.ps1'
+$LibTestCanaryGate         = Join-Path $ScriptDir 'lib\Test-CanaryGate.ps1'
+. $LibTestCanaryGate
+. $LibGetDefenderHealthProbe
 $RunAsUser       = "$env:USERDOMAIN\$env:USERNAME"
 $RunFromHost     = $env:COMPUTERNAME
 $RunFromIP       = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -384,6 +401,11 @@ if (-not $PSBoundParameters.ContainsKey('ReportPath')         -and $cfg['ReportP
 if (-not $PSBoundParameters.ContainsKey('TempFolderOnTarget') -and $cfg['TempFolderOnTarget']) { $TempFolderOnTarget = $cfg['TempFolderOnTarget'] }
 if (-not $PSBoundParameters.ContainsKey('LogSharePath')       -and $cfg['LogSharePath'])       { $LogSharePath       = $cfg['LogSharePath'] }
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads')    -and $cfg['ParallelThreads'])    { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
+if (-not $PSBoundParameters.ContainsKey('CanaryComputers')    -and $cfg['CanaryComputers']) {
+    $CanaryComputers = $cfg['CanaryComputers'] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+if (-not $PSBoundParameters.ContainsKey('MaxCanaryFailures')  -and $cfg['MaxCanaryFailures'])  { try { $MaxCanaryFailures   = [int]$cfg['MaxCanaryFailures'] }   catch {} }
+if (-not $PSBoundParameters.ContainsKey('HealthSettleSeconds') -and $cfg['HealthSettleSeconds']) { try { $HealthSettleSeconds = [int]$cfg['HealthSettleSeconds'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('SendEmail')          -and $cfg['SendEmail'] -eq 'true')  { $SendEmail   = $true }
 if (-not $PSBoundParameters.ContainsKey('SmtpServer')         -and $cfg['SmtpServer'])         { $SmtpServer         = $cfg['SmtpServer'] }
 if (-not $PSBoundParameters.ContainsKey('SmtpPort')           -and $cfg['SmtpPort'])           { try { $SmtpPort = [int]$cfg['SmtpPort'] } catch {} }
@@ -815,30 +837,34 @@ function Invoke-DefenderUpdate {
         [string]$LogSharePath,
         [System.Management.Automation.PSCredential]$WinRmCredential,
         [bool]$DisableIPv6 = $true,
-        [string]$LibPath              # Path to lib/Invoke-DefenderRemote.ps1.
-                                      # Required when this function runs inside a
-                                      # Start-ThreadJob runspace (PS7 parallel mode).
-                                      # Optional in PS 5.1 serial mode where the
-                                      # main runspace's dot-source is inherited.
+        [string[]]$LibPaths            # Paths to lib/*.ps1 helpers (Invoke-DefenderRemote,
+                                       # Get-DefenderHealthProbe, etc.). Required when this
+                                       # function runs inside a Start-ThreadJob runspace
+                                       # (PS7 parallel mode) since runspaces don't inherit
+                                       # functions from the parent.
     )
 
     $WarningPreference = 'SilentlyContinue'
 
     # Make wrapper functions available in this runspace. The Start-ThreadJob
     # runspace doesn't inherit functions from the parent, so we re-import here.
-    if ($LibPath -and (Test-Path $LibPath)) {
-        . $LibPath
+    foreach ($lib in $LibPaths) {
+        if ($lib -and (Test-Path $lib)) { . $lib }
     }
 
     $result = [pscustomobject]@{
-        ComputerName = $Computer
-        Status       = 'Unknown'
-        OldVersion   = ''
-        NewVersion   = ''
-        DurationSec  = 0
-        Details      = ''
-        Attempt      = 1
-        Timeout      = $false
+        ComputerName       = $Computer
+        Status             = 'Unknown'
+        OldVersion         = ''
+        NewVersion         = ''
+        DurationSec        = 0
+        Details            = ''
+        Attempt            = 1
+        Timeout            = $false
+        HealthStatus       = ''
+        HealthReason       = ''
+        RecentThreatCount  = 0
+        Wave               = ''
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -936,6 +962,18 @@ function Invoke-DefenderUpdate {
                         $result.Status     = 'No Update Needed'
                         $result.NewVersion = $currentVerStr
                         $result.Details    = "Already at v$currentVerStr ($hostArch available: v$AvailableVersionStr)"
+                        # Probe before returning — session is still active, host
+                        # is in a deterministic state (no install attempted, so
+                        # the probe captures the steady-state health).
+                        try {
+                            $probe = Get-DefenderHealthProbe -Session $session
+                            $result.HealthStatus      = $probe.OverallStatus
+                            $result.HealthReason      = if ($probe.StatusReason) { $probe.StatusReason } else { '' }
+                            $result.RecentThreatCount = $probe.RecentThreatCount
+                        } catch {
+                            $result.HealthStatus = 'ProbeFailed'
+                            $result.HealthReason = ($_.Exception.Message -replace "`r`n", ' ').Trim()
+                        }
                         return $result
                     }
                 } catch {
@@ -1007,6 +1045,22 @@ function Invoke-DefenderUpdate {
                 $result.Details = "Installer exit code: $($install.ExitCode)"
             }
 
+            # --- Post-install health probe ---
+            # Runs only when the host completed its update path (Success, or
+            # already current). On Failed we don't probe — the host state may
+            # be transient and the operator already has a clear failure signal.
+            if ($result.Status -in 'Success','No Update Needed') {
+                try {
+                    $probe = Get-DefenderHealthProbe -Session $session
+                    $result.HealthStatus      = $probe.OverallStatus
+                    $result.HealthReason      = if ($probe.StatusReason) { $probe.StatusReason } else { '' }
+                    $result.RecentThreatCount = $probe.RecentThreatCount
+                } catch {
+                    $result.HealthStatus = 'ProbeFailed'
+                    $result.HealthReason = ($_.Exception.Message -replace "`r`n", ' ').Trim()
+                }
+            }
+
         } finally {
             if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
         }
@@ -1036,6 +1090,7 @@ function New-HtmlReport {
     $skipCount     = @($Data | Where-Object Status -eq 'No Update Needed').Count
     $whatifCount   = @($Data | Where-Object Status -eq 'WhatIf').Count
     $excludedCount = @($Data | Where-Object Status -eq 'Excluded').Count
+    $gateHaltCount = @($Data | Where-Object Status -eq 'Skipped').Count
 
     $css = @'
 <style>
@@ -1057,6 +1112,11 @@ function New-HtmlReport {
   .skipped       { background: #9c5100; }
   .whatif        { background: #0078d4; }
   .excluded      { background: #6b7280; }
+  .gate-halt     { background: #6b21a8; }
+  .h-healthy     { background: #107c10; }
+  .h-degraded    { background: #ca5010; }
+  .h-threats     { background: #d13438; }
+  .h-probefail   { background: #4b5563; }
   .stat-card     { display: inline-block; padding: 14px 28px; border-radius: 10px; margin: 6px 8px 6px 0;
                    font-size: 1.1em; font-weight: 700; color: #fff; min-width: 120px; text-align: center;
                    cursor: pointer; user-select: none; }
@@ -1088,8 +1148,17 @@ function New-HtmlReport {
 '@
 
     # Build table rows and inject status badges
+    $reportStaged = $false
+    if ($Data -and ($Data | Where-Object { $_.Wave -and $_.Wave -ne 'All' -and $_.Wave -ne '' } | Select-Object -First 1)) {
+        $reportStaged = $true
+    }
+    $reportProps = if ($reportStaged) {
+        @('ComputerName', 'Wave', 'Status', 'OldVersion', 'NewVersion', 'DurationSec', 'Delta', 'Attempt', 'Timeout', 'HealthStatus', 'RecentThreatCount', 'Details')
+    } else {
+        @('ComputerName', 'Status', 'OldVersion', 'NewVersion', 'DurationSec', 'Delta', 'Attempt', 'Timeout', 'HealthStatus', 'RecentThreatCount', 'Details')
+    }
     $rows = $Data | Sort-Object ComputerName |
-        ConvertTo-Html -Fragment -Property ComputerName, Status, OldVersion, NewVersion, DurationSec, Delta, Attempt, Timeout, Details
+        ConvertTo-Html -Fragment -Property $reportProps
 
     # Add table id for the JS badge filter
     if ($rows.Count -gt 0) { $rows[0] = $rows[0] -replace '<table>', '<table id="resultsTable">' }
@@ -1101,8 +1170,20 @@ function New-HtmlReport {
             -replace '<td>No Update Needed</td>', '<td><span class="tag skipped">No Update Needed</span></td>' `
             -replace '<td>WhatIf</td>',           '<td><span class="tag whatif">WhatIf</span></td>' `
             -replace '<td>Excluded</td>',         '<td><span class="tag excluded">Excluded</span></td>' `
+            -replace '<td>Skipped</td>',          '<td><span class="tag gate-halt">Skipped (gate)</span></td>' `
+            -replace '<td>Healthy</td>',          '<td><span class="tag h-healthy">Healthy</span></td>' `
+            -replace '<td>Degraded</td>',         '<td><span class="tag h-degraded">Degraded</span></td>' `
+            -replace '<td>ThreatsDetected</td>',  '<td><span class="tag h-threats">Threats Detected</span></td>' `
+            -replace '<td>ProbeFailed</td>',      '<td><span class="tag h-probefail">Probe Failed</span></td>' `
             -replace '<td>True</td>',             '<td><strong style="color:#d13438">Yes</strong></td>' `
             -replace '<td>False</td>',            '<td>No</td>'
+    }
+    # Rename column headers to operator-friendly labels (after badge injection so the
+    # <th>HealthStatus</th> doesn't match the row-level pattern).
+    if ($rows.Count -gt 0) {
+        $rows[0] = $rows[0] `
+            -replace '<th>HealthStatus</th>',      '<th>Health</th>' `
+            -replace '<th>RecentThreatCount</th>', '<th>Threats (24h)</th>'
     }
 
     @"
@@ -1134,7 +1215,7 @@ function New-HtmlReport {
   <div id="statusCards">
     <span class="stat-card sc-ok"    data-filter="Success"        onclick="filterByStatus(this)">Success<br>$successCount</span>
     <span class="stat-card sc-fail"  data-filter="Failed"         onclick="filterByStatus(this)">Failed<br>$failCount</span>
-    <span class="stat-card sc-skip"  data-filter="No Update Needed" onclick="filterByStatus(this)">Skipped<br>$skipCount</span>$(if ($whatifCount   -gt 0) { "`n    <span class='stat-card sc-info'  data-filter='WhatIf'   onclick='filterByStatus(this)'>WhatIf<br>$whatifCount</span>" })$(if ($excludedCount -gt 0) { "`n    <span class='stat-card' style='background:#6b7280' data-filter='Excluded'  onclick='filterByStatus(this)'>Excluded<br>$excludedCount</span>" })
+    <span class="stat-card sc-skip"  data-filter="No Update Needed" onclick="filterByStatus(this)">Skipped<br>$skipCount</span>$(if ($whatifCount   -gt 0) { "`n    <span class='stat-card sc-info'  data-filter='WhatIf'   onclick='filterByStatus(this)'>WhatIf<br>$whatifCount</span>" })$(if ($excludedCount -gt 0) { "`n    <span class='stat-card' style='background:#6b7280' data-filter='Excluded'  onclick='filterByStatus(this)'>Excluded<br>$excludedCount</span>" })$(if ($gateHaltCount -gt 0) { "`n    <span class='stat-card' style='background:#6b21a8' data-filter='Skipped' onclick='filterByStatus(this)'>Gate Halt<br>$gateHaltCount</span>" })
   </div>
   <p style="font-size:.8em; color:#888; margin-top:4px;">Click a badge to filter the results table. Click again to clear.</p>
 
@@ -1246,14 +1327,18 @@ if ($ExcludeList.Count -gt 0) {
         if ($TargetComputers -contains $ex) {
             Write-Log "EXCLUDED (administrative): $ex — listed in ExcludeComputers in config.conf" 'WARN'
             $Results.Add([pscustomobject]@{
-                ComputerName = $ex
-                Status       = 'Excluded'
-                OldVersion   = ''
-                NewVersion   = ''
-                DurationSec  = 0
-                Details      = 'Administrative exclusion (ExcludeComputers in config.conf)'
-                Attempt      = 0
-                Timeout      = $false
+                ComputerName      = $ex
+                Status            = 'Excluded'
+                OldVersion        = ''
+                NewVersion        = ''
+                DurationSec       = 0
+                Details           = 'Administrative exclusion (ExcludeComputers in config.conf)'
+                Attempt           = 0
+                Timeout           = $false
+                HealthStatus      = ''
+                HealthReason      = ''
+                RecentThreatCount = 0
+                Wave              = ''
             })
         }
     }
@@ -1331,8 +1416,61 @@ if (-not (Test-Path $SourceFile)) {
 }
 
 # ===================================================================
+# Wave partitioning  (Staged Rollout)
+# ===================================================================
+# When -CanaryComputers is supplied, partition $TargetComputers into a
+# Canary wave (runs first) and a Production wave (runs only if the
+# canary health gate passes). When the param is empty, a single 'All'
+# wave is queued — behavior is identical to pre-v0.0.10.
+$Waves = [System.Collections.Generic.List[hashtable]]::new()
+if ($CanaryComputers -and $CanaryComputers.Count -gt 0) {
+    $fleetByLower = @{}
+    foreach ($t in $TargetComputers) { $fleetByLower[$t.ToLower()] = $t }
+    $validCanary = New-Object 'System.Collections.Generic.List[string]'
+    $unknownList = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($c in $CanaryComputers) {
+        $k = $c.ToLower()
+        if ($fleetByLower.ContainsKey($k)) {
+            $canonical = $fleetByLower[$k]
+            if (-not ($validCanary -contains $canonical)) { $validCanary.Add($canonical) }
+        } else {
+            $unknownList.Add($c)
+        }
+    }
+    if ($unknownList.Count -gt 0) {
+        Write-Log "Canary list: $($unknownList.Count) host(s) not in target fleet — dropped: $($unknownList -join ', ')" 'WARN'
+    }
+    if ($validCanary.Count -eq 0) {
+        Write-Log 'Canary list resolved to empty — proceeding without staging.' 'WARN'
+        $Waves.Add(@{ Name = 'All'; Computers = $TargetComputers; IsGate = $false })
+    } elseif ($validCanary.Count -ge $TargetComputers.Count) {
+        Write-Log "Canary list covers all $($TargetComputers.Count) targets — no production wave, proceeding as single wave." 'WARN'
+        $Waves.Add(@{ Name = 'All'; Computers = $TargetComputers; IsGate = $false })
+    } else {
+        $remainder = @($TargetComputers | Where-Object { $validCanary -notcontains $_ })
+        $Waves.Add(@{ Name = 'Canary';     Computers = $validCanary.ToArray(); IsGate = $true  })
+        $Waves.Add(@{ Name = 'Production'; Computers = $remainder;             IsGate = $false })
+        Write-Log ("Staged rollout: Wave 1 (Canary) = {0} host(s), Wave 2 (Production) = {1} host(s)" -f $validCanary.Count, $remainder.Count) 'HEADER'
+        Write-Log ("Canary hosts : {0}" -f ($validCanary -join ', ')) 'INFO'
+        Write-Log ("Gate         : halt if (Degraded + ProbeFailed) > {0}" -f $MaxCanaryFailures) 'INFO'
+        Write-Log ("Settle       : {0}s pause after canary wave before evaluating health" -f $HealthSettleSeconds) 'INFO'
+    }
+} else {
+    $Waves.Add(@{ Name = 'All'; Computers = $TargetComputers; IsGate = $false })
+}
+$Staged = ($Waves.Count -gt 1)
+
+# ===================================================================
 # Execution Engine
 # ===================================================================
+foreach ($wave in $Waves) {
+    $WaveTargets  = @($wave.Computers)
+    $WaveStartIdx = $Results.Count
+
+    if ($Staged) {
+        Write-Log ("=== Wave: {0} ({1} host(s)) ===" -f $wave.Name, $WaveTargets.Count) 'HEADER'
+    }
+
 if ($PSVersionTable.PSVersion.Major -ge 7) {
     # -----------------------------------------------------------
     # PARALLEL MODE  (PS 7+)
@@ -1348,7 +1486,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
     # Queue as a generic Queue for O(1) Dequeue
     $Queue = [System.Collections.Generic.Queue[pscustomobject]]::new()
-    foreach ($comp in $TargetComputers) {
+    foreach ($comp in $WaveTargets) {
         $Queue.Enqueue([pscustomobject]@{ Computer = $comp; Attempt = 1; Credential = $HostCredentials[$comp] })
     }
 
@@ -1360,15 +1498,18 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     $script:SuppressConsoleOutput = $true
     $savedWarningPref = $WarningPreference
     $WarningPreference = 'SilentlyContinue'
-    $DashTimer  = [System.Diagnostics.Stopwatch]::StartNew()
-    $DashAnchor = $null
+    $DashTimer    = [System.Diagnostics.Stopwatch]::StartNew()
+    $DashAnchor   = $null
+    $FirstDashTick = $true
 
     while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
-        # Dashboard refresh every 5 seconds
+        # Dashboard refresh: print immediately on first iteration so the
+        # operator gets visible feedback, then every 5 seconds after.
         if (-not $DashAnchor) { $DashAnchor = $Host.UI.RawUI.CursorPosition }
 
-        if ($DashTimer.Elapsed.TotalSeconds -ge 5) {
+        if ($FirstDashTick -or $DashTimer.Elapsed.TotalSeconds -ge 5) {
+            $FirstDashTick = $false
             $DashTimer.Restart()
             $Host.UI.RawUI.CursorPosition = $DashAnchor
 
@@ -1399,7 +1540,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 $LogSharePath,
                 $item.Credential,
                 [bool]$DisableIPv6,
-                $LibInvokeDefenderRemote
+                @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
             )
             $ActiveJobs[$job.Id] = @{
                 Job        = $job
@@ -1423,6 +1564,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                         ComputerName = $meta.Computer; Status = 'Failed'
                         OldVersion = ''; NewVersion = ''; DurationSec = 0
                         Details = 'Job produced no output'; Attempt = $meta.Attempt; Timeout = $false
+                        HealthStatus = ''; HealthReason = ''; RecentThreatCount = 0
+                        Wave = ''
                     }
                 } elseif ($r -is [array]) {
                     $r = $r[-1]
@@ -1466,6 +1609,8 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                     OldVersion = ''; NewVersion = ''
                     DurationSec = [math]::Round($elapsed, 2)
                     Details = 'Timeout'; Attempt = $meta.Attempt; Timeout = $true
+                    HealthStatus = ''; HealthReason = ''; RecentThreatCount = 0
+                    Wave = ''
                 })
                 Remove-Job $meta.Job -Force -ErrorAction SilentlyContinue
                 [void]$ActiveJobs.Remove($id)
@@ -1477,14 +1622,6 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
     $script:SuppressConsoleOutput = $false
     $WarningPreference = $savedWarningPref
-    Write-Host ''
-    Write-Host '=== Final Results ===' -ForegroundColor Magenta
-    $Results | Sort-Object ComputerName |
-        Select-Object ComputerName, Status, OldVersion, NewVersion, DurationSec,
-            @{n='Attempt#'; e={ $_.Attempt }},
-            @{n='Timeout?'; e={ $_.Timeout }},
-            Details |
-        Format-Table -AutoSize -Wrap
 
 } else {
     # -----------------------------------------------------------
@@ -1492,11 +1629,11 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     # -----------------------------------------------------------
     Write-Log 'Executing in SERIAL mode (PowerShell 5.1 detected; upgrade to PS 7+ for parallel)' 'WARN'
     $i = 0
-    foreach ($comp in $TargetComputers) {
+    foreach ($comp in $WaveTargets) {
         $i++
-        $pct = [math]::Round(($i / $TargetComputers.Count) * 100, 1)
+        $pct = [math]::Round(($i / $WaveTargets.Count) * 100, 1)
         Write-Progress -Activity 'Updating Defender Definitions' `
-            -Status "Processing $i of $($TargetComputers.Count): $comp" `
+            -Status "Processing $i of $($WaveTargets.Count): $comp" `
             -PercentComplete $pct
 
         $r = Invoke-DefenderUpdate `
@@ -1508,11 +1645,103 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
             -LogSharePath        $LogSharePath `
             -WinRmCredential     $HostCredentials[$comp] `
             -DisableIPv6         $DisableIPv6 `
-            -LibPath             $LibInvokeDefenderRemote
+            -LibPaths            @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
         $Results.Add($r)
     }
     Write-Progress -Activity 'Done' -Completed
 }
+
+    # ---- Tag results from this wave with the wave name ----
+    for ($i = $WaveStartIdx; $i -lt $Results.Count; $i++) {
+        if (-not $Results[$i].Wave) {
+            $Results[$i].Wave = $wave.Name
+        }
+    }
+
+    # ---- Wave summary ----
+    $waveRows  = @()
+    if ($Results.Count -gt $WaveStartIdx) {
+        $waveRows = @($Results[$WaveStartIdx..($Results.Count - 1)])
+    }
+    if ($Staged) {
+        $byHealth = $waveRows | Group-Object HealthStatus | Sort-Object Name
+        $summary  = ($byHealth | ForEach-Object {
+            $label = if ([string]::IsNullOrEmpty($_.Name)) { '(no-probe)' } else { $_.Name }
+            "$($_.Count) $label"
+        }) -join ', '
+        if (-not $summary) { $summary = '(no rows)' }
+        Write-Log ("Wave '{0}' complete: {1} host(s) — {2}" -f $wave.Name, $waveRows.Count, $summary) 'SUCCESS'
+    }
+
+    # ---- Canary gate ----
+    if ($wave.IsGate) {
+        if ($HealthSettleSeconds -gt 0) {
+            Write-Log ("Health settle: pausing {0}s for canary status to stabilize..." -f $HealthSettleSeconds) 'INFO'
+            # Heartbeat the settle pause so the operator can see the script
+            # is alive while waiting. Tick every 5s (or 1s for the last 10s)
+            # to give a tighter countdown near the end. Pure UX — does not
+            # affect gate evaluation.
+            $settleEnd = (Get-Date).AddSeconds($HealthSettleSeconds)
+            while ($true) {
+                $remaining = [int][math]::Ceiling(($settleEnd - (Get-Date)).TotalSeconds)
+                if ($remaining -le 0) { break }
+                $tick = if ($remaining -le 10) { 1 } else { 5 }
+                $step = [math]::Min($tick, $remaining)
+                Start-Sleep -Seconds $step
+                $remaining = [int][math]::Ceiling(($settleEnd - (Get-Date)).TotalSeconds)
+                if ($remaining -gt 0) {
+                    Write-Host ("  ...settling ({0}s remaining)" -f $remaining) -ForegroundColor DarkGray
+                }
+            }
+        }
+        $gate = Test-CanaryGate -WaveResults $waveRows -MaxFailures $MaxCanaryFailures
+        Write-Log ("Canary gate : Healthy={0}, Degraded={1}, ProbeFailed={2}, ThreatsDetected={3}, InstallFailed={4} (threshold {5})" `
+            -f $gate.HealthyCount, $gate.DegradedCount, $gate.ProbeFailedCount, $gate.ThreatsCount, $gate.InstallFailedCount, $gate.Threshold) 'INFO'
+        if ($gate.Pass) {
+            Write-Log 'Canary gate : PASS — proceeding with production wave.' 'SUCCESS'
+        } else {
+            $failedHosts = (@($gate.DegradedHosts) + @($gate.ProbeFailedHosts)) -join ', '
+            Write-Log ("Canary gate : HALT — {0} health failure(s) exceeded threshold {1}. Failing hosts: {2}" `
+                -f $gate.FailureCount, $gate.Threshold, $failedHosts) 'ERROR'
+            $haltReason = "Canary gate halted rollout ($($gate.FailureCount) health failure(s) > threshold $($gate.Threshold))"
+            $waveIdx = $Waves.IndexOf($wave)
+            for ($wi = ($waveIdx + 1); $wi -lt $Waves.Count; $wi++) {
+                foreach ($skip in $Waves[$wi].Computers) {
+                    $Results.Add([pscustomobject]@{
+                        ComputerName      = $skip
+                        Status            = 'Skipped'
+                        OldVersion        = ''
+                        NewVersion        = ''
+                        DurationSec       = 0
+                        Details           = $haltReason
+                        Attempt           = 0
+                        Timeout           = $false
+                        HealthStatus      = ''
+                        HealthReason      = ''
+                        RecentThreatCount = 0
+                        Wave              = $Waves[$wi].Name
+                    })
+                }
+            }
+            break
+        }
+    }
+}
+
+Write-Host ''
+Write-Host '=== Final Results ===' -ForegroundColor Magenta
+$finalCols = @('ComputerName')
+if ($Staged) { $finalCols += @{n='Wave'; e={ $_.Wave }} }
+$finalCols += @(
+    'Status',
+    @{n='Health';     e={ $_.HealthStatus }},
+    @{n='Threats24h'; e={ $_.RecentThreatCount }},
+    'OldVersion', 'NewVersion', 'DurationSec',
+    @{n='Attempt#'; e={ $_.Attempt }},
+    @{n='Timeout?'; e={ $_.Timeout }},
+    'Details'
+)
+$Results | Sort-Object ComputerName | Select-Object $finalCols | Format-Table -AutoSize -Wrap
 
 # ===================================================================
 # Version Analytics
@@ -1565,9 +1794,13 @@ $successCount  = @($Results | Where-Object Status -eq 'Success').Count
 $failCount     = @($Results | Where-Object Status -eq 'Failed').Count
 $skipCount     = @($Results | Where-Object Status -eq 'No Update Needed').Count
 $excludedCount = @($Results | Where-Object Status -eq 'Excluded').Count
+$gateHaltCount = @($Results | Where-Object Status -eq 'Skipped').Count
 
 Write-Log "UPDATE COMPLETE in $($TotalDuration.ToString('hh\:mm\:ss'))" 'HEADER'
-Write-Log "Success: $successCount  |  Failed: $failCount  |  Skipped: $skipCount  |  Excluded: $excludedCount  |  Total: $($Results.Count)" 'HEADER'
+$summaryLine = "Success: $successCount  |  Failed: $failCount  |  Skipped: $skipCount  |  Excluded: $excludedCount"
+if ($gateHaltCount -gt 0) { $summaryLine += "  |  GateHalt: $gateHaltCount" }
+$summaryLine += "  |  Total: $($Results.Count)"
+Write-Log $summaryLine 'HEADER'
 
 if ($successCount -gt 0) {
     Write-Log "Oldest version found   : $OldestVersion" 'INFO'

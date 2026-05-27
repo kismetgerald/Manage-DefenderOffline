@@ -305,6 +305,9 @@ See `conf\config.conf` for full documentation of every setting.
 | `-To` | *(required if -SendEmail)* | Recipient address(es) |
 | `-SmtpCredential` | *(optional)* | PSCredential for SMTP authentication |
 | `-SaveSmtpCredential` | — | Interactive helper; saves encrypted SMTP credentials to `.\conf\SmtpCredential.xml` |
+| `-CanaryComputers` | *(off)* | Comma-separated subset of the fleet to run first as a Canary wave. The Production wave runs only if the canary health gate passes. |
+| `-MaxCanaryFailures` | `0` | Number of canary-wave health failures (Degraded + ProbeFailed) allowed before the Production wave is halted. |
+| `-HealthSettleSeconds` | `60` | Pause between the canary wave finishing and the gate being evaluated. Gives Defender telemetry time to stabilize. |
 | `-ConfigPath` | `.\conf\config.conf` | Override config file location |
 
 ### Email Setup
@@ -343,7 +346,21 @@ $cred = Import-Clixml ".\conf\SmtpCredential.xml"
 
 # Maximum parallel threads
 .\Update-DefenderOffline.ps1 -ParallelThreads 32
+
+# Staged rollout — push to two canary hosts first, then halt-or-proceed
+.\Update-DefenderOffline.ps1 `
+    -CanaryComputers "LAB-PC01","LAB-PC02" `
+    -MaxCanaryFailures 0 `
+    -HealthSettleSeconds 120
 ```
+
+**Staged rollout behaviour**
+- `-CanaryComputers` partitions the fleet into a **Canary** wave and a **Production** wave.
+- After the Canary wave finishes, the script waits `-HealthSettleSeconds`, then evaluates the post-update health probe.
+- If the number of canary hosts ending in `HealthStatus = Degraded` or `ProbeFailed` exceeds `-MaxCanaryFailures`, the Production wave is **skipped**; those hosts appear as `Skipped (gate)` in the report.
+- Install failures, ThreatsDetected, and Healthy rows do **not** count against the gate (install failures are already retried 3×; pre-existing threats were not caused by the update).
+- Names in `-CanaryComputers` not in the resolved target fleet are warned and dropped.
+- Leave the parameter empty to disable staging (script runs the full fleet in a single wave — identical to pre-v0.0.10 behaviour).
 
 ### Execution Flow
 
@@ -680,7 +697,42 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.9 (2026-05-26) — Current
+### v0.0.10 (2026-05-27) — Current
+
+Health-probe + drill-down family across all three consumer scripts, plus opt-in staged rollout for `Update-DefenderOffline`. Three sub-PRs landed on `feat/v0.0.10` and merged together.
+
+**Post-update health probe (`Update-DefenderOffline.ps1`, shared `lib/Get-DefenderHealthProbe.ps1`):**
+- ✨ After every install (and every No-Update-Needed pass), the script runs `Get-DefenderHealthProbe` over the same WinRM session to classify the host as **Healthy / Degraded / ThreatsDetected / ProbeFailed**
+- ✨ Pure classifier `Get-DefenderHealthClassification` is the single source of truth shared by all three consumer scripts
+- ✨ Six protection toggles checked: RealTimeProtectionEnabled, AMServiceEnabled, AntivirusEnabled, BehaviorMonitorEnabled, IoavProtectionEnabled, OnAccessProtectionEnabled (any disabled → Degraded)
+- ✨ Recent-threat window (`-ThreatWindowHours`, default 24h) and spike threshold (`-ThreatSpikeThreshold`, default 1) — Degraded wins over ThreatsDetected when both apply
+- ✨ HTML report gains `Health` and `Threats(24h)` columns with colored badges (`.h-healthy` green, `.h-degraded` amber, `.h-threats` red `#d13438`, `.h-probefail` grey `#4b5563`)
+- ✨ +18 Pester tests covering classifier + probe paths
+
+**Drill-down modal in interactive monitor (`Show-DefenderStatus.ps1`):**
+- ✨ Right-click any row (or double-click) opens a **Host Details** dialog with Identity, Health Classification pill, all six Defender toggles bool-colored, scan timestamps, threats grid (cross-referenced `Get-MpThreatDetection` + `Get-MpThreat` catalog), and error detail
+- ✨ Color palette refined: `ThreatsDetected = red`, `Offline = dark grey` (`#4b5563`) — Offline no longer steals the red palette from real incidents
+
+**Drill-down modal on the headless dashboard (`Start-DefenderDashboard.ps1`):**
+- ✨ Click any row on `/defender` to open the same Host Details view (vanilla HTML/CSS/JS — no framework)
+- ✨ Per-host data embedded in `<script type="application/json">` (XSS-escaped) — instant modal lookup with no extra HTTP request
+- ✨ Status badge palette mirrors `Show-DefenderStatus`: `b-thr` red for ThreatsDetected, `b-off` grey for Offline
+- ✨ CSS hardening for long PUA resource strings: `table-layout: fixed` + per-column widths + `.r-wrap` div with `max-height: 8em` and internal scroll — modals stay bounded even on hosts with dozens of joined paths
+
+**Staged rollout (`Update-DefenderOffline.ps1`, `lib/Test-CanaryGate.ps1`):**
+- ✨ **`-CanaryComputers`** — explicit subset of the fleet to run first as a *Canary* wave (no count/percent shortcuts; explicit list only)
+- ✨ **`-MaxCanaryFailures`** (default `0`) — number of canary `Degraded + ProbeFailed` failures tolerated before the *Production* wave halts
+- ✨ **`-HealthSettleSeconds`** (default `60`) — pause after the canary wave finishes before the gate is evaluated
+- ✨ Gate is health-only by design: install Failed rows + ThreatsDetected don't count (install is retried 3×; threats pre-existed)
+- ✨ On halt, remaining-wave hosts recorded as `Status='Skipped'` with the gate-halt reason in Details; HTML report gains a purple `Gate Halt` stat card and a `Skipped (gate)` pill
+- ✨ Result rows + console final-table + HTML report gain a `Wave` column **only when staging was used** (zero diff when the param is empty)
+- ✨ Visible heartbeat during the settle pause (5s ticks; 1s in the final 10s) plus immediate first dashboard tick so short canary waves show progress
+- ✨ +8 Pester tests for `Test-CanaryGate` (gate pass/fail, threshold edges, what does-not-count rules)
+
+**Test infrastructure:**
+- ✨ Suite now at **242 tests** (229 active + 13 skipped placeholders) — up from 216 in v0.0.9
+
+### v0.0.9 (2026-05-26)
 
 `Get-DefenderDefinitions.ps1` polish — bandwidth-friendly re-runs, explicit proxy support, and the helper's first unit-test surface. No new operator-facing scripts; all three changes target the internet-side staging workflow introduced in v0.0.8.
 
@@ -827,8 +879,6 @@ The project follows a three-train versioning scheme:
 
 - Integration with Windows Update Service API
 - Support for multiple definition file formats (FEP, NIS)
-- Staged rollout with canary group and per-wave halt-on-health-failure
-- Post-update health probe (RT-protection check + quarantine-event collection)
 - Integration with monitoring systems (SCOM, Splunk)
 
 ---
