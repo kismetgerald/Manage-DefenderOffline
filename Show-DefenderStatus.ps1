@@ -126,6 +126,12 @@ if (Test-Path $LibGetDefenderComputers) { . $LibGetDefenderComputers }
 $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 . $LibInvokeDefenderRemote
 
+# Shared health classifier — same rules used by Update-DefenderOffline so
+# the WinForms grid and the dashboard render the same labels for the same
+# state.
+$LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.ps1'
+. $LibGetDefenderHealthProbe
+
 # ===================================================================
 # Credential Helper Mode  (exits after completion)
 # ===================================================================
@@ -459,6 +465,8 @@ function Get-DefenderStatus {
         LastQuickScan      = ''
         LastFullScan       = ''
         ThreatCount        = ''
+        HealthStatus       = ''
+        HealthReason       = ''
         QueryDuration      = 0
         Error              = ''
     }
@@ -499,13 +507,17 @@ function Get-DefenderStatus {
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
                 [pscustomobject]@{
-                    SvcStatus          = $svc.Status
-                    SignatureVersion   = if ($mp) { $mp.AntivirusSignatureVersion }   else { $null }
-                    RealTimeProtection = if ($mp) { $mp.RealTimeProtectionEnabled }  else { $null }
-                    AntivirusEnabled   = if ($mp) { $mp.AntivirusEnabled }           else { $null }
-                    LastQuickScan      = if ($mp) { $mp.QuickScanStartTime }         else { $null }
-                    LastFullScan       = if ($mp) { $mp.FullScanStartTime }          else { $null }
-                    ThreatCount        = if ($mp) {
+                    SvcStatus            = $svc.Status
+                    SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }   else { $null }
+                    RealTimeProtection   = if ($mp) { $mp.RealTimeProtectionEnabled }  else { $null }
+                    AMServiceEnabled     = if ($mp) { $mp.AMServiceEnabled }            else { $null }
+                    AntivirusEnabled     = if ($mp) { $mp.AntivirusEnabled }            else { $null }
+                    BehaviorMonitor      = if ($mp) { $mp.BehaviorMonitorEnabled }      else { $null }
+                    IoavProtection       = if ($mp) { $mp.IoavProtectionEnabled }       else { $null }
+                    OnAccessProtection   = if ($mp) { $mp.OnAccessProtectionEnabled }   else { $null }
+                    LastQuickScan        = if ($mp) { $mp.QuickScanStartTime }          else { $null }
+                    LastFullScan         = if ($mp) { $mp.FullScanStartTime }           else { $null }
+                    ThreatCount          = if ($mp) {
                         (Get-MpThreat -ErrorAction SilentlyContinue | Measure-Object).Count
                     } else { $null }
                 }
@@ -519,6 +531,28 @@ function Get-DefenderStatus {
             $result.LastQuickScan      = if ($data.LastQuickScan) { $data.LastQuickScan.ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
             $result.LastFullScan       = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
             $result.ThreatCount        = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
+
+            # Classify via the shared helper if Get-MpComputerStatus returned
+            # the full toggle set. If any toggle is $null (Defender service
+            # stopped or service errored), HealthStatus stays empty and the
+            # operator sees the legacy fields instead.
+            if ($null -ne $data.RealTimeProtection -and
+                $null -ne $data.AMServiceEnabled  -and
+                $null -ne $data.AntivirusEnabled  -and
+                $null -ne $data.BehaviorMonitor   -and
+                $null -ne $data.IoavProtection    -and
+                $null -ne $data.OnAccessProtection) {
+                $cls = Get-DefenderHealthClassification `
+                    -RealTimeProtectionEnabled  ([bool]$data.RealTimeProtection) `
+                    -AntimalwareServiceEnabled  ([bool]$data.AMServiceEnabled)   `
+                    -AntivirusEnabled           ([bool]$data.AntivirusEnabled)   `
+                    -BehaviorMonitorEnabled     ([bool]$data.BehaviorMonitor)    `
+                    -IoavProtectionEnabled      ([bool]$data.IoavProtection)     `
+                    -OnAccessProtectionEnabled  ([bool]$data.OnAccessProtection) `
+                    -RecentThreatCount          ([int]($data.ThreatCount ?? 0))
+                $result.HealthStatus = $cls.OverallStatus
+                $result.HealthReason = if ($cls.StatusReason) { $cls.StatusReason } else { '' }
+            }
 
             if ($result.SignatureVersion -and $AvailableVersionStr) {
                 try {
@@ -558,15 +592,19 @@ function ConvertTo-StatusHtml {
     $rtOff        = @($Data | Where-Object { $_.RealTimeProtection -eq 'False' -and $_.Online }).Count
 
     $rows = foreach ($r in $Data | Sort-Object ComputerName) {
+        # Mirror the grid's pill logic: prefer the shared health classifier
+        # when present, fall back to the legacy RT/AV check otherwise.
         $status = if (-not $r.Online) { 'Offline' }
                   elseif ($r.VersionStatus -eq 'Outdated') { 'Outdated' }
+                  elseif ($r.HealthStatus) { $r.HealthStatus }
                   elseif ($r.RealTimeProtection -eq 'False' -or $r.AntivirusEnabled -eq 'False') { 'Degraded' }
                   else { 'Healthy' }
         $cls = switch ($status) {
-            'Offline'  { 'failed'  }
-            'Outdated' { 'skipped' }
-            'Degraded' { 'warn'    }
-            default    { 'success' }
+            'Offline'         { 'failed'  }
+            'Outdated'        { 'skipped' }
+            'Degraded'        { 'warn'    }
+            'ThreatsDetected' { 'failed'  }
+            default           { 'success' }
         }
         $tip = if ($r.Error) {
             " title=`"$($r.Error -replace '"','&quot;' -replace '<','&lt;' -replace '>','&gt;')`""
@@ -1011,11 +1049,12 @@ $grid.add_CellPainting({
     if (-not $statusText) { return }
 
     $pillBg = switch ($statusText) {
-        'Healthy'  { $clrSuccess }
-        'Offline'  { $clrError }
-        'Outdated' { $clrOutdatedPill }
-        'Degraded' { $clrWarn }
-        default    { [System.Drawing.Color]::Gray }
+        'Healthy'         { $clrSuccess }
+        'Offline'         { $clrError }
+        'Outdated'        { $clrOutdatedPill }
+        'Degraded'        { $clrWarn }
+        'ThreatsDetected' { $clrError }
+        default           { [System.Drawing.Color]::Gray }
     }
     $pillFg = $clrWhite
 
@@ -1164,8 +1203,16 @@ function Update-Grid {
     $grid.Rows.Clear()
 
     foreach ($r in $data | Sort-Object ComputerName) {
+        # Status pill priority:
+        #   Offline   - no WinRM, nothing else matters
+        #   Outdated  - reachable but signature is behind the available version
+        #   else      - defer to the shared health classifier (Healthy /
+        #               Degraded / ThreatsDetected). Falls back to the legacy
+        #               RT/AV check if HealthStatus is empty (Defender service
+        #               down, or older script versions in mixed-test scenarios).
         $status = if (-not $r.Online) { 'Offline' }
                   elseif ($r.VersionStatus -eq 'Outdated') { 'Outdated' }
+                  elseif ($r.HealthStatus) { $r.HealthStatus }
                   elseif ($r.RealTimeProtection -eq 'False' -or $r.AntivirusEnabled -eq 'False') { 'Degraded' }
                   else { 'Healthy' }
 
@@ -1310,17 +1357,17 @@ $btnRefresh.add_Click({
 
     # Bundle everything in a hashtable to pass as a single -ArgumentList
     # value (avoids the array-flattening trap with multi-arg lists).
-    # LibPath is dot-sourced inside each parallel runspace so Get-DefenderStatus
-    # (which calls New-DefenderRemoteSession / Invoke-DefenderRemote) has the
-    # wrapper functions available — they don't propagate across runspace
-    # boundaries automatically.
+    # LibPaths are dot-sourced inside each parallel runspace so Get-DefenderStatus
+    # (which calls New-DefenderRemoteSession / Invoke-DefenderRemote and the
+    # shared health classifier) has the helper functions available — they
+    # don't propagate across runspace boundaries automatically.
     $ctx = @{
         Computers           = $TargetComputers
         AvailableVersionStr = $AvailableVersionStr
         Threads             = $ParallelThreads
         Ts                  = $TimeoutSeconds
         FuncDef             = ${function:Get-DefenderStatus}.ToString()
-        LibPath             = $LibInvokeDefenderRemote
+        LibPaths            = @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
         CompletedHosts      = $script:CompletedHosts
         Credentials         = $HostCredentials
         DisableIPv6         = $DisableIPv6
@@ -1334,7 +1381,7 @@ $btnRefresh.add_Click({
                 $c    = $using:Ctx
                 $comp = [string]$_
                 # Make wrapper functions available in this runspace
-                . $c.LibPath
+                foreach ($lib in $c.LibPaths) { . $lib }
                 # Assigning to ${function:Name} actually DEFINES the function
                 # in this runspace; dot-sourcing the body alone does not.
                 ${function:Get-DefenderStatus} = [scriptblock]::Create($c.FuncDef)
@@ -1350,7 +1397,7 @@ $btnRefresh.add_Click({
                 $r
             } -ThrottleLimit $Ctx.Threads
         } else {
-            . $Ctx.LibPath
+            foreach ($lib in $Ctx.LibPaths) { . $lib }
             ${function:Get-DefenderStatus} = [scriptblock]::Create($Ctx.FuncDef)
             foreach ($comp in $Ctx.Computers) {
                 $compStr = [string]$comp

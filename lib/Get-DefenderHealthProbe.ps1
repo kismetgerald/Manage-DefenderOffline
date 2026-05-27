@@ -35,6 +35,62 @@
 
 <#
 .SYNOPSIS
+    Classify a Defender health snapshot. Pure logic — no WinRM calls.
+
+.DESCRIPTION
+    Single source of truth for the toolkit's health classification rules.
+    Both Get-DefenderHealthProbe (post-update path in Update-DefenderOffline)
+    and Show-DefenderStatus / Start-DefenderDashboard (fleet-monitor paths)
+    call this function so every consumer renders the same labels.
+
+.OUTPUTS
+    [pscustomobject] with OverallStatus and StatusReason fields. Caller
+    composes the rest of the per-host record from whatever Defender data
+    they already have on hand.
+#>
+function Get-DefenderHealthClassification {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] [bool]$RealTimeProtectionEnabled,
+        [Parameter(Mandatory)] [bool]$AntimalwareServiceEnabled,
+        [Parameter(Mandatory)] [bool]$AntivirusEnabled,
+        [Parameter(Mandatory)] [bool]$BehaviorMonitorEnabled,
+        [Parameter(Mandatory)] [bool]$IoavProtectionEnabled,
+        [Parameter(Mandatory)] [bool]$OnAccessProtectionEnabled,
+        [int]$RecentThreatCount  = 0,
+        [int]$ThreatSpikeThreshold = 1
+    )
+
+    $disabled = New-Object System.Collections.Generic.List[string]
+    if (-not $RealTimeProtectionEnabled) { [void]$disabled.Add('real-time protection') }
+    if (-not $AntimalwareServiceEnabled) { [void]$disabled.Add('antimalware service') }
+    if (-not $AntivirusEnabled)          { [void]$disabled.Add('antivirus engine') }
+    if (-not $BehaviorMonitorEnabled)    { [void]$disabled.Add('behavior monitor') }
+    if (-not $IoavProtectionEnabled)     { [void]$disabled.Add('IOAV protection') }
+    if (-not $OnAccessProtectionEnabled) { [void]$disabled.Add('on-access protection') }
+
+    if ($disabled.Count -gt 0) {
+        [pscustomobject]@{
+            OverallStatus = 'Degraded'
+            StatusReason  = "Disabled: $($disabled -join ', ')"
+        }
+    } elseif ($RecentThreatCount -ge $ThreatSpikeThreshold) {
+        [pscustomobject]@{
+            OverallStatus = 'ThreatsDetected'
+            StatusReason  = "$RecentThreatCount threat(s) (threshold: $ThreatSpikeThreshold)"
+        }
+    } else {
+        [pscustomobject]@{
+            OverallStatus = 'Healthy'
+            StatusReason  = $null
+        }
+    }
+}
+
+
+<#
+.SYNOPSIS
     Run a Defender health probe against a remote endpoint.
 
 .PARAMETER ComputerName
@@ -176,28 +232,25 @@ function Get-DefenderHealthProbe {
     $s = $raw.Status
     $threats = @($raw.Threats)
 
-    # Build the disabled-protection list (Degraded reasons).
-    $disabled = New-Object System.Collections.Generic.List[string]
-    if (-not $s.RealTimeProtectionEnabled) { [void]$disabled.Add('real-time protection') }
-    if (-not $s.AMServiceEnabled)          { [void]$disabled.Add('antimalware service') }
-    if (-not $s.AntivirusEnabled)          { [void]$disabled.Add('antivirus engine') }
-    if (-not $s.BehaviorMonitorEnabled)    { [void]$disabled.Add('behavior monitor') }
-    if (-not $s.IoavProtectionEnabled)     { [void]$disabled.Add('IOAV protection') }
-    if (-not $s.OnAccessProtectionEnabled) { [void]$disabled.Add('on-access protection') }
+    $classification = Get-DefenderHealthClassification `
+        -RealTimeProtectionEnabled  ([bool]$s.RealTimeProtectionEnabled)  `
+        -AntimalwareServiceEnabled  ([bool]$s.AMServiceEnabled)           `
+        -AntivirusEnabled           ([bool]$s.AntivirusEnabled)           `
+        -BehaviorMonitorEnabled     ([bool]$s.BehaviorMonitorEnabled)     `
+        -IoavProtectionEnabled      ([bool]$s.IoavProtectionEnabled)      `
+        -OnAccessProtectionEnabled  ([bool]$s.OnAccessProtectionEnabled)  `
+        -RecentThreatCount          $threats.Count                        `
+        -ThreatSpikeThreshold       $ThreatSpikeThreshold
 
-    if ($disabled.Count -gt 0) {
-        $overall = 'Degraded'
-        $reason  = "Disabled: $($disabled -join ', ')"
-    } elseif ($threats.Count -ge $ThreatSpikeThreshold) {
-        $overall = 'ThreatsDetected'
-        $reason  = "$($threats.Count) threat(s) in last ${ThreatWindowHours}h (threshold: ${ThreatSpikeThreshold})"
-    } else {
-        $overall = 'Healthy'
-        $reason  = $null
+    # Tweak the threshold message to reference the window — only the probe
+    # knows that context. Classifier doesn't, by design.
+    $reason = $classification.StatusReason
+    if ($classification.OverallStatus -eq 'ThreatsDetected') {
+        $reason = "$($threats.Count) threat(s) in last ${ThreatWindowHours}h (threshold: ${ThreatSpikeThreshold})"
     }
 
     [pscustomobject]@{
-        OverallStatus              = $overall
+        OverallStatus              = $classification.OverallStatus
         StatusReason               = $reason
         RealTimeProtectionEnabled  = [bool]$s.RealTimeProtectionEnabled
         AntimalwareServiceEnabled  = [bool]$s.AMServiceEnabled
