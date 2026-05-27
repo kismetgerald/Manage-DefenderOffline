@@ -113,24 +113,6 @@ function Read-ConfigFile {
     return $cfg
 }
 
-if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
-$cfg = Read-ConfigFile $ConfigPath
-
-# Config-merge: parameters provided on the CLI win; config fills in the
-# rest; otherwise defaults apply.
-if (-not $PSBoundParameters.ContainsKey('OutputPath')    -and $cfg['DefaultOutputPath'])    { $OutputPath    = $cfg['DefaultOutputPath'] }
-if (-not $PSBoundParameters.ContainsKey('Architecture')  -and $cfg['DefaultArchitecture'])  { $Architecture  = $cfg['DefaultArchitecture'] }
-if (-not $OutputPath) { $OutputPath = Join-Path $ScriptDir 'definitions' }
-
-# Resolve the OutputPath against the script directory if a relative path
-# is supplied — same convention as the dashboard's AuthBasicUsersFile.
-# GetFullPath canonicalises '.\foo' style segments so the operator-facing
-# log lines don't show ugly mid-path '.\' fragments.
-if (-not [System.IO.Path]::IsPathRooted($OutputPath)) {
-    $OutputPath = Join-Path $ScriptDir $OutputPath
-}
-$OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
-
 # ===================================================================
 # Architecture resolution
 # ===================================================================
@@ -168,26 +150,6 @@ function Resolve-Architectures {
     return $valid.ToArray()
 }
 
-$Architectures = Resolve-Architectures -Spec $Architecture
-if ($Architectures.Count -eq 0) {
-    Write-Host 'ERROR: No architectures to download.' -ForegroundColor Red
-    exit 1
-}
-
-# ===================================================================
-# Banner
-# ===================================================================
-Write-Host ''
-Write-Host '  ============================================================' -ForegroundColor Cyan
-Write-Host "   Microsoft Defender Definitions Downloader v$ScriptVersion" -ForegroundColor Cyan
-Write-Host '  ============================================================' -ForegroundColor Cyan
-Write-Host ''
-Write-Host "  Output path     : $OutputPath" -ForegroundColor White
-Write-Host "  Architectures   : $($Architectures -join ', ')" -ForegroundColor White
-Write-Host "  Signature check : $(if ($SkipSignatureCheck) { 'SKIPPED' } else { 'Enabled' })" -ForegroundColor $(if ($SkipSignatureCheck) { 'Yellow' } else { 'White' })
-Write-Host "  Force overwrite : $($Force.IsPresent)" -ForegroundColor White
-Write-Host ''
-
 # ===================================================================
 # Helpers
 # ===================================================================
@@ -223,6 +185,56 @@ function Get-FileVersionString {
     param([string]$Path)
     (Get-Item -LiteralPath $Path).VersionInfo.FileVersion
 }
+
+# ===================================================================
+# Main-flow guard
+#
+# When dot-sourced (Pester / interactive testing) return here so the
+# config-load, banner, and download engine below do not run. Direct
+# invocation continues normally.
+# ===================================================================
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ===================================================================
+# Configuration load + parameter merge
+# ===================================================================
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
+$cfg = Read-ConfigFile $ConfigPath
+
+# Config-merge: parameters provided on the CLI win; config fills in the
+# rest; otherwise defaults apply.
+if (-not $PSBoundParameters.ContainsKey('OutputPath')    -and $cfg['DefaultOutputPath'])    { $OutputPath    = $cfg['DefaultOutputPath'] }
+if (-not $PSBoundParameters.ContainsKey('Architecture')  -and $cfg['DefaultArchitecture'])  { $Architecture  = $cfg['DefaultArchitecture'] }
+if (-not $OutputPath) { $OutputPath = Join-Path $ScriptDir 'definitions' }
+
+# Resolve the OutputPath against the script directory if a relative path
+# is supplied — same convention as the dashboard's AuthBasicUsersFile.
+# GetFullPath canonicalises '.\foo' style segments so the operator-facing
+# log lines don't show ugly mid-path '.\' fragments.
+if (-not [System.IO.Path]::IsPathRooted($OutputPath)) {
+    $OutputPath = Join-Path $ScriptDir $OutputPath
+}
+$OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
+
+$Architectures = Resolve-Architectures -Spec $Architecture
+if ($Architectures.Count -eq 0) {
+    Write-Host 'ERROR: No architectures to download.' -ForegroundColor Red
+    exit 1
+}
+
+# ===================================================================
+# Banner
+# ===================================================================
+Write-Host ''
+Write-Host '  ============================================================' -ForegroundColor Cyan
+Write-Host "   Microsoft Defender Definitions Downloader v$ScriptVersion" -ForegroundColor Cyan
+Write-Host '  ============================================================' -ForegroundColor Cyan
+Write-Host ''
+Write-Host "  Output path     : $OutputPath" -ForegroundColor White
+Write-Host "  Architectures   : $($Architectures -join ', ')" -ForegroundColor White
+Write-Host "  Signature check : $(if ($SkipSignatureCheck) { 'SKIPPED' } else { 'Enabled' })" -ForegroundColor $(if ($SkipSignatureCheck) { 'Yellow' } else { 'White' })
+Write-Host "  Force overwrite : $($Force.IsPresent)" -ForegroundColor White
+Write-Host ''
 
 # ===================================================================
 # Download loop
