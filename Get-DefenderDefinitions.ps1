@@ -37,9 +37,17 @@
     for testing — production downloads must remain signed.
 
 .PARAMETER Force
-    Overwrite an existing version subfolder. Without -Force, an existing
-    folder for the resolved version+architecture is left untouched and
-    re-using existing files when integrity verifies.
+    Bypass the bandwidth-saving fast-path and overwrite any existing
+    version subfolder. Without -Force, the script first checks today's
+    date folder for an existing copy of each requested architecture; if
+    one is found, the download is skipped (saves ~200 MB per arch), and
+    the existing file's SHA-256 + signature are re-verified and recorded
+    in the manifest. With -Force, every architecture is fetched fresh
+    from Microsoft and any matching existing folder is overwritten.
+
+    Trade-off: the fast-path will miss a Microsoft mid-day publish until
+    tomorrow's first run. Use -Force when you specifically need to pull
+    the latest Microsoft has published right now.
 
 .PARAMETER ConfigPath
     Path to a config.conf with an optional [Download] section.
@@ -238,6 +246,63 @@ try {
 
         Write-Host "  ━━ $arch ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
         Write-Host "     Source : $url" -ForegroundColor DarkGray
+
+        # Bandwidth-saving fast-path: today's folder already has this arch?
+        # If so, re-verify hash + signature on the existing file and add to
+        # the manifest without re-downloading. -Force disables this.
+        if (-not $Force -and (Test-Path $dateFolder)) {
+            $existingArchFolder = $null
+            $existingVersion    = $null
+            $candidates = @(
+                Get-ChildItem -LiteralPath $dateFolder -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^v(\d+\.\d+\.\d+\.\d+)$' } |
+                    ForEach-Object {
+                        $verStr = $_.Name -replace '^v',''
+                        $archDir = Join-Path $_.FullName $arch
+                        $exeFile = Join-Path $archDir 'mpam-fe.exe'
+                        if (Test-Path $exeFile) {
+                            [pscustomobject]@{ Folder = $archDir; Version = [version]$verStr; ExeFile = $exeFile }
+                        }
+                    }
+            )
+            if ($candidates.Count -gt 0) {
+                $best = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+                $existingArchFolder = $best.Folder
+                $existingVersion    = $best.Version.ToString()
+            }
+            if ($existingArchFolder) {
+                Write-Host "     [FAST-PATH] Found existing $arch v$existingVersion in today's folder; skipping download." -ForegroundColor Green
+                Write-Host '                 Re-run with -Force to fetch fresh from Microsoft.' -ForegroundColor DarkGray
+
+                $existingFile = Join-Path $existingArchFolder 'mpam-fe.exe'
+                $sigInfo = $null
+                try {
+                    $sigInfo = Test-MpamSignature -Path $existingFile -Skip:$SkipSignatureCheck
+                } catch {
+                    Write-Host "     [FAIL] $($_.Exception.Message)" -ForegroundColor Red
+                    [void]$failedArchs.Add($arch)
+                    continue
+                }
+
+                $existingHash = Get-Sha256 -Path $existingFile
+                [void]$manifestItems.Add([pscustomobject]@{
+                    architecture     = $arch
+                    fwlink           = $url
+                    filename         = 'mpam-fe.exe'
+                    relativePath     = (Resolve-Path $existingFile).Path.Substring($OutputPath.Length).TrimStart('\','/')
+                    version          = $existingVersion
+                    sizeBytes        = (Get-Item -LiteralPath $existingFile).Length
+                    sha256           = $existingHash
+                    signerSubject    = $sigInfo.SignerSubject
+                    signerThumbprint = $sigInfo.SignerThumbprint
+                    downloadedAt     = $null
+                    reusedExisting   = $true
+                })
+                Write-Host ''
+                continue
+            }
+        }
+
         Write-Host '     Downloading…' -ForegroundColor White
 
         try {
