@@ -1453,10 +1453,28 @@ function Build-DashboardHtml {
     .mdo-threats {
       width: 100%; margin-top: 8px; border-collapse: collapse;
       background: var(--bg-page); border-radius: 6px; overflow: hidden;
+      /* Fixed table layout + explicit column widths so a long Resource
+         string can't expand the cell beyond the modal's content area. */
+      table-layout: fixed;
     }
     .mdo-threats th, .mdo-threats td {
       padding: 6px 10px; text-align: left; font-size: .85em;
       border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+    .mdo-threats th:nth-child(1), .mdo-threats td:nth-child(1) { width: 28%; }
+    .mdo-threats th:nth-child(2), .mdo-threats td:nth-child(2) { width: 16%; white-space: nowrap; }
+    .mdo-threats th:nth-child(3), .mdo-threats td:nth-child(3) { width: 56%; }
+    /* Cap really-long Resource cells with internal scroll instead of letting
+       one threat row balloon the modal vertically. Inner div is required
+       because <td> ignores max-height. */
+    .mdo-threats .r-wrap {
+      max-height: 8em;
+      overflow-y: auto;
+      word-break: break-word;
+      overflow-wrap: anywhere;
     }
     .mdo-threats th { background: var(--th-bg); color: var(--th-text); }
     .mdo-threats tr:last-child td { border-bottom: none; }
@@ -1705,7 +1723,7 @@ function Build-DashboardHtml {
       if (h.threats && h.threats.length > 0) {
         for (var i = 0; i < h.threats.length; i++) {
           var t = h.threats[i];
-          threatRows += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.detected) + '</td><td>' + esc(t.resources) + '</td></tr>';
+          threatRows += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.detected) + '</td><td><div class="r-wrap">' + esc(t.resources) + '</div></td></tr>';
         }
       }
       var threatBlock = h.threats && h.threats.length > 0
