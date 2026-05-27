@@ -158,6 +158,8 @@ $LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.p
 . $LibGetDefenderHealthProbe
 $LibTestHttpsCertBinding   = Join-Path $ScriptDir 'lib\Test-HttpsCertBinding.ps1'
 . $LibTestHttpsCertBinding
+$LibTestUrlAclCollision    = Join-Path $ScriptDir 'lib\Test-UrlAclCollision.ps1'
+. $LibTestUrlAclCollision
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
 # ===================================================================
@@ -2174,7 +2176,27 @@ if ($UseHttps -and $RedirectHttpToHttps) {
             } -ArgumentList $redirectListener, $Port
             Write-DashLog "HTTP redirect listener started on http://+:$RedirectHttpPort/ (301 -> https://+:$Port/)" 'SUCCESS'
         } catch {
-            Write-DashLog "Could not start HTTP redirect listener on port $RedirectHttpPort : $($_.Exception.Message)" 'WARN'
+            $errMsg = $_.Exception.Message
+            Write-DashLog "Could not start HTTP redirect listener on port $RedirectHttpPort : $errMsg" 'WARN'
+
+            # When the failure is a URL-ACL reservation conflict (HttpListener's
+            # most common bind failure), surface the holding owner(s) and the
+            # corrective netsh command so the operator doesn't have to dig.
+            if ($errMsg -match 'conflicts with an existing registration') {
+                $collision = Test-UrlAclCollision -Port $RedirectHttpPort -Scheme 'http'
+                if ($collision.HasCollision) {
+                    Write-DashLog "  URL-ACL collision: $($collision.Url) is reserved by:" 'WARN'
+                    foreach ($owner in $collision.Owners) {
+                        Write-DashLog "    - $owner" 'WARN'
+                    }
+                    Write-DashLog "  To free the reservation so the redirect listener can bind, run as Administrator:" 'WARN'
+                    Write-DashLog "    netsh http delete urlacl url=$($collision.Url)" 'WARN'
+                    Write-DashLog "  Or pick a different port via 'RedirectHttpPort' in conf\config.conf." 'WARN'
+                } else {
+                    Write-DashLog "  URL-ACL diagnostic returned no owners. The conflict may be a different prefix on the same port, or another process binding the port directly." 'WARN'
+                }
+            }
+
             $redirectListener = $null
             $redirectJob      = $null
         }
