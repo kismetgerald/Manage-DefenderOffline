@@ -697,7 +697,22 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.11 (2026-05-27) — Current
+### v0.0.12 (2026-05-27) — Current
+
+Operator-quality diagnostic added to the dashboard for an issue surfaced during v0.0.11 live-fire: HTTP-to-HTTPS redirect-listener bind failures caused by stale URL-ACL reservations.
+
+**`Start-DefenderDashboard.ps1` — URL-ACL collision diagnostic:**
+- 🐛 When `HttpListener.Start()` fails with `Failed to listen on prefix ... because it conflicts with an existing registration on the machine`, the dashboard now enumerates every URL-ACL on the same port via `netsh http show urlacl` and surfaces each conflicting prefix and its holder.
+- 🐛 Matches by **port**, not by exact prefix string. HttpListener detects conflicts at the port level, so a stale `https://+:8080/` reservation blocks a new `http://+:8080/` bind even though the prefix strings differ. The diagnostic now catches this case.
+- 🐛 Prints one copy-paste-ready `netsh http delete urlacl url=<full-url>` per conflicting reservation, plus the alternative of changing `RedirectHttpPort` in `conf/config.conf`.
+- 🐛 When no URL-ACL reservation is found on the conflicting port, falls back to suggesting `Get-NetTCPConnection -LocalPort <port> -State Listen` to identify a process-level port collision instead.
+
+**Test infrastructure:**
+- ✨ New helper `lib/Test-UrlAclCollision.ps1` with `Get-NetshUrlAclReservations` (block-based parser), `Get-NetshUrlAclOwners` (backward-compat wrapper), and `Test-UrlAclCollision` (port-aware decision wrapper). netsh shell-out substitutable via `-NetshOutput` for unit tests.
+- ✨ +15 Pester cases in `tests/UrlAclCollision.Tests.ps1` covering single-prefix, multi-prefix (different wildcards/hostnames/paths on same port), SDDL-only blocks, port-substring guard, and output-shape stability.
+- ✨ Full suite now at **268 tests** (255 active + 13 skipped placeholders) — up from 253 in v0.0.11.
+
+### v0.0.11 (2026-05-27)
 
 Two operator-quality fixes surfaced during v0.0.10 live-fire. No new operator-facing parameters; behaviour change is limited to console visibility and an HTTPS startup pre-flight check.
 
