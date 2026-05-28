@@ -518,6 +518,49 @@ Describe 'Resolve-DashboardAllowedGroups' {
         $r.AllowSids.Count | Should -Be 1
         $r.DenySids.Count  | Should -Be 1
     }
+
+    Context 'Resolutions property (v0.0.13+ diagnostic surface)' {
+
+        It 'emits one Resolutions entry per input — resolved entries include Account + Sid' {
+            $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Administrators,!BUILTIN\Guests'
+            $r.Resolutions | Should -HaveCount 2
+
+            $admins = $r.Resolutions | Where-Object Input -eq 'BUILTIN\Administrators'
+            $admins.IsDeny  | Should -BeFalse
+            $admins.Status  | Should -Be 'ok'
+            $admins.Account | Should -Be 'BUILTIN\Administrators'
+            $admins.Sid     | Should -Be 'S-1-5-32-544'
+            $admins.Error   | Should -BeNullOrEmpty
+
+            $guests = $r.Resolutions | Where-Object Input -eq 'BUILTIN\Guests'
+            $guests.IsDeny  | Should -BeTrue
+            $guests.Status  | Should -Be 'ok'
+            $guests.Sid     | Should -Be 'S-1-5-32-546'
+        }
+
+        It 'records unresolvable entries with status=unresolved and an Error message' {
+            $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Administrators,NOSUCHDOMAIN\NoSuchGroup-NonExistent'
+            $r.Resolutions | Should -HaveCount 2
+
+            $bad = $r.Resolutions | Where-Object Input -eq 'NOSUCHDOMAIN\NoSuchGroup-NonExistent'
+            $bad.Status  | Should -Be 'unresolved'
+            $bad.Sid     | Should -BeNullOrEmpty
+            $bad.Account | Should -BeNullOrEmpty
+            $bad.Error   | Should -Not -BeNullOrEmpty
+        }
+
+        It 'returns an empty Resolutions array for an empty allow-list' {
+            $r = Resolve-DashboardAllowedGroups -AllowList ''
+            $r.Resolutions.Count | Should -Be 0
+        }
+
+        It 'Resolutions[].Account holds the canonical DOMAIN\Group form for downstream logging' {
+            # Operator-friendly: even when the input was a short or alternate
+            # form, .Account is the form Windows actually uses internally.
+            $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Administrators'
+            ($r.Resolutions | Select-Object -First 1).Account | Should -Be 'BUILTIN\Administrators'
+        }
+    }
 }
 
 Describe 'Test-IdentityInAllowedGroups' {
