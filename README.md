@@ -699,7 +699,31 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.13 (2026-05-28) — Current
+### v0.0.14 (2026-05-28) — Current
+
+Startup performance + diagnostic instrumentation. Two changes that together cut cold-start dashboard-availability time by 11+ seconds: phase-by-phase startup profiling exposes where the time goes, then async initial fleet refresh decouples listener readiness from the ~14-second WinRM probe.
+
+**`Start-DefenderDashboard.ps1` — structured startup phase profiling:**
+- ✨ New `Write-StartupPhase` helper emits structured `event=startup_phase phase=<name> duration_ms=<N> elapsed_ms=<N>` INFO lines after each of 11 startup phases (banner, auth_preflight, https_cert_resolve, target_computers, available_version, port_and_https_binding, primary_listener, redirect_listener, status_file, event_log, initial_fleet_refresh). Final `event=startup_complete total_ms=<N> phase_count=<N>` summary. Parseable by the same SIEM ingest that consumes `event=auth_resolve` and `event=request_error`.
+- ℹ️ Lab live-fire (cold AtStartup, before the async-refresh change): 20,371 ms total. `auth_preflight` is the most cold-sensitive phase (14× warm/cold ratio — likely DC contact during `Resolve-DashboardAllowedGroups`). `initial_fleet_refresh` dominated absolute time at ~14 seconds.
+
+**`Start-DefenderDashboard.ps1` — non-blocking initial fleet refresh:**
+- 🐛 Pre-v0.0.14, the dashboard performed a synchronous `Invoke-FleetRefresh` at startup before entering the main loop. Cold startup blocked for ~14 seconds on a healthy fleet; longer if offline hosts hit `TimeoutSeconds`. The installer's 45-second status-file wait could fire even when the dashboard came up cleanly.
+- ✨ Initial fleet collection now kicks off asynchronously via `Start-BackgroundRefresh`. Listener accepts requests immediately. First visitors during the ~14-second background work see an empty cache with the existing `IsRefreshing` banner and a "(collecting…)" timestamp; the main loop's `Receive-RefreshIfDone` swaps the cache in transparently when the thread job completes.
+- 📊 Effect: `initial_fleet_refresh` phase duration dropped from 14,167 ms to 10 ms (just the thread-job spawn). Total cold startup dropped from 20.4 seconds to ~9 seconds (-55%).
+
+**`Start-DefenderDashboard.ps1` — `/status` JSON + empty-cache UX:**
+- ✨ `/status` JSON gains an `isRefreshing` boolean field so consumers can distinguish "the cache is empty because we just started" from "the cache is empty because of a fleet issue."
+- ✨ `generated` is serialised as `null` instead of `0001-01-01T00:00:00.0000000` when `CachedAt` is still `DateTime.MinValue` — prevents SIEM alert rules from tripping on year-0001 timestamps with `totalComputers: 0` during the initial async refresh window.
+- ✨ `/defender` HTML renders "Last data: **(collecting…)**" instead of a year-0001 timestamp during the empty-cache window.
+
+**`Start-DefenderDashboard.ps1` — Int32 overflow regression fix:**
+- 🐛 `Build-DashboardHtml` had unguarded arithmetic on `$AsOf`: `$AsOf.AddSeconds($RefreshInterval) - (Get-Date)` returned ~-64 billion seconds when `$AsOf` was `DateTime.MinValue`, which overflowed the `[int]` cast and threw `System.Management.Automation.RuntimeException`. Previously unreachable (the synchronous initial refresh ensured `CachedAt` was always populated before the first render); reachable now that the cache can be empty during the initial async refresh. Guarded with a `MinValue` check that short-circuits `$secsUntil` to `0`.
+
+**Maintainer housekeeping:**
+- ℹ️ `.private/` added to `.gitignore` for local maintainer drafts (release notes, marketing collateral, etc.). Project repo itself is unaffected.
+
+### v0.0.13 (2026-05-28)
 
 Stability + diagnostics + cross-domain remote-access ergonomics. Four sub-PRs landed; the headline fix is a long-latent stability bug that made the dashboard look like it was crashing when in fact it was eating per-request exceptions and exiting cleanly.
 
