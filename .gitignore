@@ -21,6 +21,9 @@ CLAUDE.md
 # Planning documents (local to the maintainer; not part of the public project)
 docs/plans/
 
+# Private maintainer notes, drafts, and marketing collateral (never committed)
+.private/
+
 # IDE settings
 .vscode/
 

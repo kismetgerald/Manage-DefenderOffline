@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.13'
+$ScriptVersion = '0.0.14'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -890,6 +890,49 @@ function Write-DashLog {
 }
 
 # ===================================================================
+# Startup Profiling  (v0.0.14)
+#
+# Lightweight phase timer for the dashboard's cold start path. Each
+# call to Write-StartupPhase emits a structured key=value INFO line
+# with the duration of the phase that just finished and the total
+# elapsed time since Start-StartupTimer ran. The output is parseable
+# by the same SIEM ingest that consumes event=auth_resolve and
+# event=request_error, so phase profiles can be queried alongside
+# the existing audit stream.
+#
+# Phases instrumented (see main-flow block at the bottom of the
+# script): banner, auth_preflight, https_cert_resolve, target_computers,
+# available_version, port_and_https_binding, primary_listener,
+# redirect_listener, status_file, event_log, initial_fleet_refresh.
+# A final event=startup_complete line carries the grand total.
+# ===================================================================
+$script:StartupSw         = $null
+$script:LastPhaseMs       = 0
+$script:StartupPhaseCount = 0
+
+function Start-StartupTimer {
+    $script:StartupSw         = [System.Diagnostics.Stopwatch]::StartNew()
+    $script:LastPhaseMs       = 0
+    $script:StartupPhaseCount = 0
+}
+
+function Write-StartupPhase {
+    param([Parameter(Mandatory)][string]$Phase)
+    if (-not $script:StartupSw) { return }
+    $totalMs = [int]$script:StartupSw.Elapsed.TotalMilliseconds
+    $deltaMs = $totalMs - $script:LastPhaseMs
+    $script:LastPhaseMs = $totalMs
+    $script:StartupPhaseCount++
+    Write-DashLog ("event=startup_phase phase={0} duration_ms={1} elapsed_ms={2}" -f $Phase, $deltaMs, $totalMs) 'INFO'
+}
+
+function Write-StartupComplete {
+    if (-not $script:StartupSw) { return }
+    $totalMs = [int]$script:StartupSw.Elapsed.TotalMilliseconds
+    Write-DashLog ("event=startup_complete total_ms={0} phase_count={1}" -f $totalMs, $script:StartupPhaseCount) 'SUCCESS'
+}
+
+# ===================================================================
 # Target Resolution
 # ===================================================================
 function Resolve-TargetComputers {
@@ -1219,8 +1262,18 @@ function Build-DashboardHtml {
     $outdated     = @($Data | Where-Object VersionStatus -eq 'Outdated').Count
     $rtOff        = @($Data | Where-Object { $_.RealTimeProtection -eq 'False' -and $_.Online }).Count
 
-    $nextRefresh  = $AsOf.AddSeconds($RefreshInterval)
-    $secsUntil    = [math]::Max(0, [int]($nextRefresh - (Get-Date)).TotalSeconds)
+    # When the async initial collection has not completed yet, $AsOf is
+    # DateTime.MinValue (year 0001). Subtracting that from "now" yields
+    # ~-64 billion seconds, which overflows Int32 on the cast below and
+    # throws a RuntimeException before any HTML is built. Treat the
+    # empty-cache window as "next refresh due immediately" so the meta
+    # refresh fires in 5s and re-fetches once the background work is in.
+    if ($AsOf -eq [datetime]::MinValue) {
+        $secsUntil = 0
+    } else {
+        $nextRefresh = $AsOf.AddSeconds($RefreshInterval)
+        $secsUntil   = [math]::Max(0, [int]($nextRefresh - (Get-Date)).TotalSeconds)
+    }
     # Meta-refresh fires this many seconds after page load.  Align it
     # with $secsUntil + 5 so the browser reloads ~5s after the countdown
     # reaches 0 — instead of the previous hardcoded $RefreshInterval
@@ -1541,7 +1594,7 @@ function Build-DashboardHtml {
     <div class="meta">
       <div class="meta-text">
         Available: <strong>$(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' })</strong><br>
-        Last data: <strong>$($AsOf.ToString('yyyy-MM-dd HH:mm:ss'))</strong> &nbsp;|&nbsp;
+        Last data: <strong>$(if ($AsOf -eq [datetime]::MinValue) { '(collecting…)' } else { $AsOf.ToString('yyyy-MM-dd HH:mm:ss') })</strong> &nbsp;|&nbsp;
         Next refresh in: <strong id="countdown">$secsUntil</strong>s &nbsp;|&nbsp;
         <a href="/refresh">Force Refresh</a> &nbsp;|&nbsp;
         <a href="/status" target="_blank">JSON</a>
@@ -1829,9 +1882,20 @@ function Build-DashboardHtml {
 # JSON Serialiser  (for /status endpoint)
 # ===================================================================
 function ConvertTo-DashboardJson {
-    param([object[]]$Data, [datetime]$AsOf, [string]$AvailableVersionStr)
+    param(
+        [object[]]$Data,
+        [datetime]$AsOf,
+        [string]$AvailableVersionStr,
+        [bool]$IsRefreshing = $false
+    )
+    # When the async initial-collection has not completed yet, AsOf is
+    # DateTime.MinValue. Serialise that as null so consumers checking
+    # time-since don't see year-0001. The isRefreshing flag tells them
+    # to retry instead of alerting on the empty totalComputers count.
+    $generated = if ($AsOf -eq [datetime]::MinValue) { $null } else { $AsOf.ToString('o') }
     $payload = [ordered]@{
-        generated        = $AsOf.ToString('o')
+        generated        = $generated
+        isRefreshing     = $IsRefreshing
         availableVersion = $AvailableVersionStr
         totalComputers   = $Data.Count
         onlineCount      = @($Data | Where-Object Online).Count
@@ -1928,6 +1992,7 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 # ===================================================================
 # Startup
 # ===================================================================
+Start-StartupTimer
 Write-DashLog "=== Defender Dashboard v$ScriptVersion starting ===" 'SUCCESS'
 Write-DashLog "Port            : $Port"
 Write-DashLog "Refresh interval: ${RefreshInterval}s"
@@ -1937,6 +2002,7 @@ Write-DashLog "HTTPS           : $(if ($UseHttps) { "enabled (cert $CertificateT
 Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+Write-StartupPhase 'banner'
 
 # ===================================================================
 # Authentication validation (early — fail fast for misconfigurations).
@@ -2044,6 +2110,7 @@ switch ($AuthMethod) {
         Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
     }
 }
+Write-StartupPhase 'auth_preflight'
 
 # ===================================================================
 # HTTPS validation (after auth so auth errors surface first).
@@ -2075,6 +2142,7 @@ if ($UseHttps) {
         }
     }
 }
+Write-StartupPhase 'https_cert_resolve'
 
 $TargetComputers = @(Resolve-TargetComputers)
 if ($ExcludeList.Count -gt 0) {
@@ -2089,6 +2157,7 @@ if ($TargetComputers.Count -eq 0) {
     exit 1
 }
 Write-DashLog "Target computers: $($TargetComputers.Count)" 'SUCCESS'
+Write-StartupPhase 'target_computers'
 
 $AvailableVersion    = Get-LatestAvailableVersion -Root $SourceSharePath
 $AvailableVersionStr = if ($AvailableVersion) { $AvailableVersion.ToString() } else { '' }
@@ -2097,6 +2166,7 @@ if ($AvailableVersionStr) {
 } else {
     Write-DashLog 'No SourceSharePath provided; version currency check disabled.' 'WARN'
 }
+Write-StartupPhase 'available_version'
 
 # Resolve port. HTTPS does NOT use fallback because netsh sslcert binds the
 # cert to a specific ipport — if the dashboard fell back to a different port,
@@ -2132,6 +2202,7 @@ if ($UseHttps) {
     }
     $Port = $portResult.Port
 }
+Write-StartupPhase 'port_and_https_binding'
 
 # Start primary listener (HTTP or HTTPS depending on -UseHttps)
 $scheme   = if ($UseHttps) { 'https' } else { 'http' }
@@ -2182,6 +2253,7 @@ try {
 }
 Write-DashLog "$($scheme.ToUpper()) listener started on ${scheme}://+:$Port/" 'SUCCESS'
 Write-DashLog "Browse to: ${scheme}://localhost:$Port/defender" 'INFO'
+Write-StartupPhase 'primary_listener'
 
 # Optional HTTP-to-HTTPS redirect listener. Spun up in a thread job so it
 # runs alongside the main listener; cleaned up in the main finally block.
@@ -2247,6 +2319,7 @@ if ($UseHttps -and $RedirectHttpToHttps) {
         }
     }
 }
+Write-StartupPhase 'redirect_listener'
 
 # Write runtime status file so the installer and administrators can
 # discover the actual bound port without reading through the log.
@@ -2268,6 +2341,7 @@ try {
 } catch {
     Write-DashLog "Could not write status file ($statusFile): $($_.Exception.Message)" 'WARN'
 }
+Write-StartupPhase 'status_file'
 
 # Write to Windows Event Log if the source has been registered by the installer.
 # EventId 100 = normal start on primary port
@@ -2292,6 +2366,7 @@ try {
 } catch {
     Write-DashLog "Could not write to Windows Event Log: $($_.Exception.Message)" 'WARN'
 }
+Write-StartupPhase 'event_log'
 
 # ===================================================================
 # State
@@ -2302,21 +2377,23 @@ $script:IsRefreshing   = $false
 $script:RefreshJob     = $null
 $FunctionDef           = ${function:Get-DefenderStatus}.ToString()
 
-# Do an initial synchronous refresh so the first visitor sees real data
-Write-DashLog 'Performing initial data collection…' 'INFO'
-$initResults = Invoke-FleetRefresh `
-    -Computers           $TargetComputers `
-    -AvailableVersionStr $AvailableVersionStr `
-    -Threads             $ParallelThreads `
-    -TSeconds            $TimeoutSeconds `
-    -FunctionDef         $FunctionDef `
-    -WinRmCredential     $Credential `
-    -DisableIPv6         $DisableIPv6 `
-    -LibPaths            @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
-
-$script:CachedResults = $initResults
-$script:CachedAt      = Get-Date
-Write-DashLog "Initial collection complete: $($script:CachedResults.Count) computers" 'SUCCESS'
+# Kick off the initial fleet collection asynchronously so the listener
+# accepts requests immediately. First visitors before the refresh
+# completes see an empty cache; Build-DashboardHtml renders the
+# IsRefreshing banner ("Refreshing…") on /defender, and /status JSON
+# returns the empty results with the same flag. The main loop's
+# Receive-RefreshIfDone picks up the result and swaps the cache in
+# without operator action.
+#
+# Pre-v0.0.14 this was a synchronous Invoke-FleetRefresh that blocked
+# startup for ~14s on a healthy fleet; longer when offline hosts pushed
+# WinRM probes to TimeoutSeconds. The async kickoff drops cold startup
+# to ~6-7s end-to-end so the installer's status-file wait succeeds
+# comfortably and operators don't stare at a hung browser tab.
+Write-DashLog 'Kicking off initial fleet collection asynchronously…' 'INFO'
+Start-BackgroundRefresh
+Write-StartupPhase 'initial_fleet_refresh'
+Write-StartupComplete
 
 # ===================================================================
 # Main Loop
@@ -2441,7 +2518,8 @@ try {
                 $json = ConvertTo-DashboardJson `
                     -Data               $script:CachedResults `
                     -AsOf               $script:CachedAt `
-                    -AvailableVersionStr $AvailableVersionStr
+                    -AvailableVersionStr $AvailableVersionStr `
+                    -IsRefreshing       $script:IsRefreshing
                 Send-HttpResponse -Context $context -Body $json -ContentType 'application/json; charset=utf-8'
             }
 
