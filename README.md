@@ -1,10 +1,10 @@
 # Manage-DefenderOffline
 
-> Deploy, verify, and monitor Microsoft Defender antivirus definitions across air-gapped and offline Windows environments
+> PowerShell toolkit for managing Microsoft Defender across air-gapped Windows fleets — without Intune, MECM, or cloud connectivity.
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.9-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.14-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 > 👉 **New here?** Read [QUICKSTART.md](QUICKSTART.md) — dashboard running and reachable from a remote workstation in under 10 minutes.
 
@@ -21,7 +21,7 @@
 - 📝 **Audit-grade access logging** — every authentication decision logged with user identity + source IP + reason (NIST 800-53 AU-2 / STIG AC-7)
 - 🔄 **Auto-discovery** of computers from Active Directory
 - 🔧 **Email notifications** with HTML reports and CSV attachments
-- 🛡️ **Safe & tested** — 216-test Pester suite + GitHub Actions CI + dry-run mode + automatic retry logic
+- 🛡️ **Safe & tested** — 272-test Pester suite + GitHub Actions CI + dry-run mode + automatic retry logic
 - ⚙️ **Enterprise-ready** for scheduled tasks, service accounts, and gMSA
 - 📈 **Version analytics** with fleet-wide statistics and CSV exports
 - ⬇️ **Definition download helper** — `Get-DefenderDefinitions.ps1` pulls mpam-fe.exe (x64 / x86 / arm64) from Microsoft on a staging host, with SHA-256 sidecars, Authenticode verification, and a transfer manifest
