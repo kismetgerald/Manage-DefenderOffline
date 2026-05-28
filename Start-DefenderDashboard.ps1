@@ -1262,8 +1262,18 @@ function Build-DashboardHtml {
     $outdated     = @($Data | Where-Object VersionStatus -eq 'Outdated').Count
     $rtOff        = @($Data | Where-Object { $_.RealTimeProtection -eq 'False' -and $_.Online }).Count
 
-    $nextRefresh  = $AsOf.AddSeconds($RefreshInterval)
-    $secsUntil    = [math]::Max(0, [int]($nextRefresh - (Get-Date)).TotalSeconds)
+    # When the async initial collection has not completed yet, $AsOf is
+    # DateTime.MinValue (year 0001). Subtracting that from "now" yields
+    # ~-64 billion seconds, which overflows Int32 on the cast below and
+    # throws a RuntimeException before any HTML is built. Treat the
+    # empty-cache window as "next refresh due immediately" so the meta
+    # refresh fires in 5s and re-fetches once the background work is in.
+    if ($AsOf -eq [datetime]::MinValue) {
+        $secsUntil = 0
+    } else {
+        $nextRefresh = $AsOf.AddSeconds($RefreshInterval)
+        $secsUntil   = [math]::Max(0, [int]($nextRefresh - (Get-Date)).TotalSeconds)
+    }
     # Meta-refresh fires this many seconds after page load.  Align it
     # with $secsUntil + 5 so the browser reloads ~5s after the countdown
     # reaches 0 — instead of the previous hardcoded $RefreshInterval
@@ -1584,7 +1594,7 @@ function Build-DashboardHtml {
     <div class="meta">
       <div class="meta-text">
         Available: <strong>$(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' })</strong><br>
-        Last data: <strong>$($AsOf.ToString('yyyy-MM-dd HH:mm:ss'))</strong> &nbsp;|&nbsp;
+        Last data: <strong>$(if ($AsOf -eq [datetime]::MinValue) { '(collecting…)' } else { $AsOf.ToString('yyyy-MM-dd HH:mm:ss') })</strong> &nbsp;|&nbsp;
         Next refresh in: <strong id="countdown">$secsUntil</strong>s &nbsp;|&nbsp;
         <a href="/refresh">Force Refresh</a> &nbsp;|&nbsp;
         <a href="/status" target="_blank">JSON</a>
@@ -1872,9 +1882,20 @@ function Build-DashboardHtml {
 # JSON Serialiser  (for /status endpoint)
 # ===================================================================
 function ConvertTo-DashboardJson {
-    param([object[]]$Data, [datetime]$AsOf, [string]$AvailableVersionStr)
+    param(
+        [object[]]$Data,
+        [datetime]$AsOf,
+        [string]$AvailableVersionStr,
+        [bool]$IsRefreshing = $false
+    )
+    # When the async initial-collection has not completed yet, AsOf is
+    # DateTime.MinValue. Serialise that as null so consumers checking
+    # time-since don't see year-0001. The isRefreshing flag tells them
+    # to retry instead of alerting on the empty totalComputers count.
+    $generated = if ($AsOf -eq [datetime]::MinValue) { $null } else { $AsOf.ToString('o') }
     $payload = [ordered]@{
-        generated        = $AsOf.ToString('o')
+        generated        = $generated
+        isRefreshing     = $IsRefreshing
         availableVersion = $AvailableVersionStr
         totalComputers   = $Data.Count
         onlineCount      = @($Data | Where-Object Online).Count
@@ -2356,21 +2377,21 @@ $script:IsRefreshing   = $false
 $script:RefreshJob     = $null
 $FunctionDef           = ${function:Get-DefenderStatus}.ToString()
 
-# Do an initial synchronous refresh so the first visitor sees real data
-Write-DashLog 'Performing initial data collection…' 'INFO'
-$initResults = Invoke-FleetRefresh `
-    -Computers           $TargetComputers `
-    -AvailableVersionStr $AvailableVersionStr `
-    -Threads             $ParallelThreads `
-    -TSeconds            $TimeoutSeconds `
-    -FunctionDef         $FunctionDef `
-    -WinRmCredential     $Credential `
-    -DisableIPv6         $DisableIPv6 `
-    -LibPaths            @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
-
-$script:CachedResults = $initResults
-$script:CachedAt      = Get-Date
-Write-DashLog "Initial collection complete: $($script:CachedResults.Count) computers" 'SUCCESS'
+# Kick off the initial fleet collection asynchronously so the listener
+# accepts requests immediately. First visitors before the refresh
+# completes see an empty cache; Build-DashboardHtml renders the
+# IsRefreshing banner ("Refreshing…") on /defender, and /status JSON
+# returns the empty results with the same flag. The main loop's
+# Receive-RefreshIfDone picks up the result and swaps the cache in
+# without operator action.
+#
+# Pre-v0.0.14 this was a synchronous Invoke-FleetRefresh that blocked
+# startup for ~14s on a healthy fleet; longer when offline hosts pushed
+# WinRM probes to TimeoutSeconds. The async kickoff drops cold startup
+# to ~6-7s end-to-end so the installer's status-file wait succeeds
+# comfortably and operators don't stare at a hung browser tab.
+Write-DashLog 'Kicking off initial fleet collection asynchronously…' 'INFO'
+Start-BackgroundRefresh
 Write-StartupPhase 'initial_fleet_refresh'
 Write-StartupComplete
 
@@ -2497,7 +2518,8 @@ try {
                 $json = ConvertTo-DashboardJson `
                     -Data               $script:CachedResults `
                     -AsOf               $script:CachedAt `
-                    -AvailableVersionStr $AvailableVersionStr
+                    -AvailableVersionStr $AvailableVersionStr `
+                    -IsRefreshing       $script:IsRefreshing
                 Send-HttpResponse -Context $context -Body $json -ContentType 'application/json; charset=utf-8'
             }
 
