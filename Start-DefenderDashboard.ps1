@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.12'
+$ScriptVersion = '0.0.13'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -550,9 +550,10 @@ function Resolve-DashboardAllowedGroups {
     [OutputType([pscustomobject])]
     param([AllowEmptyString()] [string]$AllowList)
 
-    $allow      = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
-    $deny       = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
-    $unresolved = New-Object 'System.Collections.Generic.List[string]'
+    $allow       = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
+    $deny        = New-Object 'System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]'
+    $unresolved  = New-Object 'System.Collections.Generic.List[string]'
+    $resolutions = New-Object 'System.Collections.Generic.List[pscustomobject]'
 
     if ($AllowList) {
         foreach ($entry in ($AllowList -split ',')) {
@@ -561,19 +562,43 @@ function Resolve-DashboardAllowedGroups {
             $isDeny = $e.StartsWith('!')
             $name = if ($isDeny) { $e.Substring(1).Trim() } else { $e }
             if (-not $name) { continue }
+
+            $sidObj     = $null
+            $accountStr = $null
+            $errorMsg   = $null
             try {
-                $sid = ([System.Security.Principal.NTAccount]::new($name)).Translate(
+                $sidObj = ([System.Security.Principal.NTAccount]::new($name)).Translate(
                     [System.Security.Principal.SecurityIdentifier])
-                if ($isDeny) { [void]$deny.Add($sid) } else { [void]$allow.Add($sid) }
+                # Reverse-translate so we can log the canonical DOMAIN\Group form.
+                # This is what makes 'Helpdesk' vs 'WGSDAC\Helpdesk' debuggable —
+                # operators can see whether their unqualified entry resolved to
+                # the domain they expected.
+                try {
+                    $accountStr = $sidObj.Translate([System.Security.Principal.NTAccount]).Value
+                } catch {
+                    $accountStr = $name
+                }
+                if ($isDeny) { [void]$deny.Add($sidObj) } else { [void]$allow.Add($sidObj) }
             } catch {
                 [void]$unresolved.Add($e)
+                $errorMsg = $_.Exception.Message
             }
+
+            [void]$resolutions.Add([pscustomobject]@{
+                Input   = $name
+                IsDeny  = $isDeny
+                Status  = if ($sidObj) { 'ok' } else { 'unresolved' }
+                Account = $accountStr
+                Sid     = if ($sidObj) { $sidObj.Value } else { $null }
+                Error   = $errorMsg
+            })
         }
     }
     return [pscustomobject]@{
-        AllowSids  = $allow.ToArray()
-        DenySids   = $deny.ToArray()
-        Unresolved = $unresolved.ToArray()
+        AllowSids   = $allow.ToArray()
+        DenySids    = $deny.ToArray()
+        Unresolved  = $unresolved.ToArray()
+        Resolutions = $resolutions.ToArray()
     }
 }
 
@@ -1992,14 +2017,27 @@ switch ($AuthMethod) {
         # Resolve allow-list to SIDs once at startup. Per-request membership
         # checks then avoid any AD round-trip.
         $script:AdGroupResolution = Resolve-DashboardAllowedGroups -AllowList $AuthAllowedGroups
-        foreach ($u in $script:AdGroupResolution.Unresolved) {
-            Write-DashLog "AuthAllowedGroups: entry '$u' could not be resolved to an SID and will be ignored." 'WARN'
+
+        # Per-entry structured log (key=value) so operators can see exactly
+        # which input resolved to which DOMAIN\Group + SID — and which entries
+        # failed. v0.0.12 only logged a count, which made AuthAllowedGroups
+        # format mistakes (unqualified 'Helpdesk' vs 'WGSDAC\Helpdesk') hard
+        # to diagnose remotely.
+        foreach ($r in $script:AdGroupResolution.Resolutions) {
+            $type = if ($r.IsDeny) { 'deny' } else { 'allow' }
+            if ($r.Status -eq 'ok') {
+                Write-DashLog ("event=auth_resolve input='{0}' type={1} status=ok account='{2}' sid={3}" -f $r.Input, $type, $r.Account, $r.Sid) 'INFO'
+            } else {
+                $errClean = ($r.Error -replace "'", "''" -replace "[\r\n]+", ' ').Trim()
+                Write-DashLog ("event=auth_resolve input='{0}' type={1} status=unresolved error='{2}'" -f $r.Input, $type, $errClean) 'WARN'
+            }
         }
+
         if ($script:AdGroupResolution.AllowSids.Count -eq 0 -and
             $script:AdGroupResolution.DenySids.Count  -eq 0) {
-            Write-DashLog "ADIntegrated auth: no allow/deny groups configured. Any authenticated user will be permitted." 'INFO'
+            Write-DashLog ("event=auth_summary allow_count=0 deny_count=0 unresolved={0} effect=any-authenticated-user-permitted" -f $script:AdGroupResolution.Unresolved.Count) 'INFO'
         } else {
-            Write-DashLog "ADIntegrated auth: $($script:AdGroupResolution.AllowSids.Count) allow group(s), $($script:AdGroupResolution.DenySids.Count) deny group(s) loaded." 'INFO'
+            Write-DashLog ("event=auth_summary allow_count={0} deny_count={1} unresolved={2}" -f $script:AdGroupResolution.AllowSids.Count, $script:AdGroupResolution.DenySids.Count, $script:AdGroupResolution.Unresolved.Count) 'INFO'
         }
     }
     'None' {
@@ -2315,9 +2353,19 @@ try {
         # listener may have been stopped between WaitOne returning and now
         if (-not $listener.IsListening) { break }
 
-        $context    = $listener.EndGetContext($pendingCtx)
-        $pendingCtx = $null
-        $path       = $context.Request.Url.AbsolutePath.TrimEnd('/')
+        # Per-request try/catch: every action between EndGetContext and the
+        # end of the switch can throw (NTLM token validation issues,
+        # malformed requests, abandoned connections, HTML/JSON build errors,
+        # stream-write failures on clients that disconnect mid-response).
+        # Before v0.0.13 these bubbled to the outer finally and shut the
+        # dashboard down with exit code 0 — symptoms looked like clean
+        # graceful exits with no log trail. Now we log the exception with
+        # structured fields, send a best-effort 500 response, and continue.
+        $context = $null
+        try {
+            $context    = $listener.EndGetContext($pendingCtx)
+            $pendingCtx = $null
+            $path       = $context.Request.Url.AbsolutePath.TrimEnd('/')
 
         # ----- Authorization check (before any work) -----
         $authResult = Test-DashboardAuth `
@@ -2347,7 +2395,26 @@ try {
             try { $context.Response.OutputStream.Close() } catch {}
             try { $context.Response.Close() } catch {}
             # WARN so audit reviewers / SIEM filters can isolate denials at level.
-            Write-DashLog "Denied $path by '$auditUser' from $auditFrom ($($authResult.Reason); HTTP $($authResult.StatusCode))" 'WARN'
+            Write-DashLog ("event=auth_denied path={0} user='{1}' src={2} reason={3} status={4} method={5}" -f $path, $auditUser, $auditFrom, $authResult.Reason, $authResult.StatusCode, $AuthMethod) 'WARN'
+
+            # For ADIntegrated denials, emit a separate INFO line with the user's
+            # SIDs vs the configured allow/deny SIDs so the operator can see
+            # exactly why authorization failed. Only fires when we have a real
+            # Windows identity to inspect (avoids noise on /health bypasses and
+            # pre-auth 401s).
+            if ($AuthMethod -eq 'ADIntegrated' -and
+                $authResult.Reason -in 'not-in-allow-list','group-denied' -and
+                $context.User -and $context.User.Identity -and $context.User.Identity.IsAuthenticated) {
+                $userSidStr = if ($context.User.Identity.User) { $context.User.Identity.User.Value } else { 'none' }
+                $userGroupSids = @()
+                if ($context.User.Identity.Groups) {
+                    $userGroupSids = @($context.User.Identity.Groups | ForEach-Object { $_.Value })
+                }
+                $allowSids = @($script:AdGroupResolution.AllowSids | ForEach-Object { $_.Value })
+                $denySids  = @($script:AdGroupResolution.DenySids  | ForEach-Object { $_.Value })
+                Write-DashLog ("event=auth_denied_detail user='{0}' user_sid={1} user_group_sids=[{2}] allow_sids=[{3}] deny_sids=[{4}]" -f `
+                    $auditUser, $userSidStr, ($userGroupSids -join ','), ($allowSids -join ','), ($denySids -join ',')) 'INFO'
+            }
             continue
         }
 
@@ -2356,7 +2423,7 @@ try {
         # /status are excluded because they're polled by monitors and dashboard
         # auto-refresh, which would flood the log without adding audit value.
         if ($path -notin '/health', '/status' -and $authResult.Reason -ne 'health-bypass') {
-            Write-DashLog "Authorized $path by '$auditUser' from $auditFrom ($($authResult.Reason))" 'INFO'
+            Write-DashLog ("event=auth_allowed path={0} user='{1}' src={2} reason={3} method={4}" -f $path, $auditUser, $auditFrom, $authResult.Reason, $AuthMethod) 'INFO'
         }
 
         switch ($path) {
@@ -2397,6 +2464,45 @@ try {
             default {
                 Send-HttpResponse -Context $context -Body '<html><body>404 Not Found</body></html>' -StatusCode 404
                 Write-DashLog "404: $path" 'WARN'
+            }
+        }
+        } catch {
+            # Reset $pendingCtx so the next iteration starts a fresh
+            # BeginGetContext — the failed EndGetContext consumed the
+            # prior IAsyncResult (or the failure happened past it).
+            $pendingCtx = $null
+
+            $exType = $_.Exception.GetType().FullName
+            $exMsg  = ($_.Exception.Message -replace "'", "''" -replace "[\r\n]+", ' ').Trim()
+            $errPath = '(unknown)'
+            $errSrc  = 'unknown'
+            try {
+                if ($context -and $context.Request) {
+                    if ($context.Request.Url) {
+                        $errPath = $context.Request.Url.AbsolutePath
+                    }
+                    if ($context.Request.RemoteEndPoint) {
+                        $errSrc = $context.Request.RemoteEndPoint.Address.ToString()
+                    }
+                }
+            } catch {}
+            Write-DashLog ("event=request_error path={0} src={1} exception={2} message='{3}'" -f $errPath, $errSrc, $exType, $exMsg) 'ERROR'
+
+            # Best-effort 500 response. If the connection is already gone
+            # (e.g. client timed out and abandoned), these throw and we
+            # silently ignore — the whole point of this catch is keeping
+            # the listener alive, not adding a SECOND exception that
+            # crashes us.
+            if ($context) {
+                try {
+                    $context.Response.StatusCode = 500
+                    $context.Response.Headers['Content-Type'] = 'text/plain; charset=utf-8'
+                    $errBody = [System.Text.Encoding]::UTF8.GetBytes(
+                        '500 Internal Server Error. See dashboard log for details (search for event=request_error).')
+                    $context.Response.OutputStream.Write($errBody, 0, $errBody.Length)
+                } catch {}
+                try { $context.Response.OutputStream.Close() } catch {}
+                try { $context.Response.Close() } catch {}
             }
         }
     }

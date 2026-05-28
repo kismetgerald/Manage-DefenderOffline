@@ -148,45 +148,96 @@ or `[WARN] URL-ACL collision`, the log includes the exact `netsh` command to fix
 
 ---
 
-## Step 5 — Access from a remote workstation (30 sec)
+## Step 5 — Access from a remote workstation (1 min)
+
+### Use the FQDN, not the IP
 
 From any workstation on the same network, browse to:
 
 ```
-https://<dashboard-hostname>:8444/defender
+https://<dashboard-fqdn>:8444/defender
 ```
 
-**The browser will warn about an untrusted certificate** because the installer
-generates a self-signed cert by default. Click **Advanced → Proceed** for testing.
+**Use the FQDN form** (`dashboard.contoso.com`), not the IP (`10.0.0.50`). The auto-generated self-signed cert includes Subject Alternative Names for:
+- Short hostname (`DASHBOARD`)
+- FQDN (`DASHBOARD.contoso.com`)
+- `localhost`
+- The host's primary IPv4 (v0.0.13+)
 
-For production, replace with a PKI-issued cert:
+Hitting by IP works *only* because v0.0.13+ auto-includes the primary IPv4 — but the FQDN form is what enables Kerberos auth (SPNs are hostname-based, not IP-based). On Edge and Chrome that's significant: Kerberos via FQDN works invisibly; NTLM-over-IP triggers a credential prompt.
+
+If you need to access via an alias, CNAME, or load balancer VIP that isn't in the auto-included list, pass `-AdditionalSans` when running the installer:
 
 ```powershell
-# On the dashboard host, after importing your PKI cert into Cert:\LocalMachine\My:
-.\Install-DefenderDashboard.ps1 `
-    -ServiceAccount         'CONTOSO\svc-defender' `
-    -Credential             $cred `
-    -UseHttps `
-    -CertificateThumbprint  '<new-thumbprint>' `
-    -Port                   8444 `
-    -Force
+.\Install-DefenderDashboard.ps1 ... -AdditionalSans 'dashboard.contoso.com,my-alias,10.0.0.50' -RenewCertificate -Force
 ```
 
-If the page doesn't load from a remote workstation at all:
+(`-RenewCertificate` is required when adding SANs to an existing install — otherwise the installer reuses the previously-generated cert and ignores the new SAN list.)
+
+### Cert warnings on first access
+
+**The browser will warn about an untrusted certificate** because self-signed certs aren't in any client's trusted root by default. Three options:
+
+1. **Click through** (Advanced → Proceed) — fine for lab and pilot use.
+2. **Install the cert on the client** (production-quality for self-signed deployments):
+   ```powershell
+   # On the dashboard host — export the public cert
+   $cert = Get-Item 'Cert:\LocalMachine\My\<thumbprint>'
+   Export-Certificate -Cert $cert -FilePath 'C:\Temp\dashboard-public.cer' -Type CERT
+
+   # Copy the .cer file to each client workstation, then on each client (as Admin):
+   Import-Certificate -FilePath '<path>\dashboard-public.cer' `
+       -CertStoreLocation 'Cert:\LocalMachine\Root'
+   ```
+3. **Replace with a PKI-issued cert** (cleanest for production):
+   ```powershell
+   # On the dashboard host, after importing your PKI cert into Cert:\LocalMachine\My
+   .\Install-DefenderDashboard.ps1 `
+       -ServiceAccount         'CONTOSO\svc-defender' `
+       -Credential             $cred `
+       -UseHttps `
+       -CertificateThumbprint  '<new-thumbprint>' `
+       -Port                   8444 `
+       -Force
+   ```
+
+### Browser auth quirks — Firefox specifically
+
+Edge and Chrome auto-Negotiate against any URL matching their intranet-zone heuristics (RFC 1918, `.local`, domain-joined hostnames). **Firefox does not.**
+
+If you get an immediate 401 with **no credential prompt** from Firefox, the browser declined to send a Kerberos/NTLM token. Configure it:
+
+1. In Firefox, open `about:config` → *Accept the Risk*.
+2. Search `network.negotiate-auth.trusted-uris` → set to your dashboard's domain (leading dot covers all hosts):
+   ```
+   .contoso.com
+   ```
+3. Search `network.automatic-ntlm-auth.trusted-uris` → set the same value.
+4. Reload the dashboard.
+
+For non-domain-joined workstations, Firefox/Edge/Chrome will all prompt for credentials (`DOMAIN\user` + password) instead of auto-Negotiating — that's normal and works fine.
+
+### Cross-domain access from a non-domain-joined client
+
+This works too — NTLM over HTTPS from a non-domain-joined workstation can authenticate against a domain-joined dashboard host. Expect:
+- A "Not secure" cert warning (unless you imported the cert per option 2 above)
+- A Windows Security credential prompt for `DOMAIN\user` + password
+- Successful access after both are dismissed/entered
+
+If the request appears to *hang*, the dashboard log is the source of truth. Check `C:\Logs\DefenderDashboard\DefenderDashboard_<date>.log` on the dashboard host: a healthy dashboard logs either `event=auth_allowed` (the request succeeded) or `event=auth_denied` / `event=request_error` (the request was rejected with explainable reason). A *silent* request — no log entry for your access attempt — usually means HTTP.sys rejected at the protocol layer; the cert-trust workaround above usually fixes it.
+
+### Connectivity sanity check
+
+If the page doesn't load at all from the remote workstation:
 
 ```powershell
-# Run this from the workstation
-Test-NetConnection -ComputerName <dashboard-host> -Port 8444
+Test-NetConnection -ComputerName <dashboard-fqdn> -Port 8444
 # Expected: TcpTestSucceeded : True
 ```
 
-If `False`, the dashboard host's firewall is blocking TCP 8444 on the network
-profile the remote workstation is connecting from. The installer enables
-**Domain + Private** profiles; if your network is on the **Public** profile,
-add it manually:
+If `False`, the dashboard host's firewall is blocking TCP 8444 on the network profile the remote workstation is connecting from. The installer enables **Domain + Private** profiles; if your network is on the **Public** profile, add it manually on the dashboard host:
 
 ```powershell
-# On the dashboard host
 Set-NetFirewallRule -DisplayName 'DefenderDashboard-HTTPS-8444' -Profile Domain,Private,Public
 ```
 
@@ -216,6 +267,8 @@ Set-NetFirewallRule -DisplayName 'DefenderDashboard-HTTPS-8444' -Profile Domain,
 | `-Port` | TCP port for HTTPS listener (default 8080) | Always specify; 8443 is often taken, 8444 is a safe pick |
 | `-UseHttps` | Enable TLS | Recommended for any non-local use |
 | `-CertificateThumbprint` | Reuse an existing cert from `Cert:\LocalMachine\My` | When you have a PKI-issued cert, or upgrading and want to keep the same cert |
+| `-AdditionalSans` | Comma-separated extra Subject Alternative Names baked into a generated self-signed cert (DNS names + IPs) | When operators access via a CNAME, load-balancer VIP, alias, or extra IP. Pair with `-RenewCertificate` when adding to an existing install. |
+| `-RenewCertificate` | Regenerate the cert (and rebind via `netsh sslcert`) even if a thumbprint is already set | When the existing cert's SAN coverage is wrong, or you just added `-AdditionalSans` to an existing install |
 | `-AddFirewallRule` | Open inbound TCP `Port` on Domain + Private profiles | Almost always |
 | `-StartImmediately` | Start the task right after registration + probe `/health` | Recommended — proves the install works |
 | `-Force` | Overwrite an existing task with the same name | When re-installing or upgrading |
