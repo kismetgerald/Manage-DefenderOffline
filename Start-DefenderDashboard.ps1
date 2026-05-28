@@ -2353,9 +2353,19 @@ try {
         # listener may have been stopped between WaitOne returning and now
         if (-not $listener.IsListening) { break }
 
-        $context    = $listener.EndGetContext($pendingCtx)
-        $pendingCtx = $null
-        $path       = $context.Request.Url.AbsolutePath.TrimEnd('/')
+        # Per-request try/catch: every action between EndGetContext and the
+        # end of the switch can throw (NTLM token validation issues,
+        # malformed requests, abandoned connections, HTML/JSON build errors,
+        # stream-write failures on clients that disconnect mid-response).
+        # Before v0.0.13 these bubbled to the outer finally and shut the
+        # dashboard down with exit code 0 — symptoms looked like clean
+        # graceful exits with no log trail. Now we log the exception with
+        # structured fields, send a best-effort 500 response, and continue.
+        $context = $null
+        try {
+            $context    = $listener.EndGetContext($pendingCtx)
+            $pendingCtx = $null
+            $path       = $context.Request.Url.AbsolutePath.TrimEnd('/')
 
         # ----- Authorization check (before any work) -----
         $authResult = Test-DashboardAuth `
@@ -2454,6 +2464,45 @@ try {
             default {
                 Send-HttpResponse -Context $context -Body '<html><body>404 Not Found</body></html>' -StatusCode 404
                 Write-DashLog "404: $path" 'WARN'
+            }
+        }
+        } catch {
+            # Reset $pendingCtx so the next iteration starts a fresh
+            # BeginGetContext — the failed EndGetContext consumed the
+            # prior IAsyncResult (or the failure happened past it).
+            $pendingCtx = $null
+
+            $exType = $_.Exception.GetType().FullName
+            $exMsg  = ($_.Exception.Message -replace "'", "''" -replace "[\r\n]+", ' ').Trim()
+            $errPath = '(unknown)'
+            $errSrc  = 'unknown'
+            try {
+                if ($context -and $context.Request) {
+                    if ($context.Request.Url) {
+                        $errPath = $context.Request.Url.AbsolutePath
+                    }
+                    if ($context.Request.RemoteEndPoint) {
+                        $errSrc = $context.Request.RemoteEndPoint.Address.ToString()
+                    }
+                }
+            } catch {}
+            Write-DashLog ("event=request_error path={0} src={1} exception={2} message='{3}'" -f $errPath, $errSrc, $exType, $exMsg) 'ERROR'
+
+            # Best-effort 500 response. If the connection is already gone
+            # (e.g. client timed out and abandoned), these throw and we
+            # silently ignore — the whole point of this catch is keeping
+            # the listener alive, not adding a SECOND exception that
+            # crashes us.
+            if ($context) {
+                try {
+                    $context.Response.StatusCode = 500
+                    $context.Response.Headers['Content-Type'] = 'text/plain; charset=utf-8'
+                    $errBody = [System.Text.Encoding]::UTF8.GetBytes(
+                        '500 Internal Server Error. See dashboard log for details (search for event=request_error).')
+                    $context.Response.OutputStream.Write($errBody, 0, $errBody.Length)
+                } catch {}
+                try { $context.Response.OutputStream.Close() } catch {}
+                try { $context.Response.Close() } catch {}
             }
         }
     }
