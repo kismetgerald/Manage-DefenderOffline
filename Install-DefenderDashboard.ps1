@@ -715,12 +715,23 @@ $trigger = New-ScheduledTaskTrigger -AtStartup
 # -StartWhenAvailable is a [switch]; PS treats `-Switch $true` as a positional
 # argument, so use presence-only form. -RunOnlyIfNetworkAvailable defaults to
 # $false (omit it).
+#
+# -DontStopIfGoingOnBatteries / -AllowStartIfOnBatteries override the cmdlet's
+# defaults (which are TRUE for both StopIfGoingOnBatteries and
+# DisallowStartIfOnBatteries). Without these overrides, Task Scheduler will
+# gracefully kill the dashboard on any battery-state transition — even on a
+# desktop with no battery, if a UPS sends a battery event, a power management
+# driver glitches, or a hypervisor signals battery to a VM guest. The user
+# observation that prompted this fix: dashboard cleanly exiting (return code 0)
+# after ~17 min of healthy operation, with no errors in the dashboard log.
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit  ([timespan]::Zero) `
     -MultipleInstances   IgnoreNew `
     -StartWhenAvailable `
     -RestartCount        3 `
-    -RestartInterval     ([timespan]::FromMinutes(1))
+    -RestartInterval     ([timespan]::FromMinutes(1)) `
+    -DontStopIfGoingOnBatteries `
+    -AllowStartIfOnBatteries
 
 # Principal
 if ($isGmsa) {
