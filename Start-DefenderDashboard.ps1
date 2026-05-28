@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.13'
+$ScriptVersion = '0.0.14'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -887,6 +887,49 @@ function Write-DashLog {
         'SUCCESS' { 'Green'   }
     }
     Write-Host $line -ForegroundColor $color
+}
+
+# ===================================================================
+# Startup Profiling  (v0.0.14)
+#
+# Lightweight phase timer for the dashboard's cold start path. Each
+# call to Write-StartupPhase emits a structured key=value INFO line
+# with the duration of the phase that just finished and the total
+# elapsed time since Start-StartupTimer ran. The output is parseable
+# by the same SIEM ingest that consumes event=auth_resolve and
+# event=request_error, so phase profiles can be queried alongside
+# the existing audit stream.
+#
+# Phases instrumented (see main-flow block at the bottom of the
+# script): banner, auth_preflight, https_cert_resolve, target_computers,
+# available_version, port_and_https_binding, primary_listener,
+# redirect_listener, status_file, event_log, initial_fleet_refresh.
+# A final event=startup_complete line carries the grand total.
+# ===================================================================
+$script:StartupSw         = $null
+$script:LastPhaseMs       = 0
+$script:StartupPhaseCount = 0
+
+function Start-StartupTimer {
+    $script:StartupSw         = [System.Diagnostics.Stopwatch]::StartNew()
+    $script:LastPhaseMs       = 0
+    $script:StartupPhaseCount = 0
+}
+
+function Write-StartupPhase {
+    param([Parameter(Mandatory)][string]$Phase)
+    if (-not $script:StartupSw) { return }
+    $totalMs = [int]$script:StartupSw.Elapsed.TotalMilliseconds
+    $deltaMs = $totalMs - $script:LastPhaseMs
+    $script:LastPhaseMs = $totalMs
+    $script:StartupPhaseCount++
+    Write-DashLog ("event=startup_phase phase={0} duration_ms={1} elapsed_ms={2}" -f $Phase, $deltaMs, $totalMs) 'INFO'
+}
+
+function Write-StartupComplete {
+    if (-not $script:StartupSw) { return }
+    $totalMs = [int]$script:StartupSw.Elapsed.TotalMilliseconds
+    Write-DashLog ("event=startup_complete total_ms={0} phase_count={1}" -f $totalMs, $script:StartupPhaseCount) 'SUCCESS'
 }
 
 # ===================================================================
@@ -1928,6 +1971,7 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 # ===================================================================
 # Startup
 # ===================================================================
+Start-StartupTimer
 Write-DashLog "=== Defender Dashboard v$ScriptVersion starting ===" 'SUCCESS'
 Write-DashLog "Port            : $Port"
 Write-DashLog "Refresh interval: ${RefreshInterval}s"
@@ -1937,6 +1981,7 @@ Write-DashLog "HTTPS           : $(if ($UseHttps) { "enabled (cert $CertificateT
 Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+Write-StartupPhase 'banner'
 
 # ===================================================================
 # Authentication validation (early — fail fast for misconfigurations).
@@ -2044,6 +2089,7 @@ switch ($AuthMethod) {
         Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
     }
 }
+Write-StartupPhase 'auth_preflight'
 
 # ===================================================================
 # HTTPS validation (after auth so auth errors surface first).
@@ -2075,6 +2121,7 @@ if ($UseHttps) {
         }
     }
 }
+Write-StartupPhase 'https_cert_resolve'
 
 $TargetComputers = @(Resolve-TargetComputers)
 if ($ExcludeList.Count -gt 0) {
@@ -2089,6 +2136,7 @@ if ($TargetComputers.Count -eq 0) {
     exit 1
 }
 Write-DashLog "Target computers: $($TargetComputers.Count)" 'SUCCESS'
+Write-StartupPhase 'target_computers'
 
 $AvailableVersion    = Get-LatestAvailableVersion -Root $SourceSharePath
 $AvailableVersionStr = if ($AvailableVersion) { $AvailableVersion.ToString() } else { '' }
@@ -2097,6 +2145,7 @@ if ($AvailableVersionStr) {
 } else {
     Write-DashLog 'No SourceSharePath provided; version currency check disabled.' 'WARN'
 }
+Write-StartupPhase 'available_version'
 
 # Resolve port. HTTPS does NOT use fallback because netsh sslcert binds the
 # cert to a specific ipport — if the dashboard fell back to a different port,
@@ -2132,6 +2181,7 @@ if ($UseHttps) {
     }
     $Port = $portResult.Port
 }
+Write-StartupPhase 'port_and_https_binding'
 
 # Start primary listener (HTTP or HTTPS depending on -UseHttps)
 $scheme   = if ($UseHttps) { 'https' } else { 'http' }
@@ -2182,6 +2232,7 @@ try {
 }
 Write-DashLog "$($scheme.ToUpper()) listener started on ${scheme}://+:$Port/" 'SUCCESS'
 Write-DashLog "Browse to: ${scheme}://localhost:$Port/defender" 'INFO'
+Write-StartupPhase 'primary_listener'
 
 # Optional HTTP-to-HTTPS redirect listener. Spun up in a thread job so it
 # runs alongside the main listener; cleaned up in the main finally block.
@@ -2247,6 +2298,7 @@ if ($UseHttps -and $RedirectHttpToHttps) {
         }
     }
 }
+Write-StartupPhase 'redirect_listener'
 
 # Write runtime status file so the installer and administrators can
 # discover the actual bound port without reading through the log.
@@ -2268,6 +2320,7 @@ try {
 } catch {
     Write-DashLog "Could not write status file ($statusFile): $($_.Exception.Message)" 'WARN'
 }
+Write-StartupPhase 'status_file'
 
 # Write to Windows Event Log if the source has been registered by the installer.
 # EventId 100 = normal start on primary port
@@ -2292,6 +2345,7 @@ try {
 } catch {
     Write-DashLog "Could not write to Windows Event Log: $($_.Exception.Message)" 'WARN'
 }
+Write-StartupPhase 'event_log'
 
 # ===================================================================
 # State
@@ -2317,6 +2371,8 @@ $initResults = Invoke-FleetRefresh `
 $script:CachedResults = $initResults
 $script:CachedAt      = Get-Date
 Write-DashLog "Initial collection complete: $($script:CachedResults.Count) computers" 'SUCCESS'
+Write-StartupPhase 'initial_fleet_refresh'
+Write-StartupComplete
 
 # ===================================================================
 # Main Loop
