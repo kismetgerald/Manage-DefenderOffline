@@ -699,7 +699,38 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.12 (2026-05-27) — Current
+### v0.0.13 (2026-05-28) — Current
+
+Stability + diagnostics + cross-domain remote-access ergonomics. Four sub-PRs landed; the headline fix is a long-latent stability bug that made the dashboard look like it was crashing when in fact it was eating per-request exceptions and exiting cleanly.
+
+**`Start-DefenderDashboard.ps1` — request-loop resilience (the real one):**
+- 🐛 The main request loop had no per-request `try/catch`. Any unhandled exception during request handling — bad NTLM token, malformed request, abandoned connection, HTML/JSON build edge case — bubbled out of the `while`, hit the outer `finally`, ran the graceful shutdown, and exited pwsh.exe with code 0. Symptoms looked like clean Task Scheduler completions: no error event, no Kernel-Power event, no termination request — just a silent stop with the operator left wondering what happened.
+- ✨ Per-request `try/catch` now wraps everything from `EndGetContext` through the request switch. On exception: structured `event=request_error` log line (path, src, exception type, message), best-effort HTTP 500 response, listener stays alive, next request proceeds normally.
+
+**`Start-DefenderDashboard.ps1` — AuthAllowedGroups diagnostics:**
+- 🐛 The startup log previously emitted only an aggregate count of resolved allow/deny groups. When an unqualified short-name entry (e.g. `Helpdesk` instead of `WGSDAC\Helpdesk`) failed to resolve under the dashboard's service-account security context, the operator got no diagnostic.
+- ✨ New `event=auth_resolve` per-entry structured log lines on startup: `input='WGSDAC\Helpdesk' type=allow status=ok account='WGSDAC\Helpdesk' sid=S-1-5-21-...-1234`. Unresolved entries log with `status=unresolved error='...'` so operators see exactly which entry failed and why.
+- ✨ Per-request 401/403 logging is now structured (`event=auth_denied`) with a follow-up `event=auth_denied_detail` line for ADIntegrated that compares user SIDs against configured allow/deny SIDs — instantly shows whether the user *would* have matched if an unresolved entry had loaded.
+- ✨ `conf/config.conf` AuthAllowedGroups comment expanded with canonical `DOMAIN\Group` format guidance and a description of the new `event=auth_resolve` startup log.
+
+**`Install-DefenderDashboard.ps1` — task survives transient power events:**
+- 🐛 `New-ScheduledTaskSettingsSet` defaults to `StopIfGoingOnBatteries=true` and `DisallowStartIfOnBatteries=true`. Even on a desktop with no battery, Bluetooth peripherals reporting battery status, attached UPS state events, hypervisor signals to a VM guest, or power-management driver glitches can trigger Task Scheduler to gracefully terminate the running task. The installer never overrode these defaults.
+- ✨ Installer now passes `-DontStopIfGoingOnBatteries` and `-AllowStartIfOnBatteries` so the registered task is invariant to power-state transitions.
+- ℹ️ Existing v0.0.6–v0.0.12 deployments can apply the fix to their registered task without re-running the installer (see release notes).
+
+**`Install-DefenderDashboard.ps1` — self-signed cert SAN coverage:**
+- ✨ Self-signed cert generation now auto-includes the host's primary non-loopback non-APIPA IPv4 address as a Subject Alternative Name — so by-IP access (common in lab/test environments) no longer trips the "Not secure" browser warning.
+- ✨ New `-AdditionalSans` parameter accepts a comma-separated list of additional DNS names or IP addresses to bake into the generated cert. For operators accessing the dashboard via CNAMEs, load-balancer VIPs, aliases, or extra IPs.
+- ✨ Reusing-existing-cert path now logs the cert's SAN coverage (`DnsNameList`) so operators can see before they hit a remote-access cert warning. WARN if `-AdditionalSans` is supplied but the installer is reusing a cert (suggests `-RenewCertificate`).
+
+**`QUICKSTART.md` — cross-domain access section:**
+- ✨ Step 5 substantially expanded: FQDN-vs-IP guidance (Kerberos SPN dependency); three cert-trust options (click through / `Import-Certificate` workflow / PKI swap); Firefox-specific `network.negotiate-auth.trusted-uris` configuration; cross-domain access from non-domain-joined clients; silent-vs-explainable-log diagnostic guidance leveraging the new `event=request_error`.
+- ✨ Parameters reference table gains `-AdditionalSans` and `-RenewCertificate` entries.
+
+**Test infrastructure:**
+- ✨ +4 Pester cases for the new `.Resolutions` surface on `Resolve-DashboardAllowedGroups`. Full suite at **272 tests** (259 active + 13 skipped placeholders).
+
+### v0.0.12 (2026-05-27)
 
 Operator-quality diagnostic added to the dashboard for an issue surfaced during v0.0.11 live-fire: HTTP-to-HTTPS redirect-listener bind failures caused by stale URL-ACL reservations.
 
