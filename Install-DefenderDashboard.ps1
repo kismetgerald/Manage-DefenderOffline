@@ -155,6 +155,17 @@ param(
     # is already set. Requires -UseHttps.
     [switch]$RenewCertificate,
 
+    # Additional Subject Alternative Names (SANs) to include in a generated
+    # self-signed cert. Comma-separated. Accepts DNS names and IP addresses.
+    # Use this when operators access the dashboard via a CNAME, load-balancer
+    # VIP, alternate hostname, or extra IP that isn't the host's primary.
+    # The installer already auto-includes: $env:COMPUTERNAME, the FQDN,
+    # 'localhost', and the host's primary IPv4 address — so this is for
+    # everything beyond that. Ignored when reusing an existing cert; pair
+    # with -RenewCertificate to actually rebuild the cert with new SANs.
+    # Example: -AdditionalSans 'dashboard.contoso.com,10.0.0.50,my-alias'
+    [string]$AdditionalSans,
+
     # --- Options ---
     [switch]$AddFirewallRule,
     [switch]$StartImmediately,
@@ -491,14 +502,52 @@ if ($UseHttps) {
             $certShouldGenerate = $true
         } else {
             Write-Ok "Reusing existing cert: $($existing.Subject) (expires $($existing.NotAfter.ToString('yyyy-MM-dd')))"
+            # Surface SAN coverage so the operator can see whether the existing
+            # cert covers the URL they'll be hitting (FQDN, IP, alias). This is
+            # the most common source of "Not secure" browser warnings during
+            # remote access.
+            $existingSans = if ($existing.DnsNameList) {
+                @($existing.DnsNameList | ForEach-Object { $_.Punycode }) -join ', '
+            } else { '(none)' }
+            Write-Info "  Subject Alt Names: $existingSans"
+            if ($AdditionalSans) {
+                Write-Warn "  -AdditionalSans was supplied but is ignored when reusing an existing cert."
+                Write-Warn "  To apply additional SANs, re-run with -RenewCertificate (regenerates + rebinds via netsh sslcert)."
+            }
         }
     }
     if ($certShouldGenerate) {
         try {
             $fqdn = if ($env:USERDNSDOMAIN) { "$env:COMPUTERNAME.$env:USERDNSDOMAIN" } else { $env:COMPUTERNAME }
+
+            # Auto-include the host's primary non-loopback non-APIPA IPv4 so
+            # cert-by-IP access (lab common) doesn't trip the "Not secure"
+            # browser warning. Same selection logic Update-DefenderOffline uses
+            # for its audit RunFromIP field.
+            $primaryIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+                    $_.PrefixOrigin -ne 'WellKnown'
+                } |
+                Sort-Object InterfaceIndex |
+                Select-Object -First 1 -ExpandProperty IPAddress)
+
+            $sanList = New-Object 'System.Collections.Generic.List[string]'
+            [void]$sanList.Add($env:COMPUTERNAME)
+            if ($fqdn -ne $env:COMPUTERNAME) { [void]$sanList.Add($fqdn) }
+            [void]$sanList.Add('localhost')
+            if ($primaryIp) { [void]$sanList.Add($primaryIp) }
+
+            if ($AdditionalSans) {
+                foreach ($extra in ($AdditionalSans -split ',')) {
+                    $e = $extra.Trim()
+                    if ($e -and -not $sanList.Contains($e)) { [void]$sanList.Add($e) }
+                }
+            }
+
             $newCert = New-SelfSignedCertificate `
                 -Subject "CN=$env:COMPUTERNAME" `
-                -DnsName $env:COMPUTERNAME, $fqdn, 'localhost' `
+                -DnsName $sanList.ToArray() `
                 -CertStoreLocation 'Cert:\LocalMachine\My' `
                 -NotAfter (Get-Date).AddYears(2) `
                 -KeyAlgorithm RSA -KeyLength 2048 `
@@ -508,7 +557,7 @@ if ($UseHttps) {
             $CertificateThumbprint = $newCert.Thumbprint
             Write-Ok "Generated self-signed certificate"
             Write-Info "  Subject     : $($newCert.Subject)"
-            Write-Info "  DNS names   : $env:COMPUTERNAME, $fqdn, localhost"
+            Write-Info "  SANs        : $($sanList -join ', ')"
             Write-Info "  Thumbprint  : $CertificateThumbprint"
             Write-Info "  Expires     : $($newCert.NotAfter.ToString('yyyy-MM-dd')) (2 years)"
         } catch {
