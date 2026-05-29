@@ -110,7 +110,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.17'
+$ScriptVersion = '0.0.18'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # ===================================================================

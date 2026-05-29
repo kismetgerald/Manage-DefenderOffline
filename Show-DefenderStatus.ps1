@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.17'
+$ScriptVersion = '0.0.18'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
@@ -849,7 +849,7 @@ $clrSelection     = [System.Drawing.Color]::FromArgb(220, 233, 248)  # selection
 # Status colours (match HTML .tag classes and stat cards)
 $clrSuccess       = [System.Drawing.Color]::FromArgb(16,  124, 16)   # #107c10 - Healthy/Online
 $clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 - ThreatsDetected (critical — Defender flagged threats on this host)
-$clrOutdatedPill  = [System.Drawing.Color]::FromArgb(156, 81,  0)    # #9c5100 - Outdated pill (HTML .skipped)
+$clrOutdatedPill  = [System.Drawing.Color]::FromArgb(245, 158, 11)   # #f59e0b - Outdated pill (matches dashboard --c-outdated-bg + stat card; pre-v0.0.18 was #9c5100 / white text — re-aligned for dashboard parity per first-demo feedback)
 $clrWarn          = [System.Drawing.Color]::FromArgb(184, 134, 11)   # #b8860b - Degraded pill (HTML .warn)
 $clrOffline       = [System.Drawing.Color]::FromArgb(75,  85,  99)   # #4b5563 - Offline (no comms — informational, not a critical signal)
 $clrOutdatedCard  = [System.Drawing.Color]::FromArgb(245, 158, 11)   # #f59e0b - Outdated stat card (amber per ISSM round-1 feedback)
@@ -965,12 +965,12 @@ $pnlHeader.Controls.AddRange(@($picTitleIcon, $lblTitle, $lblInfo, $pnlHeaderAcc
 $pnlStats              = [System.Windows.Forms.TableLayoutPanel]::new()
 $pnlStats.Dock         = 'Top'
 $pnlStats.Height       = 96
-$pnlStats.ColumnCount  = 4
+$pnlStats.ColumnCount  = 5
 $pnlStats.RowCount     = 1
 $pnlStats.BackColor    = $clrBackground
 $pnlStats.Padding      = [System.Windows.Forms.Padding]::new(16, 10, 16, 8)
-for ($c = 0; $c -lt 4; $c++) {
-    $pnlStats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 25)) | Out-Null
+for ($c = 0; $c -lt 5; $c++) {
+    $pnlStats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 20)) | Out-Null
 }
 
 function New-StatCard ([string]$Label, [System.Drawing.Color]$Bg, [System.Drawing.Color]$Fg) {
@@ -1014,6 +1014,7 @@ $statOnline   = New-StatCard 'ONLINE'   $clrSuccess      $clrWhite
 $statOffline  = New-StatCard 'OFFLINE'  $clrOffline      $clrWhite
 $statOutdated = New-StatCard 'OUTDATED' $clrOutdatedCard $clrTextDark
 $statRtOff    = New-StatCard 'RT OFF'   $clrRtOffCard    $clrTextDark
+$statDegraded = New-StatCard 'DEGRADED' $clrWarn         $clrWhite
 
 # Make each card clickable so it acts as a quick filter (matches the
 # HTML report's clickable stat badges).  The card's Tag stores the
@@ -1030,6 +1031,7 @@ $cardMap = [ordered]@{
     'Offline'  = $statOffline
     'Outdated' = $statOutdated
     'RTOff'    = $statRtOff
+    'Degraded' = $statDegraded
 }
 # Multi-select card filter. Multiple cards combine with AND on Update-Grid.
 # Online/Offline are mutually exclusive (a host is one or the other) so
@@ -1357,7 +1359,11 @@ function Show-HostDetailsDialog {
     $pill.Text      = $pillStatus
     $pill.AutoSize  = $true
     $pill.BackColor = $pillBg
-    $pill.ForeColor = $clrWhite
+    # Outdated uses an amber pill bg now; dark text reads better on amber than
+    # white does, and matches the dashboard's --c-outdated-fg #1e1e2e. All
+    # other pills (Healthy/Offline/Degraded/ThreatsDetected) keep white text
+    # on their darker backgrounds.
+    $pill.ForeColor = if ($pillStatus -eq 'Outdated') { $clrTextDark } else { $clrWhite }
     $pill.Font      = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $pill.Padding   = [System.Windows.Forms.Padding]::new(10, 3, 10, 3)
     $pillRow.Controls.Add($pill, 1, 0)
@@ -1544,7 +1550,9 @@ $grid.add_CellPainting({
         'ThreatsDetected' { $clrError }
         default           { [System.Drawing.Color]::Gray }
     }
-    $pillFg = $clrWhite
+    # Outdated uses an amber bg — dark text reads better on it. See pill
+    # color note where $clrOutdatedPill is defined.
+    $pillFg = if ($statusText -eq 'Outdated') { $clrTextDark } else { $clrWhite }
 
     # Cell background — respect alternating row tint and selection
     $isSelected = ($e.State -band [System.Windows.Forms.DataGridViewElementStates]::Selected) -ne 0
@@ -1723,6 +1731,7 @@ function Update-Grid {
                     'Offline'  { $item.Online -eq $false }
                     'Outdated' { $item.VersionStatus -eq 'Outdated' }
                     'RTOff'    { $item.RealTimeProtection -eq 'False' -and $item.Online -eq $true }
+                    'Degraded' { $item.HealthStatus -eq 'Degraded' -and $item.Online -eq $true }
                     default    { $true }
                 }
                 if (-not $match) { $keep = $false; break }
@@ -1775,11 +1784,16 @@ function Update-Grid {
     $offline  = $all.Count - $online
     $outdated = @($all | Where-Object VersionStatus -eq 'Outdated').Count
     $rtOff    = @($all | Where-Object { $_.RealTimeProtection -eq 'False' -and $_.Online }).Count
+    # Degraded = hosts where the shared health classifier flagged 'Degraded'.
+    # RT Off is a specific subset of degraded conditions; the two cards
+    # overlap by design (operators can filter on either lens).
+    $degraded = @($all | Where-Object { $_.HealthStatus -eq 'Degraded' -and $_.Online }).Count
 
     $statOnline.Number.Text   = "$online"
     $statOffline.Number.Text  = "$offline"
     $statOutdated.Number.Text = "$outdated"
     $statRtOff.Number.Text    = "$rtOff"
+    $statDegraded.Number.Text = "$degraded"
 
     # Refresh the info subline with the latest total
     $lblInfo.Text = if ($AvailableVersionStr) {

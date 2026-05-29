@@ -1374,11 +1374,10 @@ function Build-DashboardHtml {
         $isOnline   = if ($r.Online) { 'true' } else { 'false' }
         $isOutdated = if ($r.VersionStatus -eq 'Outdated') { 'true' } else { 'false' }
         $isRtOff    = if ($r.RealTimeProtection -eq 'False' -and $r.Online) { 'true' } else { 'false' }
-        $isDegraded = if ($r.HealthStatus -eq 'Degraded' -and $r.Online) { 'true' } else { 'false' }
 
         # data-host is the key the row-click handler uses to look up the
         # per-host record in the embedded JSON blob and populate the modal.
-        "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`" data-degraded=`"$isDegraded`">
+        "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`">
           <td$tip>$($r.ComputerName)</td>
           <td>$($r.IPv4Address)</td>
           <td>$badge</td>
@@ -1708,8 +1707,6 @@ function Build-DashboardHtml {
       <div class="lbl">Outdated</div><div class="val">$outdated</div></div>
     <div class="stat st-rt"      data-card="rtoff"    onclick="filterByCard('rtoff')">
       <div class="lbl">RT Prot Off</div><div class="val">$rtOff</div></div>
-    <div class="stat st-deg"     data-card="degraded" onclick="filterByCard('degraded')">
-      <div class="lbl">Degraded</div><div class="val">$degraded</div></div>
   </div>
 
   <div class="toolbar">
@@ -1841,7 +1838,6 @@ function Build-DashboardHtml {
         if (activeCards.offline  && row.dataset.online   !== 'false') cardMatch = false;
         if (activeCards.outdated && row.dataset.outdated !== 'true')  cardMatch = false;
         if (activeCards.rtoff    && row.dataset.rtoff    !== 'true')  cardMatch = false;
-        if (activeCards.degraded && row.dataset.degraded !== 'true')  cardMatch = false;
         row.style.display = (nameMatch && cardMatch) ? '' : 'none';
       }
       updateClearVisibility();
