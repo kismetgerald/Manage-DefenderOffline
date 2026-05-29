@@ -490,6 +490,10 @@ function Get-DefenderStatus {
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
+        # Per-host signature publication date — populated from
+        # Get-MpComputerStatus.AntivirusSignatureLastUpdated. Displayed as
+        # 'yyyy-MM-dd' in the new GUI column + dashboard column (v0.0.18).
+        SignatureLastUpdated      = ''
         AvailableVersion          = $AvailableVersionStr
         VersionStatus             = 'Unknown'
         RealTimeProtection        = 'Unknown'
@@ -599,6 +603,7 @@ function Get-DefenderStatus {
                     # render 'Running' rather than the deserialized object form.
                     SvcStatus            = if ($svc) { [string]$svc.Status } else { 'NotFound' }
                     SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }   else { $null }
+                    SignatureLastUpdated = if ($mp) { $mp.AntivirusSignatureLastUpdated } else { $null }
                     RealTimeProtection   = if ($mp) { $mp.RealTimeProtectionEnabled }  else { $null }
                     AMServiceEnabled     = if ($mp) { $mp.AMServiceEnabled }            else { $null }
                     AntivirusEnabled     = if ($mp) { $mp.AntivirusEnabled }            else { $null }
@@ -621,6 +626,7 @@ function Get-DefenderStatus {
             $result.Online                    = $true
             $result.DefenderService           = $data.SvcStatus
             $result.SignatureVersion          = $data.SignatureVersion
+            $result.SignatureLastUpdated      = if ($data.SignatureLastUpdated) { $data.SignatureLastUpdated.ToString('yyyy-MM-dd') } else { '' }
             $result.RealTimeProtection        = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
             $result.AntivirusEnabled          = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
             $result.AmServiceEnabled          = if ($null -ne $data.AMServiceEnabled)   { $data.AMServiceEnabled.ToString() }   else { 'Unknown' }
@@ -1568,6 +1574,7 @@ function Show-HostDetailsDialog {
     $verLabel = $HostData.SignatureVersion
     if ($HostData.VersionStatus) { $verLabel = "$($HostData.SignatureVersion) ($($HostData.VersionStatus))" }
     & $addKeyValue 'Signature version' $verLabel
+    & $addKeyValue 'Definitions date'  $(if ($HostData.SignatureLastUpdated) { $HostData.SignatureLastUpdated } else { '-' })
     & $addKeyValue 'Available version' $HostData.AvailableVersion
     & $addKeyValue 'Real-time protection'  $HostData.RealTimeProtection         (& $boolColor $HostData.RealTimeProtection)
     & $addKeyValue 'Antimalware service'   $HostData.AmServiceEnabled           (& $boolColor $HostData.AmServiceEnabled)
@@ -1708,7 +1715,10 @@ $colDefs = @(
     @{ Name = 'Platform';          Weight =  8; Min =  80 }   # v0.0.18: VMware / Hyper-V / Physical / etc.
     @{ Name = 'Status';            Weight = 10; Min = 110 }
     @{ Name = 'Installed Version'; Weight = 11; Min = 110 }
-    @{ Name = 'Available Version'; Weight = 11; Min = 110 }
+    # v0.0.18: 'Available Version' column dropped (info is already in the
+    # header), replaced with the per-host 'Definitions Date' (when this
+    # host's signatures were last updated).
+    @{ Name = 'Definitions Date';  Weight = 10; Min = 100 }
     @{ Name = 'Currency';          Weight =  8; Min =  85 }
     @{ Name = 'RT Protection';     Weight =  9; Min =  90 }
     @{ Name = 'AV Enabled';        Weight =  8; Min =  85 }
@@ -1960,7 +1970,7 @@ function Update-Grid {
             $r.Platform,
             $status,
             $r.SignatureVersion,
-            $r.AvailableVersion,
+            $r.SignatureLastUpdated,
             $r.VersionStatus,
             $r.RealTimeProtection,
             $r.AntivirusEnabled,

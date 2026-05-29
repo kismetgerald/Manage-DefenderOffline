@@ -1077,6 +1077,10 @@ function Get-DefenderStatus {
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
+        # Per-host signature publication date — populated from
+        # Get-MpComputerStatus.AntivirusSignatureLastUpdated. Displayed as
+        # 'yyyy-MM-dd' in the new dashboard column (v0.0.18).
+        SignatureLastUpdated      = ''
         AvailableVersion          = $AvailableVersionStr
         VersionStatus             = 'Unknown'
         RealTimeProtection        = 'Unknown'
@@ -1185,6 +1189,7 @@ function Get-DefenderStatus {
                     # path renders 'Running' rather than '[object Object]'.
                     SvcStatus            = if ($svc) { [string]$svc.Status } else { 'NotFound' }
                     SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }  else { $null }
+                    SignatureLastUpdated = if ($mp) { $mp.AntivirusSignatureLastUpdated } else { $null }
                     RealTimeProtection   = if ($mp) { $mp.RealTimeProtectionEnabled } else { $null }
                     AMServiceEnabled     = if ($mp) { $mp.AMServiceEnabled }           else { $null }
                     AntivirusEnabled     = if ($mp) { $mp.AntivirusEnabled }          else { $null }
@@ -1207,6 +1212,7 @@ function Get-DefenderStatus {
             $result.Online                    = $true
             $result.DefenderService           = $data.SvcStatus
             $result.SignatureVersion          = $data.SignatureVersion
+            $result.SignatureLastUpdated      = if ($data.SignatureLastUpdated) { $data.SignatureLastUpdated.ToString('yyyy-MM-dd') } else { '' }
             $result.RealTimeProtection        = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
             $result.AntivirusEnabled          = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
             $result.AmServiceEnabled          = if ($null -ne $data.AMServiceEnabled)   { $data.AMServiceEnabled.ToString() }   else { 'Unknown' }
@@ -1437,6 +1443,7 @@ function Build-DashboardHtml {
           <td>$($r.Platform)</td>
           <td>$badge</td>
           <td>$($r.SignatureVersion)</td>
+          <td>$($r.SignatureLastUpdated)</td>
           <td>$($r.VersionStatus)</td>
           <td>$($r.RealTimeProtection)</td>
           <td>$($r.AntivirusEnabled)</td>
@@ -1466,6 +1473,7 @@ function Build-DashboardHtml {
             online                    = [bool]$_.Online
             defenderService           = $_.DefenderService
             signatureVersion          = $_.SignatureVersion
+            signatureLastUpdated      = $_.SignatureLastUpdated
             availableVersion          = $_.AvailableVersion
             versionStatus             = $_.VersionStatus
             realTimeProtection        = $_.RealTimeProtection
@@ -1797,12 +1805,13 @@ function Build-DashboardHtml {
         <th onclick="sort(3)">Platform</th>
         <th onclick="sort(4)">Status</th>
         <th onclick="sort(5)">Installed Version</th>
-        <th onclick="sort(6)">Currency</th>
-        <th onclick="sort(7)">RT Protection</th>
-        <th onclick="sort(8)">AV Enabled</th>
-        <th onclick="sort(9)">Last Quick Scan</th>
-        <th onclick="sort(10)">Threats</th>
-        <th onclick="sort(11)">Query Time</th>
+        <th onclick="sort(6)">Definitions Date</th>
+        <th onclick="sort(7)">Currency</th>
+        <th onclick="sort(8)">RT Protection</th>
+        <th onclick="sort(9)">AV Enabled</th>
+        <th onclick="sort(10)">Last Quick Scan</th>
+        <th onclick="sort(11)">Threats</th>
+        <th onclick="sort(12)">Query Time</th>
       </tr></thead>
       <tbody>
         $($rows -join "`n        ")
@@ -2053,6 +2062,7 @@ function Build-DashboardHtml {
         + '<div class="mdo-kv">'
         +   kv('WinDefend service',     h.defenderService)
         +   kv('Signature version',     h.signatureVersion + (h.versionStatus ? ' (' + h.versionStatus + ')' : ''))
+        +   kv('Definitions date',      (h.signatureLastUpdated || '—'))
         +   kv('Available version',     h.availableVersion)
         +   kv('Real-time protection',  h.realTimeProtection,        boolClass(h.realTimeProtection))
         +   kv('Antimalware service',   h.amServiceEnabled,          boolClass(h.amServiceEnabled))
@@ -2171,6 +2181,7 @@ function ConvertTo-DashboardJson {
                 online                    = $_.Online
                 defenderService           = $_.DefenderService
                 signatureVersion          = $_.SignatureVersion
+                signatureLastUpdated      = $_.SignatureLastUpdated
                 availableVersion          = $_.AvailableVersion
                 versionStatus             = $_.VersionStatus
                 realTimeProtection        = $_.RealTimeProtection
