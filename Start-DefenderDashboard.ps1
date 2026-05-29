@@ -2029,6 +2029,7 @@ Write-DashLog "HTTPS           : $(if ($UseHttps) { "enabled (cert $CertificateT
 Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+Write-DashLog "Source share    : $(if ($SourceSharePath) { $SourceSharePath } else { '(none configured)' })"
 Write-StartupPhase 'banner'
 
 # ===================================================================
