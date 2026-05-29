@@ -1508,8 +1508,8 @@ function Build-DashboardHtml {
     .st-out     { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
     .st-rt      { background: var(--c-rtoff-bg);    color: var(--c-rtoff-fg); }
 
-    .legend { padding: 6px 28px 0; display: flex; flex-wrap: wrap; gap: 14px;
-              align-items: center; font-size: .78em; color: var(--text-muted); }
+    .legend { display: inline-flex; flex-wrap: wrap; gap: 14px; align-items: center;
+              margin-left: 10px; font-size: .78em; color: var(--text-muted); }
     .legend .lgnd-label { font-weight: 600; color: var(--text-primary); }
     .legend .lgnd-chip  { display: inline-flex; align-items: center; gap: 6px; }
     .legend .lgnd-dot   { display: inline-block; width: 10px; height: 10px;
@@ -1641,7 +1641,7 @@ function Build-DashboardHtml {
 </head>
 <body>
   <div class="topbar">
-    <h1>&#x1F6E1; Microsoft Defender Antivirus &#8211; Fleet Status</h1>
+    <h1><svg viewBox="0 0 24 24" width="0.9em" height="0.9em" style="vertical-align:-0.12em" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.6 8 11 4.6-1.4 8-6 8-11V5l-8-3z" fill="currentColor"/><path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg> Microsoft Defender Antivirus &#8211; Fleet Status</h1>
     <div class="meta">
       <div class="meta-text">
         Available: <strong>$(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' })</strong><br>
@@ -1669,17 +1669,16 @@ function Build-DashboardHtml {
   <div class="toolbar">
     <input type="text" id="filter" placeholder="Filter by computer name…" oninput="applyFilter()">
     <a href="/refresh" class="btn">&#x21BB; Refresh Now</a>
+    <span class="legend">
+      <span class="lgnd-label">Status:</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-online-bg)"></i>Healthy</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-outdated-bg)"></i>Outdated</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-threats-bg)"></i>ThreatsDetected</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-degraded-bg)"></i>Degraded</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-offline-bg)"></i>Offline</span>
+    </span>
     <a href="#" class="clear-filter" id="clearFilter"
        onclick="clearAllFilters(); return false;">Clear filters</a>
-  </div>
-
-  <div class="legend">
-    <span class="lgnd-label">Status:</span>
-    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-online-bg)"></i>Healthy</span>
-    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-outdated-bg)"></i>Outdated</span>
-    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-threats-bg)"></i>ThreatsDetected</span>
-    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-degraded-bg)"></i>Degraded</span>
-    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-offline-bg)"></i>Offline</span>
   </div>
 
   $refreshingBanner

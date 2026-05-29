@@ -846,6 +846,48 @@ $clrRtOffCard     = [System.Drawing.Color]::FromArgb(249, 226, 175)  # #f9e2af -
 $clrWhite         = [System.Drawing.Color]::White
 #endregion
 
+# Defender shield-with-checkmark icon, rendered via GDI+ so we don't ship
+# a binary PNG/ICO file in the bundle. Shape mirrors the inline SVG used
+# by the dashboard's /favicon.svg endpoint; curves are approximated as
+# straight segments at icon size where the difference is invisible. Used
+# for both the in-form header PictureBox and the Windows title-bar Icon.
+function script:New-DefenderShieldBitmap {
+    param([int]$Size = 24)
+    $bmp = [System.Drawing.Bitmap]::new($Size, $Size)
+    $g   = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::Transparent)
+
+    $s = $Size / 24.0
+    $shieldPts = [System.Drawing.PointF[]]@(
+        [System.Drawing.PointF]::new(12 * $s,  2 * $s),
+        [System.Drawing.PointF]::new( 4 * $s,  5 * $s),
+        [System.Drawing.PointF]::new( 4 * $s, 11 * $s),
+        [System.Drawing.PointF]::new( 6 * $s, 17 * $s),
+        [System.Drawing.PointF]::new(12 * $s, 22 * $s),
+        [System.Drawing.PointF]::new(18 * $s, 17 * $s),
+        [System.Drawing.PointF]::new(20 * $s, 11 * $s),
+        [System.Drawing.PointF]::new(20 * $s,  5 * $s)
+    )
+    $shieldBrush = [System.Drawing.SolidBrush]::new($clrPrimary)
+    $g.FillPolygon($shieldBrush, $shieldPts)
+    $shieldBrush.Dispose()
+
+    $checkPen = [System.Drawing.Pen]::new([System.Drawing.Color]::White, [single](2.2 * $s))
+    $checkPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $checkPen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+    $checkPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+    $checkPts = [System.Drawing.PointF[]]@(
+        [System.Drawing.PointF]::new( 8.5 * $s, 12.0 * $s),
+        [System.Drawing.PointF]::new(11.0 * $s, 14.5 * $s),
+        [System.Drawing.PointF]::new(15.5 * $s,  9.5 * $s)
+    )
+    $g.DrawLines($checkPen, $checkPts)
+    $checkPen.Dispose()
+    $g.Dispose()
+    return $bmp
+}
+
 #region Form
 $form               = [System.Windows.Forms.Form]::new()
 $form.Text          = "Microsoft Defender Fleet Monitor v$ScriptVersion"
@@ -855,6 +897,15 @@ $form.StartPosition = 'CenterScreen'
 $form.BackColor     = $clrBackground
 $form.ForeColor     = $clrTextDark
 $form.Font          = [System.Drawing.Font]::new('Segoe UI', 9)
+
+# Windows title-bar icon. Render at 32x32 then convert via GetHicon —
+# Windows scales the result for taskbar / alt-tab / title bar as needed.
+try {
+    $iconBmp = New-DefenderShieldBitmap -Size 32
+    $hIcon   = $iconBmp.GetHicon()
+    $form.Icon = [System.Drawing.Icon]::FromHandle($hIcon)
+    $iconBmp.Dispose()
+} catch {}
 #endregion
 
 #region Header  (matches HTML <h1> with blue underline + status subline)
@@ -863,12 +914,21 @@ $pnlHeader.Dock      = 'Top'
 $pnlHeader.Height    = 84
 $pnlHeader.BackColor = $clrCardBg
 
+# Shield icon to the left of the title. Same shape as the dashboard's
+# /favicon.svg so the two UIs look like siblings rather than cousins.
+$picTitleIcon            = [System.Windows.Forms.PictureBox]::new()
+$picTitleIcon.Image      = New-DefenderShieldBitmap -Size 32
+$picTitleIcon.SizeMode   = 'Zoom'
+$picTitleIcon.Size       = [System.Drawing.Size]::new(32, 32)
+$picTitleIcon.Location   = [System.Drawing.Point]::new(20, 12)
+$picTitleIcon.BackColor  = $clrCardBg
+
 $lblTitle            = [System.Windows.Forms.Label]::new()
 $lblTitle.Text       = 'Microsoft Defender Antivirus – Fleet Status'
 $lblTitle.Font       = [System.Drawing.Font]::new('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor  = $clrPrimary
 $lblTitle.AutoSize   = $true
-$lblTitle.Location   = [System.Drawing.Point]::new(20, 14)
+$lblTitle.Location   = [System.Drawing.Point]::new(60, 14)
 
 $lblInfo             = [System.Windows.Forms.Label]::new()
 $lblInfo.Text        = if ($AvailableVersionStr) {
@@ -879,7 +939,7 @@ $lblInfo.Text        = if ($AvailableVersionStr) {
 $lblInfo.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
 $lblInfo.ForeColor   = $clrTextMuted
 $lblInfo.AutoSize    = $true
-$lblInfo.Location    = [System.Drawing.Point]::new(20, 50)
+$lblInfo.Location    = [System.Drawing.Point]::new(60, 50)
 
 # 3px blue accent line at the bottom (matches HTML h1 border-bottom)
 $pnlHeaderAccent           = [System.Windows.Forms.Panel]::new()
@@ -887,7 +947,7 @@ $pnlHeaderAccent.Dock      = 'Bottom'
 $pnlHeaderAccent.Height    = 3
 $pnlHeaderAccent.BackColor = $clrPrimary
 
-$pnlHeader.Controls.AddRange(@($lblTitle, $lblInfo, $pnlHeaderAccent))
+$pnlHeader.Controls.AddRange(@($picTitleIcon, $lblTitle, $lblInfo, $pnlHeaderAccent))
 #endregion
 
 #region Stat cards  (4 cards mirroring the HTML stats grid)
