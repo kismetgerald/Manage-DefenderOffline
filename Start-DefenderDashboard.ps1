@@ -251,6 +251,11 @@ if (-not $PSBoundParameters.ContainsKey('LogPath')         -and $cfg['DashboardL
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelThreads']) { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 if (-not $PSBoundParameters.ContainsKey('DisableIPv6')     -and $cfg['DisableIPv6'])     { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
+
+# Issue-tracker URL surfaced by the dashboard's footer "Report an Issue" link.
+# Override via [Common] IssuesUrl in conf/config.conf (e.g. for a GHE instance
+# or internal tracker); otherwise use the public GitHub URL.
+$IssuesUrl = if ($cfg['IssuesUrl']) { $cfg['IssuesUrl'].Trim() } else { 'https://github.com/kismetgerald/Manage-DefenderOffline/issues' }
 if (-not $PSBoundParameters.ContainsKey('DashboardTheme')  -and $cfg['DashboardTheme'])  {
     $t = $cfg['DashboardTheme'].Trim()
     if ($t -match '^(?i)light$|^(?i)dark$') { $DashboardTheme = (Get-Culture).TextInfo.ToTitleCase($t.ToLower()) }
@@ -1304,7 +1309,8 @@ function Build-DashboardHtml {
         [datetime]$AsOf,
         [bool]$IsRefreshing,
         [ValidateSet('Dark','Light')]
-        [string]$Theme = 'Dark'
+        [string]$Theme = 'Dark',
+        [string]$IssuesUrl = 'https://github.com/kismetgerald/Manage-DefenderOffline/issues'
     )
 
     $themeAttr = if ($Theme -eq 'Light') { 'light' } else { 'dark' }
@@ -1752,6 +1758,32 @@ function Build-DashboardHtml {
   <div class="footer">
     Start-DefenderDashboard.ps1 v$ScriptVersion &nbsp;|&nbsp;
     $($Data.Count) computers &nbsp;|&nbsp; $onlineCount online &nbsp;|&nbsp; $offlineCount offline
+    &nbsp;|&nbsp; <a href="#" onclick="openIssuesModal(); return false;">Report an Issue</a>
+  </div>
+
+  <!-- Issues / Feedback modal -->
+  <div class="mdo-modal-backdrop" id="issuesModal" onclick="if(event.target===this)closeIssuesModal()">
+    <div class="mdo-modal" role="dialog" aria-modal="true" aria-labelledby="issuesTitle">
+      <h2 id="issuesTitle">Report an Issue / Feedback</h2>
+      <div class="mdo-sub">
+        This system is on an air-gapped network and cannot reach the internet
+        directly. Copy the URL below (or photograph this dialog) and open it
+        on an internet-connected PC to file a bug or feature request.
+      </div>
+      <h3>URL</h3>
+      <div style="display:flex; gap:10px; align-items:center; margin-bottom:8px;">
+        <input id="issuesUrl" type="text" readonly value="$IssuesUrl"
+               onfocus="this.select()"
+               style="flex:1; font-family:Consolas,monospace; font-size:.95em;
+                      padding:8px 10px; border:1px solid var(--border-strong);
+                      background:var(--bg-input); color:var(--text-primary);
+                      border-radius:6px;">
+        <button class="mdo-btn" id="issuesCopyBtn" onclick="copyIssuesUrl()">Copy URL</button>
+      </div>
+      <div class="mdo-modal-footer">
+        <button class="mdo-btn" onclick="closeIssuesModal()">Close</button>
+      </div>
+    </div>
   </div>
 
   <!-- Host Details modal (hidden until a row is clicked) -->
@@ -1984,8 +2016,45 @@ function Build-DashboardHtml {
     function closeHostModal() {
       document.getElementById('mdoModal').classList.remove('show');
     }
+
+    // Issues / Feedback modal — separate from Host Details, surfaced by the
+    // footer link. Air-gapped operators copy the URL out to an internet-
+    // connected PC to file the actual issue.
+    function openIssuesModal() {
+      document.getElementById('issuesModal').classList.add('show');
+      // Focus + select so Ctrl+C works immediately.
+      var input = document.getElementById('issuesUrl');
+      if (input) { input.focus(); input.select(); }
+    }
+    function closeIssuesModal() {
+      document.getElementById('issuesModal').classList.remove('show');
+    }
+    function copyIssuesUrl() {
+      var input = document.getElementById('issuesUrl');
+      var btn   = document.getElementById('issuesCopyBtn');
+      if (!input) return;
+      var done = function() {
+        if (!btn) return;
+        var original = btn.textContent;
+        btn.textContent = '✓ Copied!';
+        setTimeout(function() { btn.textContent = original; }, 1500);
+      };
+      // Prefer the modern Clipboard API; fall back to execCommand for older
+      // browsers and for http:// contexts where Clipboard API is unavailable.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(input.value).then(done, function() {
+          input.select(); document.execCommand('copy'); done();
+        });
+      } else {
+        input.select(); document.execCommand('copy'); done();
+      }
+    }
+
     document.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') closeHostModal();
+      if (e.key === 'Escape') {
+        closeHostModal();
+        closeIssuesModal();
+      }
     });
     // Delegate row clicks (avoids re-binding after DOM mutations from sort).
     var tbl = document.getElementById('tbl');
@@ -2653,7 +2722,8 @@ try {
                     -AvailableVersionStr $AvailableVersionStr `
                     -AsOf               $script:CachedAt `
                     -IsRefreshing       $script:IsRefreshing `
-                    -Theme              $DashboardTheme
+                    -Theme              $DashboardTheme `
+                    -IssuesUrl          $IssuesUrl
                 Send-HttpResponse -Context $context -Body $html
             }
 

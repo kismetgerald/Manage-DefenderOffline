@@ -225,6 +225,11 @@ if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['Wo
 if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
 if (-not $PSBoundParameters.ContainsKey('DisableIPv6')              -and $cfg['DisableIPv6'])              { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
 
+# Issue-tracker URL surfaced by the GUI's "Report an Issue" header link.
+# Override via [Common] IssuesUrl in conf/config.conf (e.g. for a GHE
+# instance or internal tracker); otherwise use the public GitHub URL.
+$script:IssuesUrl = if ($cfg['IssuesUrl']) { $cfg['IssuesUrl'].Trim() } else { 'https://github.com/kismetgerald/Manage-DefenderOffline/issues' }
+
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
     $ExcludeList = $cfg['ExcludeComputers'] -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
@@ -952,13 +957,38 @@ $lblInfo.ForeColor   = $clrTextMuted
 $lblInfo.AutoSize    = $true
 $lblInfo.Location    = [System.Drawing.Point]::new(60, 50)
 
+# "Report an Issue" link in the top-right of the header. Operators on this
+# air-gapped network need an obvious way to file feedback; click opens a
+# dialog with the URL ready to copy + instructions for taking it to an
+# internet-connected PC. Anchored Top+Right so it stays put on resize.
+$lnkIssues             = [System.Windows.Forms.LinkLabel]::new()
+$lnkIssues.Text        = 'Report an Issue / Feedback'
+$lnkIssues.AutoSize    = $true
+$lnkIssues.Font        = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$lnkIssues.LinkColor   = $clrPrimary
+$lnkIssues.ActiveLinkColor = $clrPrimary
+$lnkIssues.LinkBehavior = 'HoverUnderline'
+$lnkIssues.Cursor      = [System.Windows.Forms.Cursors]::Hand
+# Right-align: position at the panel's right edge minus its own width, and
+# re-position on resize so it tracks the right edge of the form.
+$lnkIssues.Anchor      = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+$lnkIssues.add_LinkClicked({ Show-IssuesFeedbackDialog -Url $script:IssuesUrl })
+
 # 3px blue accent line at the bottom (matches HTML h1 border-bottom)
 $pnlHeaderAccent           = [System.Windows.Forms.Panel]::new()
 $pnlHeaderAccent.Dock      = 'Bottom'
 $pnlHeaderAccent.Height    = 3
 $pnlHeaderAccent.BackColor = $clrPrimary
 
-$pnlHeader.Controls.AddRange(@($picTitleIcon, $lblTitle, $lblInfo, $pnlHeaderAccent))
+$pnlHeader.Controls.AddRange(@($picTitleIcon, $lblTitle, $lblInfo, $lnkIssues, $pnlHeaderAccent))
+# Position the link after AddRange so the panel's width is known. Re-runs on
+# header resize via the Layout event so the link stays right-aligned.
+$placeIssuesLink = {
+    $lnkIssues.Location = [System.Drawing.Point]::new(
+        $pnlHeader.Width - $lnkIssues.Width - 20, 32)
+}
+& $placeIssuesLink
+$pnlHeader.add_Resize($placeIssuesLink)
 #endregion
 
 #region Stat cards  (4 cards mirroring the HTML stats grid)
@@ -1243,6 +1273,109 @@ $statusHint.Text       = 'Tip: Double-click a row (or right-click → View Detai
 $statusHint.ForeColor  = $clrTextMuted
 $statusHint.Alignment  = [System.Windows.Forms.ToolStripItemAlignment]::Right
 $statusStrip.Items.Add($statusHint) | Out-Null
+#endregion
+
+#region Issues / Feedback dialog
+# Small modal surfaced by the header link. Designed for air-gapped operators
+# who can't click a URL directly to file feedback — the dialog shows the URL
+# in a read-only monospace box (selectable for copy-paste), a one-click
+# "Copy URL to Clipboard" button, and an instruction line telling them to
+# bring the URL to an internet-connected PC.
+function Show-IssuesFeedbackDialog {
+    param([Parameter(Mandatory)][string]$Url)
+
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'Report an Issue / Feedback'
+    $dlg.Size            = [System.Drawing.Size]::new(620, 320)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $clrCardBg
+    $dlg.Font            = [System.Drawing.Font]::new('Segoe UI', 9)
+
+    $lblTitle             = [System.Windows.Forms.Label]::new()
+    $lblTitle.Text        = 'File a bug or feature request on the project tracker'
+    $lblTitle.Font        = [System.Drawing.Font]::new('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.ForeColor   = $clrPrimary
+    $lblTitle.AutoSize    = $true
+    $lblTitle.Location    = [System.Drawing.Point]::new(20, 18)
+
+    $lblInstruction             = [System.Windows.Forms.Label]::new()
+    $lblInstruction.Text        = "This system is on an air-gapped network and cannot reach the internet directly.`r`nCopy the URL below (or photograph this dialog) and open it on an internet-connected PC."
+    $lblInstruction.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
+    $lblInstruction.ForeColor   = $clrTextDark
+    $lblInstruction.AutoSize    = $true
+    $lblInstruction.Location    = [System.Drawing.Point]::new(20, 52)
+
+    $lblUrlLabel             = [System.Windows.Forms.Label]::new()
+    $lblUrlLabel.Text        = 'URL:'
+    $lblUrlLabel.Font        = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblUrlLabel.ForeColor   = $clrTextDark
+    $lblUrlLabel.AutoSize    = $true
+    $lblUrlLabel.Location    = [System.Drawing.Point]::new(20, 108)
+
+    $txtUrl                = [System.Windows.Forms.TextBox]::new()
+    $txtUrl.Text           = $Url
+    $txtUrl.ReadOnly       = $true
+    $txtUrl.Font           = [System.Drawing.Font]::new('Consolas', 10)
+    $txtUrl.BackColor      = [System.Drawing.Color]::White
+    $txtUrl.Location       = [System.Drawing.Point]::new(20, 128)
+    $txtUrl.Size           = [System.Drawing.Size]::new(560, 24)
+    $txtUrl.BorderStyle    = 'FixedSingle'
+    # Auto-select on focus so a single keyboard shortcut (Ctrl+C) works.
+    $txtUrl.add_Enter({ $txtUrl.SelectAll() })
+
+    $btnCopy             = [System.Windows.Forms.Button]::new()
+    $btnCopy.Text        = 'Copy URL to Clipboard'
+    $btnCopy.AutoSize    = $true
+    $btnCopy.Height      = 32
+    $btnCopy.Padding     = [System.Windows.Forms.Padding]::new(14, 0, 14, 0)
+    $btnCopy.FlatStyle   = 'Flat'
+    $btnCopy.BackColor   = $clrPrimary
+    $btnCopy.ForeColor   = $clrWhite
+    $btnCopy.Font        = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $btnCopy.FlatAppearance.BorderSize = 0
+    $btnCopy.Cursor      = [System.Windows.Forms.Cursors]::Hand
+    $btnCopy.Location    = [System.Drawing.Point]::new(20, 170)
+    $btnCopy.add_Click({
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($Url)
+            $btnCopy.Text = '✓ Copied!'
+            # Reset the label after a moment so the user can copy again.
+            $resetTimer = [System.Windows.Forms.Timer]::new()
+            $resetTimer.Interval = 1500
+            $resetTimer.add_Tick({
+                $btnCopy.Text = 'Copy URL to Clipboard'
+                $resetTimer.Stop()
+                $resetTimer.Dispose()
+            })
+            $resetTimer.Start()
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                $dlg, "Couldn't copy to clipboard: $($_.Exception.Message)`r`n`r`nSelect the URL manually and use Ctrl+C.",
+                'Clipboard error', 'OK', 'Warning') | Out-Null
+        }
+    })
+
+    # Close button uses the system default look (no FlatStyle override) so it
+    # reads as a secondary action against the blue primary "Copy" button.
+    $btnClose            = [System.Windows.Forms.Button]::new()
+    $btnClose.Text       = 'Close'
+    $btnClose.AutoSize   = $true
+    $btnClose.Padding    = [System.Windows.Forms.Padding]::new(16, 4, 16, 4)
+    $btnClose.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
+    $btnClose.Cursor     = [System.Windows.Forms.Cursors]::Hand
+    $btnClose.Location   = [System.Drawing.Point]::new(500, 232)
+    $btnClose.Anchor     = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $btnClose.add_Click({ $dlg.Close() })
+
+    $dlg.AcceptButton = $btnClose
+    $dlg.CancelButton = $btnClose
+    $dlg.Controls.AddRange(@($lblTitle, $lblInstruction, $lblUrlLabel, $txtUrl, $btnCopy, $btnClose))
+    [void]$dlg.ShowDialog()
+    $dlg.Dispose()
+}
 #endregion
 
 #region Host Details dialog  (right-click / double-click drill-in)
