@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.14'
+$ScriptVersion = '0.0.15'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -2528,14 +2528,21 @@ try {
             }
 
             '/refresh' {
-                # Force an immediate refresh; redirect back to dashboard
+                # Force an immediate refresh; redirect back to dashboard.
+                # Use a relative URL so the browser resolves it against the
+                # same scheme/host/port it just hit. The previous hardcoded
+                # "http://" prefix broke HTTPS deployments: the redirect
+                # pointed at http://<host>:<https-port>/defender, the browser
+                # opened a plain-HTTP connection to the HTTPS listener, the
+                # malformed TLS handshake dropped the connection, and the
+                # operator saw ERR_CONNECTION_RESET in the browser.
                 if (-not $script:IsRefreshing) { Start-BackgroundRefresh }
-                $context.Response.Redirect("http://$($context.Request.UserHostName)/defender")
+                $context.Response.Redirect('/defender')
                 $context.Response.OutputStream.Close()
             }
 
             '/' {
-                $context.Response.Redirect("http://$($context.Request.UserHostName)/defender")
+                $context.Response.Redirect('/defender')
                 $context.Response.OutputStream.Close()
             }
 
