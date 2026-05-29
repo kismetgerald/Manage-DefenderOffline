@@ -481,6 +481,7 @@ function Get-DefenderStatus {
 
     $result = [pscustomobject]@{
         ComputerName              = $Computer
+        IPv4Address               = ''
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
@@ -505,22 +506,32 @@ function Get-DefenderStatus {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        # Reachability check.  When DisableIPv6 is set (LAN default), resolve
-        # the hostname to IPv4 only and connect directly — avoids the ~21s
-        # TCP timeout that Test-NetConnection eats on IPv6 ULA addresses
+        # Resolve IPv4 once, up front, regardless of reachability strategy —
+        # the address surfaces in the grid whether the host is online,
+        # offline, or DNS-known-but-unreachable. The DisableIPv6 reachability
+        # path reuses this lookup to avoid a duplicate DNS hit.
+        $ipv4 = $null
+        try {
+            $ipv4 = [System.Net.Dns]::GetHostAddresses($Computer) |
+                Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+                Select-Object -First 1
+            if ($ipv4) { $result.IPv4Address = $ipv4.IPAddressToString }
+        } catch {}
+
+        # Reachability check.  When DisableIPv6 is set (LAN default), connect
+        # directly to the IPv4 we already resolved — avoids the ~21s TCP
+        # timeout that Test-NetConnection eats on IPv6 ULA addresses
         # advertised in DNS but not actually routed.
         $reachable = $false
         if ($DisableIPv6) {
-            try {
-                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
-                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
-                if ($addrs) {
+            if ($ipv4) {
+                try {
                     $client = [System.Net.Sockets.TcpClient]::new()
-                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $task   = $client.ConnectAsync($ipv4, 5985)
                     $reachable = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
                     try { $client.Close() } catch {}
-                }
-            } catch { $reachable = $false }
+                } catch { $reachable = $false }
+            }
         } else {
             $reachable = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
                 -InformationLevel Quiet -WarningAction SilentlyContinue)
@@ -676,6 +687,7 @@ function ConvertTo-StatusHtml {
 
         "<tr>
           <td$tip>$($r.ComputerName)</td>
+          <td>$($r.IPv4Address)</td>
           <td><span class='tag $cls'>$status</span></td>
           <td>$($r.SignatureVersion)</td>
           <td>$($r.AvailableVersion)</td>
@@ -728,7 +740,7 @@ tr:nth-child(even) td { background: #f9f9f9; }
 </div>
 <table>
 <thead><tr>
-  <th>Computer</th><th>Status</th><th>Installed Version</th><th>Available Version</th>
+  <th>Computer</th><th>IPv4</th><th>Status</th><th>Installed Version</th><th>Available Version</th>
   <th>Currency</th><th>RT Protection</th><th>AV Enabled</th><th>Last Quick Scan</th>
   <th>Threats</th><th>Query Time</th>
 </tr></thead>
@@ -1005,6 +1017,61 @@ foreach ($key in $cardMap.Keys) {
 #endregion
 
 #region Toolbar
+# Status color legend — a small row of colored chips below the stat cards
+# matching the dashboard's legend. Reuses the existing palette so the
+# colors track any future palette change without a second source of truth.
+$pnlLegend                = [System.Windows.Forms.FlowLayoutPanel]::new()
+$pnlLegend.Dock           = 'Top'
+$pnlLegend.AutoSize       = $true
+$pnlLegend.FlowDirection  = 'LeftToRight'
+$pnlLegend.WrapContents   = $false
+$pnlLegend.BackColor      = $clrBackground
+$pnlLegend.Padding        = [System.Windows.Forms.Padding]::new(20, 4, 16, 4)
+
+function script:Add-LegendChip {
+    param(
+        [System.Windows.Forms.FlowLayoutPanel]$Parent,
+        [string]$Label,
+        [System.Drawing.Color]$Color
+    )
+    $chip               = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $chip.AutoSize      = $true
+    $chip.FlowDirection = 'LeftToRight'
+    $chip.WrapContents  = $false
+    $chip.Margin        = [System.Windows.Forms.Padding]::new(0, 0, 14, 0)
+    $chip.Padding       = [System.Windows.Forms.Padding]::new(0)
+
+    $dot               = [System.Windows.Forms.Panel]::new()
+    $dot.Size          = [System.Drawing.Size]::new(10, 10)
+    $dot.BackColor     = $Color
+    $dot.Margin        = [System.Windows.Forms.Padding]::new(0, 5, 6, 0)
+    [void]$chip.Controls.Add($dot)
+
+    $txt               = [System.Windows.Forms.Label]::new()
+    $txt.Text          = $Label
+    $txt.AutoSize      = $true
+    $txt.ForeColor     = $clrTextMuted
+    $txt.Margin        = [System.Windows.Forms.Padding]::new(0, 1, 0, 0)
+    [void]$chip.Controls.Add($txt)
+
+    [void]$Parent.Controls.Add($chip)
+}
+
+$lblLegendTitle           = [System.Windows.Forms.Label]::new()
+$lblLegendTitle.Text      = 'Status:'
+$lblLegendTitle.AutoSize  = $true
+$lblLegendTitle.ForeColor = $clrTextDark
+$lblLegendTitle.Font      = [System.Drawing.Font]::new(
+    $lblLegendTitle.Font.FontFamily, $lblLegendTitle.Font.Size, [System.Drawing.FontStyle]::Bold)
+$lblLegendTitle.Margin    = [System.Windows.Forms.Padding]::new(0, 1, 12, 0)
+[void]$pnlLegend.Controls.Add($lblLegendTitle)
+
+Add-LegendChip -Parent $pnlLegend -Label 'Healthy'         -Color $clrSuccess
+Add-LegendChip -Parent $pnlLegend -Label 'Outdated'        -Color $clrOutdatedPill
+Add-LegendChip -Parent $pnlLegend -Label 'ThreatsDetected' -Color $clrError
+Add-LegendChip -Parent $pnlLegend -Label 'Degraded'        -Color $clrWarn
+Add-LegendChip -Parent $pnlLegend -Label 'Offline'         -Color $clrOffline
+
 $pnlToolbar           = [System.Windows.Forms.FlowLayoutPanel]::new()
 $pnlToolbar.Dock      = 'Top'
 $pnlToolbar.Height    = 46
@@ -1175,6 +1242,7 @@ function Show-HostDetailsDialog {
     # ---- Identity --------------------------------------------------------
     & $addSectionHeader 'Identity'
     & $addKeyValue 'Computer'        $HostData.ComputerName
+    & $addKeyValue 'IPv4 address'    $(if ($HostData.IPv4Address) { $HostData.IPv4Address } else { '-' })
     & $addKeyValue 'Online'          $(if ($HostData.Online) { 'Yes' } else { 'No' }) (& $boolColor ($HostData.Online.ToString()))
     & $addKeyValue 'Query duration'  ("{0}s" -f $HostData.QueryDuration)
 
@@ -1334,13 +1402,16 @@ $grid.AlternatingRowsDefaultCellStyle.BackColor = $clrRowAlt
 $grid.AlternatingRowsDefaultCellStyle.SelectionBackColor = $clrSelection
 $grid.RowTemplate.Height                      = 32
 
-# 11 columns matching the HTML report (Online dropped — Status pill covers it; Error / Detail kept as GUI extra).
+# 12 columns matching the HTML report (Online dropped — Status pill covers it; Error / Detail kept as GUI extra).
+# IPv4 sits between Computer and Status per ISSM feedback so operators can
+# triage by hostname or address without drilling into Host Details.
 # AutoSizeColumnsMode = Fill on the grid + per-column FillWeight makes every
 # column resize proportionally with the form, and MinimumWidth keeps content
 # legible when the window is narrowed.
 $grid.AutoSizeColumnsMode = 'Fill'
 $colDefs = @(
     @{ Name = 'Computer';          Weight = 14; Min = 110 }
+    @{ Name = 'IPv4';              Weight =  9; Min =  95 }
     @{ Name = 'Status';            Weight = 11; Min = 110 }
     @{ Name = 'Installed Version'; Weight = 12; Min = 110 }
     @{ Name = 'Available Version'; Weight = 12; Min = 110 }
@@ -1365,7 +1436,9 @@ foreach ($cd in $colDefs) {
 # Custom-paint the Status column as a rounded pill, matching the HTML report's .tag styling.
 $grid.add_CellPainting({
     param($src, $e)
-    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 1) { return }
+    # Status pill custom-paint lives in column index 2 (was 1 before the
+    # IPv4 column inserted itself between Computer and Status in v0.0.16).
+    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 2) { return }
     $statusText = "$($e.Value)"
     if (-not $statusText) { return }
 
@@ -1528,7 +1601,8 @@ $pnlOverlay.Controls.Add($pnlOverlayContent, 1, 1)
 $form.Controls.Add($grid)         # Dock=Fill (added first, behind the overlay)
 $form.Controls.Add($pnlOverlay)   # Dock=Fill (front of grid; hidden by default)
 $form.Controls.Add($pnlToolbar)   # Dock=Top — lowest of the top-docked
-$form.Controls.Add($pnlStats)     # Dock=Top — above the toolbar
+$form.Controls.Add($pnlLegend)    # Dock=Top — above the toolbar
+$form.Controls.Add($pnlStats)     # Dock=Top — above the legend
 $form.Controls.Add($pnlHeader)    # Dock=Top — very top
 $form.Controls.Add($statusStrip)  # Dock=Bottom
 
@@ -1575,6 +1649,7 @@ function Update-Grid {
 
         $idx = $grid.Rows.Add(
             $r.ComputerName,
+            $r.IPv4Address,
             $status,
             $r.SignatureVersion,
             $r.AvailableVersion,

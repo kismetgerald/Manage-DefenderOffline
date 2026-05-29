@@ -677,8 +677,11 @@ function Test-DashboardAuth {
         [string]$UsersFile
     )
 
-    # /health is always anonymous so external monitoring works in every mode
-    if ($Context.Request.Url.LocalPath -eq '/health') {
+    # /health is always anonymous so external monitoring works in every mode.
+    # Favicon paths are anonymous so the browser can fetch the tab icon
+    # without triggering a credential prompt or polluting the audit log.
+    $p = $Context.Request.Url.LocalPath
+    if ($p -in '/health', '/favicon.ico', '/favicon.svg') {
         return [pscustomobject]@{
             Authorized = $true; StatusCode = 200
             User = 'anonymous'; Reason = 'health-bypass'
@@ -1065,6 +1068,7 @@ function Get-DefenderStatus {
 
     $result = [pscustomobject]@{
         ComputerName              = $Computer
+        IPv4Address               = ''
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
@@ -1089,22 +1093,32 @@ function Get-DefenderStatus {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        # Reachability check.  When DisableIPv6 is set (LAN default), resolve
-        # the hostname to IPv4 only and connect directly — avoids the ~21s
-        # TCP timeout that Test-NetConnection eats on IPv6 ULA addresses
+        # Resolve IPv4 once, up front, regardless of reachability strategy —
+        # the address surfaces in the dashboard row whether the host is
+        # online, offline, or DNS-known-but-unreachable. The DisableIPv6
+        # reachability path reuses this lookup to avoid a duplicate DNS hit.
+        $ipv4 = $null
+        try {
+            $ipv4 = [System.Net.Dns]::GetHostAddresses($Computer) |
+                Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+                Select-Object -First 1
+            if ($ipv4) { $result.IPv4Address = $ipv4.IPAddressToString }
+        } catch {}
+
+        # Reachability check.  When DisableIPv6 is set (LAN default), connect
+        # directly to the IPv4 we already resolved — avoids the ~21s TCP
+        # timeout that Test-NetConnection eats on IPv6 ULA addresses
         # advertised in DNS but not actually routed.
         $reachable = $false
         if ($DisableIPv6) {
-            try {
-                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
-                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
-                if ($addrs) {
+            if ($ipv4) {
+                try {
                     $client = [System.Net.Sockets.TcpClient]::new()
-                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $task   = $client.ConnectAsync($ipv4, 5985)
                     $reachable = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
                     try { $client.Close() } catch {}
-                }
-            } catch { $reachable = $false }
+                } catch { $reachable = $false }
+            }
         } else {
             $reachable = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
                 -InformationLevel Quiet -WarningAction SilentlyContinue)
@@ -1338,6 +1352,7 @@ function Build-DashboardHtml {
         # per-host record in the embedded JSON blob and populate the modal.
         "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`">
           <td$tip>$($r.ComputerName)</td>
+          <td>$($r.IPv4Address)</td>
           <td>$badge</td>
           <td>$($r.SignatureVersion)</td>
           <td>$($r.VersionStatus)</td>
@@ -1360,6 +1375,7 @@ function Build-DashboardHtml {
     $hostJsonBlob = @($Data | Sort-Object ComputerName | ForEach-Object {
         [ordered]@{
             computerName              = $_.ComputerName
+            ipv4Address               = $_.IPv4Address
             online                    = [bool]$_.Online
             defenderService           = $_.DefenderService
             signatureVersion          = $_.SignatureVersion
@@ -1399,7 +1415,8 @@ function Build-DashboardHtml {
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="$metaRefreshSecs">
   <title>Microsoft Defender Antivirus &#8211; Fleet Status</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxNiAxNic+PHBhdGggZmlsbD0nIzAwNzhkNCcgZD0nTTggMUwyIDN2NWMwIDMuNSAyLjUgNi41IDYgNyAzLjUtLjUgNi0zLjUgNi03VjNMOCAxeicvPjwvc3ZnPg==">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="shortcut icon" href="/favicon.ico">
   <script>
     // Early-load: apply per-browser theme preference (if any) BEFORE the
     // stylesheet renders, so we never flash the server-side default and
@@ -1490,6 +1507,13 @@ function Build-DashboardHtml {
     .st-offline { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
     .st-out     { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
     .st-rt      { background: var(--c-rtoff-bg);    color: var(--c-rtoff-fg); }
+
+    .legend { padding: 6px 28px 0; display: flex; flex-wrap: wrap; gap: 14px;
+              align-items: center; font-size: .78em; color: var(--text-muted); }
+    .legend .lgnd-label { font-weight: 600; color: var(--text-primary); }
+    .legend .lgnd-chip  { display: inline-flex; align-items: center; gap: 6px; }
+    .legend .lgnd-dot   { display: inline-block; width: 10px; height: 10px;
+                          border-radius: 50%; border: 1px solid rgba(0,0,0,0.08); }
 
     .toolbar { padding: 12px 28px; display: flex; align-items: center; gap: 10px; }
     .toolbar input { background: var(--bg-input); border: 1px solid var(--border-strong);
@@ -1649,20 +1673,30 @@ function Build-DashboardHtml {
        onclick="clearAllFilters(); return false;">Clear filters</a>
   </div>
 
+  <div class="legend">
+    <span class="lgnd-label">Status:</span>
+    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-online-bg)"></i>Healthy</span>
+    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-outdated-bg)"></i>Outdated</span>
+    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-threats-bg)"></i>ThreatsDetected</span>
+    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-degraded-bg)"></i>Degraded</span>
+    <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-offline-bg)"></i>Offline</span>
+  </div>
+
   $refreshingBanner
 
   <div class="wrap">
     <table id="tbl">
       <thead><tr>
         <th onclick="sort(0)">Computer &#9651;</th>
-        <th onclick="sort(1)">Status</th>
-        <th onclick="sort(2)">Installed Version</th>
-        <th onclick="sort(3)">Currency</th>
-        <th onclick="sort(4)">RT Protection</th>
-        <th onclick="sort(5)">AV Enabled</th>
-        <th onclick="sort(6)">Last Quick Scan</th>
-        <th onclick="sort(7)">Threats</th>
-        <th onclick="sort(8)">Query Time</th>
+        <th onclick="sort(1)">IPv4</th>
+        <th onclick="sort(2)">Status</th>
+        <th onclick="sort(3)">Installed Version</th>
+        <th onclick="sort(4)">Currency</th>
+        <th onclick="sort(5)">RT Protection</th>
+        <th onclick="sort(6)">AV Enabled</th>
+        <th onclick="sort(7)">Last Quick Scan</th>
+        <th onclick="sort(8)">Threats</th>
+        <th onclick="sort(9)">Query Time</th>
       </tr></thead>
       <tbody>
         $($rows -join "`n        ")
@@ -1847,6 +1881,7 @@ function Build-DashboardHtml {
         + '<h3>Identity</h3>'
         + '<div class="mdo-kv">'
         +   kv('Computer',       h.computerName)
+        +   kv('IPv4 address',   (h.ipv4Address || '—'))
         +   kv('Online',         h.online ? 'Yes' : 'No', h.online ? 'bool-true' : 'bool-false')
         +   kv('Query duration', (h.queryDurationSec != null ? h.queryDurationSec + 's' : '—'))
         + '</div>'
@@ -1931,6 +1966,7 @@ function ConvertTo-DashboardJson {
         computers        = @($Data | Sort-Object ComputerName | ForEach-Object {
             [ordered]@{
                 computerName              = $_.ComputerName
+                ipv4Address               = $_.IPv4Address
                 online                    = $_.Online
                 defenderService           = $_.DefenderService
                 signatureVersion          = $_.SignatureVersion
@@ -1959,6 +1995,16 @@ function ConvertTo-DashboardJson {
 # ===================================================================
 # HTTP Response Helper
 # ===================================================================
+# Defender shield favicon — embedded SVG so the dashboard tab shows the
+# project icon instead of the browser's default globe glyph. Single source
+# of truth: referenced by the request handler (for /favicon.ico and
+# /favicon.svg) and indirectly by the HTML head <link rel="icon"> tag.
+# Designed at 24x24 viewport; renders cleanly at any tab-favicon size.
+# Color is the same Fluent blue (#0078d4) used elsewhere in the UI.
+$script:FaviconSvg = @'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.4 9.6 8 11 4.6-1.4 8-6 8-11V5l-8-3z" fill="#0078d4"/><path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+'@
+
 function Send-HttpResponse {
     param(
         [System.Net.HttpListenerContext]$Context,
@@ -2256,8 +2302,11 @@ if ($AuthMethod -eq 'ADIntegrated') {
 using System.Net;
 public static class DashboardAuthSelector {
     public static AuthenticationSchemes Decide(HttpListenerRequest req) {
-        if (req != null && req.Url != null && req.Url.LocalPath == "/health") {
-            return AuthenticationSchemes.Anonymous;
+        if (req != null && req.Url != null) {
+            string path = req.Url.LocalPath;
+            if (path == "/health" || path == "/favicon.ico" || path == "/favicon.svg") {
+                return AuthenticationSchemes.Anonymous;
+            }
         }
         return AuthenticationSchemes.Negotiate;
     }
@@ -2528,10 +2577,11 @@ try {
         }
 
         # Successful auth for human-facing paths: log who accessed what, from
-        # where (NIST 800-53 AU-2 / STIG AC-7 auditable events). /health and
-        # /status are excluded because they're polled by monitors and dashboard
-        # auto-refresh, which would flood the log without adding audit value.
-        if ($path -notin '/health', '/status' -and $authResult.Reason -ne 'health-bypass') {
+        # where (NIST 800-53 AU-2 / STIG AC-7 auditable events). /health,
+        # /status and /favicon.* are excluded because they're polled by
+        # monitors / auto-refresh / browser tab-icon fetches, which would
+        # flood the log without adding audit value.
+        if ($path -notin '/health', '/status', '/favicon.ico', '/favicon.svg' -and $authResult.Reason -ne 'health-bypass') {
             Write-DashLog ("event=auth_allowed path={0} user='{1}' src={2} reason={3} method={4}" -f $path, $auditUser, $auditFrom, $authResult.Reason, $AuthMethod) 'INFO'
         }
 
@@ -2557,6 +2607,10 @@ try {
 
             '/health' {
                 Send-HttpResponse -Context $context -Body 'OK' -ContentType 'text/plain; charset=utf-8'
+            }
+
+            { $_ -in '/favicon.ico', '/favicon.svg' } {
+                Send-HttpResponse -Context $context -Body $script:FaviconSvg -ContentType 'image/svg+xml; charset=utf-8'
             }
 
             '/refresh' {
