@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.15'
+$ScriptVersion = '0.0.16'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -1005,22 +1005,49 @@ function Resolve-TargetComputers {
 # ===================================================================
 function Get-LatestAvailableVersion {
     param([string]$Root)
-    if (-not $Root -or -not (Test-Path $Root -ErrorAction SilentlyContinue)) { return $null }
+    # Returns $null for any failure. Caller-side "no path configured"
+    # is silent — the caller checks $SourceSharePath separately so the
+    # message can include the parameter name. All other failures log
+    # with the distinguishing reason here so the operator doesn't have
+    # to guess between "path doesn't exist", "permission denied",
+    # "share unreachable", and "share OK but layout doesn't match".
+    if (-not $Root) { return $null }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Root -ErrorAction Stop)) {
+            Write-DashLog "Available version: SourceSharePath '$Root' is not reachable (path does not exist or service account lacks read access). Version currency check disabled." 'WARN'
+            return $null
+        }
+    } catch {
+        Write-DashLog "Available version: error accessing SourceSharePath '$Root' - $($_.Exception.Message). Version currency check disabled." 'ERROR'
+        return $null
+    }
+
     # Supports two layouts (v0.0.8 introduced the per-arch subfolder layout):
     #   Flat (legacy)   : <version>\mpam-fe.exe                  -> parent matches ^v\d+...
     #   Per-arch (new)  : <version>\<arch>\mpam-fe.exe           -> parent is x64/x86/arm64; grandparent is ^v\d+...
-    $versions = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
-        ForEach-Object {
-            $parent      = $_.Directory.Name
-            $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
-            if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
-            } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
+    try {
+        $versions = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction Stop |
+            Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
+            ForEach-Object {
+                $parent      = $_.Directory.Name
+                $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
+                if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                }
             }
-        }
-    return $versions | Sort-Object -Descending | Select-Object -First 1
+    } catch {
+        Write-DashLog "Available version: error enumerating SourceSharePath '$Root' - $($_.Exception.Message). Version currency check disabled." 'ERROR'
+        return $null
+    }
+
+    $latest = $versions | Sort-Object -Descending | Select-Object -First 1
+    if (-not $latest) {
+        Write-DashLog "Available version: SourceSharePath '$Root' contains no 'mpam-fe.exe' matching the expected '<YYYYMMDD>\v#.#.#.#\[arch\]\mpam-fe.exe' structure. Version currency check disabled." 'WARN'
+    }
+    return $latest
 }
 
 # ===================================================================
@@ -1409,7 +1436,7 @@ function Build-DashboardHtml {
          with the Forms GUI and HTML report. */
       --c-online-bg:   #107c10; --c-online-fg:   #ffffff;
       --c-offline-bg:  #4b5563; --c-offline-fg:  #ffffff;
-      --c-outdated-bg: #fab387; --c-outdated-fg: #1e1e2e;
+      --c-outdated-bg: #f59e0b; --c-outdated-fg: #1e1e2e;
       --c-rtoff-bg:    #f9e2af; --c-rtoff-fg:    #1e1e2e;
       --c-degraded-bg: #b8860b; --c-degraded-fg: #ffffff;
       --c-threats-bg:  #d13438; --c-threats-fg:  #ffffff;
@@ -2163,8 +2190,12 @@ $AvailableVersion    = Get-LatestAvailableVersion -Root $SourceSharePath
 $AvailableVersionStr = if ($AvailableVersion) { $AvailableVersion.ToString() } else { '' }
 if ($AvailableVersionStr) {
     Write-DashLog "Available version: v$AvailableVersionStr" 'SUCCESS'
-} else {
-    Write-DashLog 'No SourceSharePath provided; version currency check disabled.' 'WARN'
+} elseif (-not $SourceSharePath) {
+    # Only log the "no path configured" branch here. All other failure
+    # branches (path unreachable, permission denied, layout mismatch)
+    # log their distinct reason from inside Get-LatestAvailableVersion
+    # itself so the operator sees the actual cause.
+    Write-DashLog 'Available version: SourceSharePath is not configured in conf/config.conf; version currency check disabled.' 'WARN'
 }
 Write-StartupPhase 'available_version'
 

@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.15'
+$ScriptVersion = '0.0.16'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
@@ -360,22 +360,48 @@ You have four ways to proceed:
 # ===================================================================
 function Get-LatestAvailableVersion {
     param([string]$Root)
-    if (-not $Root -or -not (Test-Path $Root -ErrorAction SilentlyContinue)) { return $null }
+    # Returns $null for any failure. "No path configured" stays silent;
+    # the caller checks $SourceSharePath separately. All other failures
+    # log a distinguishing reason so the operator doesn't have to guess
+    # between "path doesn't exist", "permission denied", and "share OK
+    # but layout doesn't match".
+    if (-not $Root) { return $null }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Root -ErrorAction Stop)) {
+            Write-Host "Note: SourceSharePath '$Root' is not reachable (path does not exist or current account lacks read access). Version currency check disabled." -ForegroundColor Yellow
+            return $null
+        }
+    } catch {
+        Write-Host "Error: accessing SourceSharePath '$Root' failed - $($_.Exception.Message). Version currency check disabled." -ForegroundColor Red
+        return $null
+    }
+
     # Supports two layouts (v0.0.8 introduced the per-arch subfolder layout):
     #   Flat (legacy)   : <version>\mpam-fe.exe                  -> parent matches ^v\d+...
     #   Per-arch (new)  : <version>\<arch>\mpam-fe.exe           -> parent is x64/x86/arm64; grandparent is ^v\d+...
-    $versions = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
-        ForEach-Object {
-            $parent      = $_.Directory.Name
-            $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
-            if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
-            } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
+    try {
+        $versions = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction Stop |
+            Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
+            ForEach-Object {
+                $parent      = $_.Directory.Name
+                $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
+                if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                }
             }
-        }
-    return $versions | Sort-Object -Descending | Select-Object -First 1
+    } catch {
+        Write-Host "Error: enumerating SourceSharePath '$Root' failed - $($_.Exception.Message). Version currency check disabled." -ForegroundColor Red
+        return $null
+    }
+
+    $latest = $versions | Sort-Object -Descending | Select-Object -First 1
+    if (-not $latest) {
+        Write-Host "Note: SourceSharePath '$Root' contains no 'mpam-fe.exe' matching the expected '<YYYYMMDD>\v#.#.#.#\[arch\]\mpam-fe.exe' structure. Version currency check disabled." -ForegroundColor Yellow
+    }
+    return $latest
 }
 
 # ===================================================================
@@ -754,7 +780,10 @@ $AvailableVersionStr = if ($AvailableVersion) { $AvailableVersion.ToString() } e
 
 if ($AvailableVersionStr) {
     Write-Host "Latest available version: v$AvailableVersionStr" -ForegroundColor Cyan
-} else {
+} elseif (-not $SourceSharePath) {
+    # Only log the "no path configured" branch here. All other failure
+    # branches (path unreachable, permission denied, layout mismatch)
+    # log their distinct reason from inside Get-LatestAvailableVersion.
     Write-Host 'Note: No -SourceSharePath provided; version currency check disabled.' -ForegroundColor Yellow
 }
 
@@ -764,6 +793,25 @@ if ($AvailableVersionStr) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Win32 EM_SETCUEBANNER for placeholder ("hint") text on the filter
+# TextBox — Windows Forms doesn't expose a managed equivalent on the
+# .NET Framework runtime PowerShell uses. The cue draws when the
+# control is empty and unfocused; passes through normally on focus.
+if (-not ('CueBannerHelper' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CueBannerHelper {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, string lParam);
+    private const int EM_SETCUEBANNER = 0x1501;
+    public static void SetCue(IntPtr hWnd, string text) {
+        SendMessage(hWnd, EM_SETCUEBANNER, 0, text);
+    }
+}
+'@
+}
 
 #region Colour palette  (mirrors the HTML report exported by Export HTML)
 $clrPrimary       = [System.Drawing.Color]::FromArgb(0,   120, 212)  # #0078d4 Fluent blue
@@ -781,7 +829,7 @@ $clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 -
 $clrOutdatedPill  = [System.Drawing.Color]::FromArgb(156, 81,  0)    # #9c5100 - Outdated pill (HTML .skipped)
 $clrWarn          = [System.Drawing.Color]::FromArgb(184, 134, 11)   # #b8860b - Degraded pill (HTML .warn)
 $clrOffline       = [System.Drawing.Color]::FromArgb(75,  85,  99)   # #4b5563 - Offline (no comms — informational, not a critical signal)
-$clrOutdatedCard  = [System.Drawing.Color]::FromArgb(250, 179, 135)  # #fab387 - Outdated stat card (HTML .s3)
+$clrOutdatedCard  = [System.Drawing.Color]::FromArgb(245, 158, 11)   # #f59e0b - Outdated stat card (amber per ISSM round-1 feedback)
 $clrRtOffCard     = [System.Drawing.Color]::FromArgb(249, 226, 175)  # #f9e2af - RT Off stat card (HTML .s4)
 $clrWhite         = [System.Drawing.Color]::White
 #endregion
@@ -889,7 +937,12 @@ $statRtOff    = New-StatCard 'RT OFF'   $clrRtOffCard    $clrTextDark
 # filter key ('Online' / 'Offline' / 'Outdated' / 'RTOff').  A Paint
 # handler draws a 3px primary-blue outline when the card is the
 # currently-selected filter.
-$cardMap = @{
+#
+# [ordered] is significant: the GUI paints the cards in the order this
+# dictionary enumerates its keys (see foreach below). An unordered
+# Hashtable would scramble the visual order, producing inconsistency
+# with the dashboard's stat-card layout.
+$cardMap = [ordered]@{
     'Online'   = $statOnline
     'Offline'  = $statOffline
     'Outdated' = $statOutdated
@@ -992,6 +1045,14 @@ $txtFilter.Width       = 220
 $txtFilter.Height      = 24
 $txtFilter.Margin      = [System.Windows.Forms.Padding]::new(2, 5, 0, 0)
 $txtFilter.BorderStyle = 'FixedSingle'
+
+# Set the placeholder ("hint") text once the Win32 handle exists. Wires
+# via HandleCreated rather than after-the-fact so the cue is in place
+# the first time the textbox renders, matching the dashboard's HTML
+# placeholder behaviour.
+$txtFilter.add_HandleCreated({
+    [CueBannerHelper]::SetCue($txtFilter.Handle, 'Filter by computer name…')
+})
 
 $chkAuto             = [System.Windows.Forms.CheckBox]::new()
 $chkAuto.Text        = 'Auto-refresh (5 min)'
