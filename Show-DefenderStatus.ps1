@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.16'
+$ScriptVersion = '0.0.17'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
@@ -1031,7 +1031,13 @@ $cardMap = [ordered]@{
     'Outdated' = $statOutdated
     'RTOff'    = $statRtOff
 }
-$script:CardFilter = $null   # null | 'Online' | 'Offline' | 'Outdated' | 'RTOff'
+# Multi-select card filter. Multiple cards combine with AND on Update-Grid.
+# Online/Offline are mutually exclusive (a host is one or the other) so
+# clicking one auto-deselects the other; all other combinations stack.
+# A StringComparer.OrdinalIgnoreCase HashSet mirrors the dashboard's
+# case-insensitive key matching ('Online' / 'online' both work).
+$script:CardFilters = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
 
 # Capture each card's resting BackColor so we can swap to a darker shade
 # when the card is the active filter, and restore it when deselected.
@@ -1049,21 +1055,27 @@ function script:Get-DarkerShade {
 $cardClickHandler = {
     $key = $this.Tag
     if (-not $key) { return }
-    $script:CardFilter = if ($script:CardFilter -eq $key) { $null } else { $key }
+    if ($script:CardFilters.Contains($key)) {
+        [void]$script:CardFilters.Remove($key)
+    } else {
+        if ($key -eq 'Online')  { [void]$script:CardFilters.Remove('Offline') }
+        if ($key -eq 'Offline') { [void]$script:CardFilters.Remove('Online') }
+        [void]$script:CardFilters.Add($key)
+    }
     foreach ($k in $cardMap.Keys) {
         $card = $cardMap[$k].Panel
         $orig = $script:CardOriginalColors[$k]
-        $card.BackColor = if ($script:CardFilter -eq $k) { Get-DarkerShade $orig } else { $orig }
+        $card.BackColor = if ($script:CardFilters.Contains($k)) { Get-DarkerShade $orig } else { $orig }
         $card.Invalidate()
     }
     if ($script:AllResults) { Update-Grid }
 }
 
-# Sunken-edge effect: a semi-transparent dark inset border on the
-# selected card, drawn into the small strips left by the label margins.
+# Sunken-edge effect: a semi-transparent dark inset border on every active
+# card, drawn into the small strips left by the label margins.
 $cardPaintHandler = {
     param($src, $e)
-    if ($script:CardFilter -and $src.Tag -eq $script:CardFilter) {
+    if ($src.Tag -and $script:CardFilters.Contains([string]$src.Tag)) {
         $darkPen = [System.Drawing.Pen]::new(
             [System.Drawing.Color]::FromArgb(140, 0, 0, 0), 2)
         $e.Graphics.DrawRectangle($darkPen, 0, 0, $src.Width - 1, $src.Height - 1)
@@ -1698,17 +1710,24 @@ function Update-Grid {
     $filter = $script:FilterText.Trim()
     if ($filter) { $data = @($data | Where-Object { $_.ComputerName -like "*$filter*" }) }
 
-    if ($script:CardFilter) {
-        # Capture $_ in $item BEFORE switch — inside switch, $_ rebinds
-        # to the switch's matched value, not the pipeline item.
+    if ($script:CardFilters.Count -gt 0) {
+        # Multi-card AND: a row must satisfy every active card filter to
+        # remain. Capture $_ in $item BEFORE switch — inside switch, $_
+        # rebinds to the switch's matched value, not the pipeline item.
         $data = @($data | Where-Object {
             $item = $_
-            switch ($script:CardFilter) {
-                'Online'   { $item.Online -eq $true }
-                'Offline'  { $item.Online -eq $false }
-                'Outdated' { $item.VersionStatus -eq 'Outdated' }
-                'RTOff'    { $item.RealTimeProtection -eq 'False' -and $item.Online -eq $true }
+            $keep = $true
+            foreach ($f in $script:CardFilters) {
+                $match = switch ($f) {
+                    'Online'   { $item.Online -eq $true }
+                    'Offline'  { $item.Online -eq $false }
+                    'Outdated' { $item.VersionStatus -eq 'Outdated' }
+                    'RTOff'    { $item.RealTimeProtection -eq 'False' -and $item.Online -eq $true }
+                    default    { $true }
+                }
+                if (-not $match) { $keep = $false; break }
             }
+            $keep
         })
     }
 

@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.16'
+$ScriptVersion = '0.0.17'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -1780,31 +1780,46 @@ function Build-DashboardHtml {
     }
     syncThemeButton();
 
-    // Card-click filtering — same behaviour as the HTML report.
-    var activeCard = null;
+    // Card-click filtering — multi-select with AND combination across cards.
+    // Online and Offline are mutually exclusive (a host is one or the other),
+    // so clicking one auto-deselects the other; all other combinations stack.
+    // Common useful combos: Online+Outdated (reachable but behind), Offline+
+    // Outdated (orphaned + stale). Offline+RTOff is always empty by design
+    // (RT-off classification requires the host be Online) — operator's choice.
+    var activeCards = {};   // key set: { online:true, outdated:true, ... }
+    function activeCardCount() {
+      var n = 0; for (var k in activeCards) { if (activeCards[k]) n++; } return n;
+    }
     function filterByCard(key) {
-      activeCard = (activeCard === key) ? null : key;
+      if (activeCards[key]) {
+        delete activeCards[key];
+      } else {
+        if (key === 'online')  delete activeCards.offline;
+        if (key === 'offline') delete activeCards.online;
+        activeCards[key] = true;
+      }
       var cards = document.querySelectorAll('.stat');
       for (var i = 0; i < cards.length; i++) {
-        if (cards[i].dataset.card === activeCard) cards[i].classList.add('active');
+        if (activeCards[cards[i].dataset.card]) cards[i].classList.add('active');
         else cards[i].classList.remove('active');
       }
       applyFilter();
     }
     function clearAllFilters() {
-      activeCard = null;
+      activeCards = {};
       var cards = document.querySelectorAll('.stat');
       for (var i = 0; i < cards.length; i++) cards[i].classList.remove('active');
       document.getElementById('filter').value = '';
       applyFilter();
     }
     function updateClearVisibility() {
-      var has = (activeCard !== null) || (document.getElementById('filter').value.length > 0);
+      var has = (activeCardCount() > 0) || (document.getElementById('filter').value.length > 0);
       var cf  = document.getElementById('clearFilter');
       if (cf) cf.classList.toggle('visible', has);
     }
 
-    // Combined text-filter + card-filter applied to every row
+    // Combined text-filter + card-filter applied to every row. Card filters
+    // AND together — a row must satisfy every active card to remain visible.
     function applyFilter() {
       var q = document.getElementById('filter').value.toLowerCase();
       var rows = document.getElementById('tbl').tBodies[0].rows;
@@ -1813,10 +1828,10 @@ function Build-DashboardHtml {
         var name = row.cells[0] ? row.cells[0].innerText.toLowerCase() : '';
         var nameMatch = name.indexOf(q) !== -1;
         var cardMatch = true;
-        if      (activeCard === 'online')   cardMatch = row.dataset.online   === 'true';
-        else if (activeCard === 'offline')  cardMatch = row.dataset.online   === 'false';
-        else if (activeCard === 'outdated') cardMatch = row.dataset.outdated === 'true';
-        else if (activeCard === 'rtoff')    cardMatch = row.dataset.rtoff    === 'true';
+        if (activeCards.online   && row.dataset.online   !== 'true')  cardMatch = false;
+        if (activeCards.offline  && row.dataset.online   !== 'false') cardMatch = false;
+        if (activeCards.outdated && row.dataset.outdated !== 'true')  cardMatch = false;
+        if (activeCards.rtoff    && row.dataset.rtoff    !== 'true')  cardMatch = false;
         row.style.display = (nameMatch && cardMatch) ? '' : 'none';
       }
       updateClearVisibility();
