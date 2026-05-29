@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.16-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.17-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 > 👉 **New here?** Read [QUICKSTART.md](QUICKSTART.md) — dashboard running and reachable from a remote workstation in under 10 minutes.
 
@@ -699,7 +699,18 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.16 (2026-05-29) — Current
+### v0.0.17 (2026-05-29) — Current
+
+Focused single-feature release: multi-card AND combinations on both UIs (ISSM #14, leaner scope).
+
+**Both UIs — multi-card AND filter (ISSM #14-a):**
+- ✨ Stat cards on both UIs were single-select — clicking another card un-selected the first. Operators routinely want intersections like "Online + Outdated" (reachable but behind a patch) or "Offline + Outdated" (orphaned and stale).
+- ✨ Cards are now multi-select with AND combination. Click a card to add it to the active set; click again to remove. All active cards must match for a row to remain visible. Name filter still ANDs with the card set; "Clear filters" wipes everything in one click.
+- ✨ Online ↔ Offline are mutually exclusive (a host is one or the other); clicking one auto-deselects the other. Outdated and RT-Off stack freely with either. Offline + RT-Off is empty by design (RT-Off classification already requires Online) — accepted edge case, no warning.
+- ℹ️ Implementation: dashboard JS replaced `activeCard` scalar with `activeCards` key set; GUI replaced `$script:CardFilter` with `$script:CardFilters` (HashSet[string], OrdinalIgnoreCase). Paint/render every active card with the sunken-edge "selected" effect.
+- 📝 The larger ISSM #14 framing — column-aware filter syntax (`ip:10.0.10 version:1.451 status:offline`) or a full builder UI — is deferred pending field feedback. Multi-card AND alone covers the operator queries we've heard about; if lab dwell-time produces real demand for predicate syntax, revisit then.
+
+### v0.0.16 (2026-05-29)
 
 ISSM round-1 review polish. Two ISSMs reviewed v0.0.14 pre-demo and produced a 14-item list; items 5 and 6 shipped in v0.0.15. The remaining 12 items landed here, alongside several bugs surfaced during round-2 lab testing and four QUICKSTART gaps identified in 2026-05-28 work-lab live-fire.
 

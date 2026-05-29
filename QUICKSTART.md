@@ -39,10 +39,10 @@ Allow remote server management through WinRM`
 In an **elevated PowerShell 7** window on the dashboard host:
 
 ```powershell
-$Zip = "$env:TEMP\manage-defenderoffline-0.0.16.zip"
+$Zip = "$env:TEMP\manage-defenderoffline-0.0.17.zip"
 
 Invoke-WebRequest `
-    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.16/manage-defenderoffline-0.0.16.zip' `
+    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.17/manage-defenderoffline-0.0.17.zip' `
     -OutFile $Zip
 
 Expand-Archive -Path $Zip -DestinationPath 'C:\Tools' -Force
