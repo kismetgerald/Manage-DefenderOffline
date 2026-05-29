@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.14-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.15-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 > 👉 **New here?** Read [QUICKSTART.md](QUICKSTART.md) — dashboard running and reachable from a remote workstation in under 10 minutes.
 
@@ -699,7 +699,15 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.14 (2026-05-28) — Current
+### v0.0.15 (2026-05-28) — Current
+
+Hotfix release for a long-latent HTTPS bug surfaced during ISSM demo review.
+
+**`Start-DefenderDashboard.ps1` — Force Refresh `ERR_CONNECTION_RESET` on HTTPS:**
+- 🐛 The `/refresh` and `/` endpoints emitted a 302 redirect with a hardcoded `http://<host>:<port>/defender` Location header. On HTTPS deployments the browser tried to connect to the HTTPS port over plain HTTP, the malformed TLS handshake dropped the connection, and the operator saw `ERR_CONNECTION_RESET`. Latent since v0.0.6 when HTTPS support landed; nobody clicked Force Refresh during HTTPS testing until an ISSM reviewer did.
+- ✨ Both endpoints now redirect to the relative URL `/defender`. The browser resolves it against the same scheme/host/port it just hit, so the same code path works for HTTP and HTTPS with no server-side scheme detection.
+
+### v0.0.14 (2026-05-28)
 
 Startup performance + diagnostic instrumentation. Two changes that together cut cold-start dashboard-availability time by 11+ seconds: phase-by-phase startup profiling exposes where the time goes, then async initial fleet refresh decouples listener readiness from the ~14-second WinRM probe.
 
