@@ -505,6 +505,15 @@ function Get-DefenderStatus {
         ThreatList                = @()
         HealthStatus              = ''
         HealthReason              = ''
+        # System inventory surfaced as columns + modal section (v0.0.18 / ISSM
+        # demo feedback #1). NodeType derives from Win32_OperatingSystem
+        # ProductType; Platform from Win32_ComputerSystem Manufacturer + Model
+        # pattern match.
+        NodeType                  = 'Unknown'
+        Platform                  = 'Unknown'
+        OSCaption                 = ''
+        Manufacturer              = ''
+        Model                     = ''
         QueryDuration             = 0
         Error                     = ''
     }
@@ -554,6 +563,11 @@ function Get-DefenderStatus {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
+                # OS + ComputerSystem CIM for NodeType and Platform columns.
+                # Both classes are local on the target; ~50ms each.
+                $os = $null; $cs = $null
+                try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop } catch {}
+                try { $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop } catch {}
                 # Per-threat detail for the Host Details dialog. Get-MpThreat
                 # is the catalog of threat types ever seen — it doesn't reliably
                 # populate InitialDetectionTime / Resources for long-quarantined
@@ -595,6 +609,12 @@ function Get-DefenderStatus {
                     LastFullScan         = if ($mp) { $mp.FullScanStartTime }           else { $null }
                     ThreatCount          = $threats.Count
                     ThreatList           = $threats
+                    # ProductType: 1 = Workstation, 2 = Domain Controller,
+                    # 3 = Member Server. OSCaption is the friendly OS name.
+                    ProductType          = if ($os) { [int]$os.ProductType } else { 0 }
+                    OSCaption            = if ($os) { [string]$os.Caption } else { '' }
+                    Manufacturer         = if ($cs) { [string]$cs.Manufacturer } else { '' }
+                    Model                = if ($cs) { [string]$cs.Model } else { '' }
                 }
             }
 
@@ -611,6 +631,33 @@ function Get-DefenderStatus {
             $result.LastFullScan              = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
             $result.ThreatCount               = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
             $result.ThreatList                = @($data.ThreatList)
+
+            # Map raw CIM values to friendly column strings (v0.0.18).
+            #   ProductType: 1=Workstation, 2=DC, 3=Server (Microsoft definition).
+            #   Platform:    Manufacturer/Model pattern match against the common
+            #                hypervisor signatures. Anything unrecognised falls
+            #                back to 'Physical' — the actual manufacturer is
+            #                still surfaced in the modal's System section so
+            #                operators can verify.
+            $result.OSCaption    = $data.OSCaption
+            $result.Manufacturer = $data.Manufacturer
+            $result.Model        = $data.Model
+            $result.NodeType     = switch ([int]$data.ProductType) {
+                1       { 'Workstation' }
+                2       { 'DC' }
+                3       { 'Server' }
+                default { 'Unknown' }
+            }
+            $mfg   = "$($data.Manufacturer)".Trim()
+            $model = "$($data.Model)".Trim()
+            $result.Platform = if     ($mfg -like 'VMware*' -or $model -like 'VMware*')               { 'VMware' }
+                               elseif ($mfg -eq 'Microsoft Corporation' -and $model -eq 'Virtual Machine') { 'Hyper-V' }
+                               elseif ($mfg -eq 'innotek GmbH' -or $mfg -eq 'Oracle Corporation' -and $model -like '*VirtualBox*') { 'VirtualBox' }
+                               elseif ($mfg -like 'QEMU*' -or $model -like 'KVM*' -or $model -like 'QEMU*')                       { 'KVM/QEMU' }
+                               elseif ($mfg -like 'Xen*')                                                                          { 'Xen' }
+                               elseif ($mfg -like 'Parallels*')                                                                    { 'Parallels' }
+                               elseif ($mfg -eq '' -and $model -eq '')                                                             { 'Unknown' }
+                               else                                                                                                { 'Physical' }
 
             # Classify via the shared helper if Get-MpComputerStatus returned
             # the full toggle set. If any toggle is $null (Defender service
@@ -1475,6 +1522,18 @@ function Show-HostDetailsDialog {
     & $addKeyValue 'Online'          $(if ($HostData.Online) { 'Yes' } else { 'No' }) (& $boolColor ($HostData.Online.ToString()))
     & $addKeyValue 'Query duration'  ("{0}s" -f $HostData.QueryDuration)
 
+    # ---- System inventory (v0.0.18) ------------------------------------
+    # Type + Platform are the new grid columns; Manufacturer/Model/OS show
+    # the raw CIM values that drive the Platform classification so an
+    # operator can sanity-check (e.g. confirm a host classified as
+    # 'Physical' really has a Dell/HP/Lenovo manufacturer string).
+    & $addSectionHeader 'System'
+    & $addKeyValue 'Type'            $(if ($HostData.NodeType)     { $HostData.NodeType }     else { '-' })
+    & $addKeyValue 'Platform'        $(if ($HostData.Platform)     { $HostData.Platform }     else { '-' })
+    & $addKeyValue 'Operating system' $(if ($HostData.OSCaption)   { $HostData.OSCaption }    else { '-' })
+    & $addKeyValue 'Manufacturer'    $(if ($HostData.Manufacturer) { $HostData.Manufacturer } else { '-' })
+    & $addKeyValue 'Model'           $(if ($HostData.Model)        { $HostData.Model }        else { '-' })
+
     # ---- Health classification (with pill) -------------------------------
     & $addSectionHeader 'Health Classification'
     $pillRow = [System.Windows.Forms.TableLayoutPanel]::new()
@@ -1643,18 +1702,20 @@ $grid.RowTemplate.Height                      = 32
 # legible when the window is narrowed.
 $grid.AutoSizeColumnsMode = 'Fill'
 $colDefs = @(
-    @{ Name = 'Computer';          Weight = 14; Min = 110 }
+    @{ Name = 'Computer';          Weight = 13; Min = 110 }
     @{ Name = 'IPv4';              Weight =  9; Min =  95 }
-    @{ Name = 'Status';            Weight = 11; Min = 110 }
-    @{ Name = 'Installed Version'; Weight = 12; Min = 110 }
-    @{ Name = 'Available Version'; Weight = 12; Min = 110 }
-    @{ Name = 'Currency';          Weight =  9; Min =  85 }
-    @{ Name = 'RT Protection';     Weight = 10; Min =  90 }
-    @{ Name = 'AV Enabled';        Weight =  9; Min =  85 }
-    @{ Name = 'Last Quick Scan';   Weight = 14; Min = 130 }
-    @{ Name = 'Threats';           Weight =  6; Min =  60 }
-    @{ Name = 'Query Time';        Weight =  8; Min =  75 }
-    @{ Name = 'Error / Detail';    Weight = 22; Min = 180 }
+    @{ Name = 'Type';              Weight =  7; Min =  70 }   # v0.0.18: Workstation / Server / DC
+    @{ Name = 'Platform';          Weight =  8; Min =  80 }   # v0.0.18: VMware / Hyper-V / Physical / etc.
+    @{ Name = 'Status';            Weight = 10; Min = 110 }
+    @{ Name = 'Installed Version'; Weight = 11; Min = 110 }
+    @{ Name = 'Available Version'; Weight = 11; Min = 110 }
+    @{ Name = 'Currency';          Weight =  8; Min =  85 }
+    @{ Name = 'RT Protection';     Weight =  9; Min =  90 }
+    @{ Name = 'AV Enabled';        Weight =  8; Min =  85 }
+    @{ Name = 'Last Quick Scan';   Weight = 12; Min = 130 }
+    @{ Name = 'Threats';           Weight =  5; Min =  60 }
+    @{ Name = 'Query Time';        Weight =  7; Min =  75 }
+    @{ Name = 'Error / Detail';    Weight = 19; Min = 180 }
 )
 foreach ($cd in $colDefs) {
     $col              = [System.Windows.Forms.DataGridViewTextBoxColumn]::new()
@@ -1669,9 +1730,11 @@ foreach ($cd in $colDefs) {
 # Custom-paint the Status column as a rounded pill, matching the HTML report's .tag styling.
 $grid.add_CellPainting({
     param($src, $e)
-    # Status pill custom-paint lives in column index 2 (was 1 before the
-    # IPv4 column inserted itself between Computer and Status in v0.0.16).
-    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 2) { return }
+    # Status pill custom-paint lives in column index 4:
+    #   0 Computer | 1 IPv4 | 2 Type | 3 Platform | 4 Status
+    # Pre-v0.0.18: index 2 (Computer | IPv4 | Status).
+    # Pre-v0.0.16: index 1 (Computer | Status).
+    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 4) { return }
     $statusText = "$($e.Value)"
     if (-not $statusText) { return }
 
@@ -1893,6 +1956,8 @@ function Update-Grid {
         $idx = $grid.Rows.Add(
             $r.ComputerName,
             $r.IPv4Address,
+            $r.NodeType,
+            $r.Platform,
             $status,
             $r.SignatureVersion,
             $r.AvailableVersion,

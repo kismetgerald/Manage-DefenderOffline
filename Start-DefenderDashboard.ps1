@@ -1092,6 +1092,14 @@ function Get-DefenderStatus {
         ThreatList                = @()
         HealthStatus              = ''
         HealthReason              = ''
+        # System inventory surfaced as columns + modal section (v0.0.18 / ISSM
+        # demo feedback #1). NodeType from Win32_OperatingSystem ProductType;
+        # Platform from Win32_ComputerSystem Manufacturer + Model pattern match.
+        NodeType                  = 'Unknown'
+        Platform                  = 'Unknown'
+        OSCaption                 = ''
+        Manufacturer              = ''
+        Model                     = ''
         QueryDuration             = 0
         Error                     = ''
     }
@@ -1141,6 +1149,11 @@ function Get-DefenderStatus {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
+                # OS + ComputerSystem CIM for NodeType and Platform columns.
+                # Both classes are local on the target; ~50ms each.
+                $os = $null; $cs = $null
+                try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop } catch {}
+                try { $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop } catch {}
                 # Per-threat detail for the row-click modal. Get-MpThreat is
                 # the *catalog* of threat types ever seen — it doesn't reliably
                 # populate InitialDetectionTime / Resources for long-quarantined
@@ -1182,6 +1195,12 @@ function Get-DefenderStatus {
                     LastFullScan         = if ($mp) { $mp.FullScanStartTime }         else { $null }
                     ThreatCount          = $threats.Count
                     ThreatList           = $threats
+                    # ProductType: 1 = Workstation, 2 = Domain Controller,
+                    # 3 = Member Server. OSCaption is the friendly OS name.
+                    ProductType          = if ($os) { [int]$os.ProductType } else { 0 }
+                    OSCaption            = if ($os) { [string]$os.Caption } else { '' }
+                    Manufacturer         = if ($cs) { [string]$cs.Manufacturer } else { '' }
+                    Model                = if ($cs) { [string]$cs.Model } else { '' }
                 }
             }
 
@@ -1198,6 +1217,33 @@ function Get-DefenderStatus {
             $result.LastFullScan              = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
             $result.ThreatCount               = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
             $result.ThreatList                = @($data.ThreatList)
+
+            # Map raw CIM values to friendly column strings (v0.0.18).
+            #   ProductType: 1=Workstation, 2=DC, 3=Server (Microsoft definition).
+            #   Platform:    Manufacturer/Model pattern match against the common
+            #                hypervisor signatures. Anything unrecognised falls
+            #                back to 'Physical' — the actual manufacturer is
+            #                still surfaced in the modal's System section so
+            #                operators can verify.
+            $result.OSCaption    = $data.OSCaption
+            $result.Manufacturer = $data.Manufacturer
+            $result.Model        = $data.Model
+            $result.NodeType     = switch ([int]$data.ProductType) {
+                1       { 'Workstation' }
+                2       { 'DC' }
+                3       { 'Server' }
+                default { 'Unknown' }
+            }
+            $mfg   = "$($data.Manufacturer)".Trim()
+            $model = "$($data.Model)".Trim()
+            $result.Platform = if     ($mfg -like 'VMware*' -or $model -like 'VMware*')               { 'VMware' }
+                               elseif ($mfg -eq 'Microsoft Corporation' -and $model -eq 'Virtual Machine') { 'Hyper-V' }
+                               elseif ($mfg -eq 'innotek GmbH' -or $mfg -eq 'Oracle Corporation' -and $model -like '*VirtualBox*') { 'VirtualBox' }
+                               elseif ($mfg -like 'QEMU*' -or $model -like 'KVM*' -or $model -like 'QEMU*')                       { 'KVM/QEMU' }
+                               elseif ($mfg -like 'Xen*')                                                                          { 'Xen' }
+                               elseif ($mfg -like 'Parallels*')                                                                    { 'Parallels' }
+                               elseif ($mfg -eq '' -and $model -eq '')                                                             { 'Unknown' }
+                               else                                                                                                { 'Physical' }
 
             # Health classification — see lib/Get-DefenderHealthProbe.ps1.
             if ($null -ne $data.RealTimeProtection -and
@@ -1387,6 +1433,8 @@ function Build-DashboardHtml {
         "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`" data-degraded=`"$isDegraded`">
           <td$tip>$($r.ComputerName)</td>
           <td>$($r.IPv4Address)</td>
+          <td>$($r.NodeType)</td>
+          <td>$($r.Platform)</td>
           <td>$badge</td>
           <td>$($r.SignatureVersion)</td>
           <td>$($r.VersionStatus)</td>
@@ -1410,6 +1458,11 @@ function Build-DashboardHtml {
         [ordered]@{
             computerName              = $_.ComputerName
             ipv4Address               = $_.IPv4Address
+            nodeType                  = $_.NodeType
+            platform                  = $_.Platform
+            osCaption                 = $_.OSCaption
+            manufacturer              = $_.Manufacturer
+            model                     = $_.Model
             online                    = [bool]$_.Online
             defenderService           = $_.DefenderService
             signatureVersion          = $_.SignatureVersion
@@ -1740,14 +1793,16 @@ function Build-DashboardHtml {
       <thead><tr>
         <th onclick="sort(0)">Computer &#9651;</th>
         <th onclick="sort(1)">IPv4</th>
-        <th onclick="sort(2)">Status</th>
-        <th onclick="sort(3)">Installed Version</th>
-        <th onclick="sort(4)">Currency</th>
-        <th onclick="sort(5)">RT Protection</th>
-        <th onclick="sort(6)">AV Enabled</th>
-        <th onclick="sort(7)">Last Quick Scan</th>
-        <th onclick="sort(8)">Threats</th>
-        <th onclick="sort(9)">Query Time</th>
+        <th onclick="sort(2)">Type</th>
+        <th onclick="sort(3)">Platform</th>
+        <th onclick="sort(4)">Status</th>
+        <th onclick="sort(5)">Installed Version</th>
+        <th onclick="sort(6)">Currency</th>
+        <th onclick="sort(7)">RT Protection</th>
+        <th onclick="sort(8)">AV Enabled</th>
+        <th onclick="sort(9)">Last Quick Scan</th>
+        <th onclick="sort(10)">Threats</th>
+        <th onclick="sort(11)">Query Time</th>
       </tr></thead>
       <tbody>
         $($rows -join "`n        ")
@@ -1978,6 +2033,17 @@ function Build-DashboardHtml {
         +   kv('Online',         h.online ? 'Yes' : 'No', h.online ? 'bool-true' : 'bool-false')
         +   kv('Query duration', (h.queryDurationSec != null ? h.queryDurationSec + 's' : '—'))
         + '</div>'
+        // System inventory: NodeType + Platform are the new grid columns;
+        // Manufacturer/Model/OS show the raw CIM values that drive Platform
+        // classification so operators can sanity-check the mapping.
+        + '<h3>System</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Type',             (h.nodeType     || '—'))
+        +   kv('Platform',         (h.platform     || '—'))
+        +   kv('Operating system', (h.osCaption    || '—'))
+        +   kv('Manufacturer',     (h.manufacturer || '—'))
+        +   kv('Model',            (h.model        || '—'))
+        + '</div>'
         + '<h3>Health Classification</h3>'
         + '<div class="mdo-kv">'
         +   '<div class="k">Status :</div><div class="v">' + pill + '</div>'
@@ -2097,6 +2163,11 @@ function ConvertTo-DashboardJson {
             [ordered]@{
                 computerName              = $_.ComputerName
                 ipv4Address               = $_.IPv4Address
+                nodeType                  = $_.NodeType
+                platform                  = $_.Platform
+                osCaption                 = $_.OSCaption
+                manufacturer              = $_.Manufacturer
+                model                     = $_.Model
                 online                    = $_.Online
                 defenderService           = $_.DefenderService
                 signatureVersion          = $_.SignatureVersion
