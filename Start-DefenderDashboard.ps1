@@ -1603,8 +1603,11 @@ function Build-DashboardHtml {
     .mdo-kv { display: grid; grid-template-columns: 220px 1fr; gap: 4px 12px; font-size: .9em; }
     .mdo-kv .k { color: var(--text-muted); }
     .mdo-kv .v { color: var(--text-primary); word-break: break-word; }
-    .mdo-kv .v.bool-true  { color: #4ade80; font-weight: 600; }
-    .mdo-kv .v.bool-false { color: #f87171; font-weight: 600; }
+    /* Use the same green/red as the Healthy/ThreatsDetected status badge
+       backgrounds so the bool values feel like part of the same palette
+       instead of a separate, brighter accent layer. */
+    .mdo-kv .v.bool-true  { color: var(--c-online-bg);  font-weight: 600; }
+    .mdo-kv .v.bool-false { color: var(--c-threats-bg); font-weight: 600; }
     .mdo-threats {
       width: 100%; margin-top: 8px; border-collapse: collapse;
       background: var(--bg-page); border-radius: 6px; overflow: hidden;
@@ -1634,8 +1637,12 @@ function Build-DashboardHtml {
     .mdo-threats th { background: var(--th-bg); color: var(--th-text); }
     .mdo-threats tr:last-child td { border-bottom: none; }
     .mdo-modal .mdo-err {
+      /* Text uses --text-primary so it's readable on both themes; the red
+         border + tinted background carry the "this is an error/detail"
+         semantic. Previously the salmon-on-pink combo was unreadable in
+         light mode. */
       background: rgba(209,52,56,.15); border: 1px solid #d13438;
-      color: #fca5a5; padding: 10px 12px; border-radius: 6px; font-size: .9em;
+      color: var(--text-primary); padding: 10px 12px; border-radius: 6px; font-size: .9em;
     }
     .mdo-modal-footer {
       display: flex; justify-content: flex-end; margin-top: 20px;
