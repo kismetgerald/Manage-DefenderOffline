@@ -1455,22 +1455,26 @@ function Build-DashboardHtml {
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    /* Dark is the implicit base.  data-theme="light" overrides below. */
+    /* Dark is the implicit base.  data-theme="light" overrides below.
+       Palette: "Defender-blue dark" — deep near-black bg + electric blue
+       accent that ties visually to the Microsoft Defender brand. Replaces
+       the prior Catppuccin Mocha palette which read too soft/pastel for
+       a status dashboard. */
     :root {
-      --bg-page: #1e1e2e;
-      --bg-elev: #313244;
-      --bg-input: #45475a;
-      --bg-input-hover: #585b70;
+      --bg-page: #0d1117;
+      --bg-elev: #161b22;
+      --bg-input: #21262d;
+      --bg-input-hover: #30363d;
       --bg-row-hover: rgba(255,255,255,.04);
-      --text-primary: #cdd6f4;
-      --text-muted: #a6adc8;
-      --text-faint: #6c7086;
-      --accent: #cba6f7;
-      --link: #89b4fa;
-      --border: #45475a;
-      --border-strong: #585b70;
-      --th-bg: #45475a;
-      --th-text: #cba6f7;
+      --text-primary: #f0f6fc;
+      --text-muted: #8b949e;
+      --text-faint: #6e7681;
+      --accent: #3b9eff;
+      --link: #58a6ff;
+      --border: #30363d;
+      --border-strong: #484f58;
+      --th-bg: #1f6feb;
+      --th-text: #ffffff;
       /* Status colours — identical in both themes for visual continuity
          with the Forms GUI and HTML report. */
       --c-online-bg:   #107c10; --c-online-fg:   #ffffff;
@@ -1649,7 +1653,11 @@ function Build-DashboardHtml {
       padding-top: 14px; border-top: 1px solid var(--border);
     }
     .mdo-btn {
-      background: var(--accent); color: #1e1e2e; border: none;
+      /* White text matches the toolbar buttons (a.btn) and reads well on
+         both the dark-mode and light-mode accent colors. Previously this
+         used hardcoded #1e1e2e which was fine on Catppuccin mauve but
+         lost contrast on the brighter accent blues. */
+      background: var(--accent); color: #ffffff; border: none;
       padding: 8px 22px; border-radius: 6px; font-weight: 600;
       cursor: pointer; font-size: .95em;
     }
