@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.15'
+$ScriptVersion = '0.0.16'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -677,8 +677,11 @@ function Test-DashboardAuth {
         [string]$UsersFile
     )
 
-    # /health is always anonymous so external monitoring works in every mode
-    if ($Context.Request.Url.LocalPath -eq '/health') {
+    # /health is always anonymous so external monitoring works in every mode.
+    # Favicon paths are anonymous so the browser can fetch the tab icon
+    # without triggering a credential prompt or polluting the audit log.
+    $p = $Context.Request.Url.LocalPath
+    if ($p -in '/health', '/favicon.ico', '/favicon.svg') {
         return [pscustomobject]@{
             Authorized = $true; StatusCode = 200
             User = 'anonymous'; Reason = 'health-bypass'
@@ -1005,22 +1008,49 @@ function Resolve-TargetComputers {
 # ===================================================================
 function Get-LatestAvailableVersion {
     param([string]$Root)
-    if (-not $Root -or -not (Test-Path $Root -ErrorAction SilentlyContinue)) { return $null }
+    # Returns $null for any failure. Caller-side "no path configured"
+    # is silent — the caller checks $SourceSharePath separately so the
+    # message can include the parameter name. All other failures log
+    # with the distinguishing reason here so the operator doesn't have
+    # to guess between "path doesn't exist", "permission denied",
+    # "share unreachable", and "share OK but layout doesn't match".
+    if (-not $Root) { return $null }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Root -ErrorAction Stop)) {
+            Write-DashLog "Available version: SourceSharePath '$Root' is not reachable (path does not exist or service account lacks read access). Version currency check disabled." 'WARN'
+            return $null
+        }
+    } catch {
+        Write-DashLog "Available version: error accessing SourceSharePath '$Root' - $($_.Exception.Message). Version currency check disabled." 'ERROR'
+        return $null
+    }
+
     # Supports two layouts (v0.0.8 introduced the per-arch subfolder layout):
     #   Flat (legacy)   : <version>\mpam-fe.exe                  -> parent matches ^v\d+...
     #   Per-arch (new)  : <version>\<arch>\mpam-fe.exe           -> parent is x64/x86/arm64; grandparent is ^v\d+...
-    $versions = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
-        ForEach-Object {
-            $parent      = $_.Directory.Name
-            $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
-            if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
-            } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
+    try {
+        $versions = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction Stop |
+            Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
+            ForEach-Object {
+                $parent      = $_.Directory.Name
+                $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
+                if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                }
             }
-        }
-    return $versions | Sort-Object -Descending | Select-Object -First 1
+    } catch {
+        Write-DashLog "Available version: error enumerating SourceSharePath '$Root' - $($_.Exception.Message). Version currency check disabled." 'ERROR'
+        return $null
+    }
+
+    $latest = $versions | Sort-Object -Descending | Select-Object -First 1
+    if (-not $latest) {
+        Write-DashLog "Available version: SourceSharePath '$Root' contains no 'mpam-fe.exe' matching the expected '<YYYYMMDD>\v#.#.#.#\[arch\]\mpam-fe.exe' structure. Version currency check disabled." 'WARN'
+    }
+    return $latest
 }
 
 # ===================================================================
@@ -1038,6 +1068,7 @@ function Get-DefenderStatus {
 
     $result = [pscustomobject]@{
         ComputerName              = $Computer
+        IPv4Address               = ''
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
@@ -1062,22 +1093,32 @@ function Get-DefenderStatus {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        # Reachability check.  When DisableIPv6 is set (LAN default), resolve
-        # the hostname to IPv4 only and connect directly — avoids the ~21s
-        # TCP timeout that Test-NetConnection eats on IPv6 ULA addresses
+        # Resolve IPv4 once, up front, regardless of reachability strategy —
+        # the address surfaces in the dashboard row whether the host is
+        # online, offline, or DNS-known-but-unreachable. The DisableIPv6
+        # reachability path reuses this lookup to avoid a duplicate DNS hit.
+        $ipv4 = $null
+        try {
+            $ipv4 = [System.Net.Dns]::GetHostAddresses($Computer) |
+                Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+                Select-Object -First 1
+            if ($ipv4) { $result.IPv4Address = $ipv4.IPAddressToString }
+        } catch {}
+
+        # Reachability check.  When DisableIPv6 is set (LAN default), connect
+        # directly to the IPv4 we already resolved — avoids the ~21s TCP
+        # timeout that Test-NetConnection eats on IPv6 ULA addresses
         # advertised in DNS but not actually routed.
         $reachable = $false
         if ($DisableIPv6) {
-            try {
-                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
-                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
-                if ($addrs) {
+            if ($ipv4) {
+                try {
                     $client = [System.Net.Sockets.TcpClient]::new()
-                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $task   = $client.ConnectAsync($ipv4, 5985)
                     $reachable = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
                     try { $client.Close() } catch {}
-                }
-            } catch { $reachable = $false }
+                } catch { $reachable = $false }
+            }
         } else {
             $reachable = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
                 -InformationLevel Quiet -WarningAction SilentlyContinue)
@@ -1174,9 +1215,20 @@ function Get-DefenderStatus {
 
             if ($result.SignatureVersion -and $AvailableVersionStr) {
                 try {
-                    $result.VersionStatus = if ([version]$result.SignatureVersion -ge [version]$AvailableVersionStr) {
-                        'Current'
-                    } else { 'Outdated' }
+                    # Three-way compare so hosts that received defs from
+                    # another channel (cloud, manual, lingering MECM) — or
+                    # a stale share — surface as 'Ahead' instead of being
+                    # silently bucketed with 'Current'. Ahead is informational,
+                    # not an error; the detail string is written to .Error so
+                    # it shows in the GUI's Error/Detail column, the dashboard
+                    # hostname tooltip, and the Host Details modal.
+                    $cmp = ([version]$result.SignatureVersion).CompareTo([version]$AvailableVersionStr)
+                    if     ($cmp -lt 0) { $result.VersionStatus = 'Outdated' }
+                    elseif ($cmp -gt 0) {
+                        $result.VersionStatus = 'Ahead'
+                        $result.Error         = "Newer than share (available: v$AvailableVersionStr)"
+                    }
+                    else { $result.VersionStatus = 'Current' }
                 } catch { $result.VersionStatus = 'Unknown' }
             } elseif ($result.SignatureVersion) {
                 $result.VersionStatus = 'Unknown'
@@ -1279,7 +1331,18 @@ function Build-DashboardHtml {
     # reaches 0 — instead of the previous hardcoded $RefreshInterval
     # which could be wildly out of sync (page sat at 'Next refresh: 0s'
     # for up to 5 minutes before actually reloading).
-    $metaRefreshSecs = [math]::Max(5, $secsUntil + 5)
+    #
+    # When a refresh is in-flight (Force Refresh, or auto-refresh that
+    # kicked off a new collection), tighten the cadence to 5s so the
+    # banner clears promptly once the job finishes. Without this, Force
+    # Refresh clicked mid-cycle would leave the banner up for nearly the
+    # full RefreshInterval (since secsUntil is computed from CachedAt,
+    # which doesn't move until the refresh completes).
+    $metaRefreshSecs = if ($IsRefreshing) {
+        5
+    } else {
+        [math]::Max(5, $secsUntil + 5)
+    }
 
     $rows = foreach ($r in $Data | Sort-Object ComputerName) {
         # Same priority order as Show-DefenderStatus:
@@ -1311,6 +1374,7 @@ function Build-DashboardHtml {
         # per-host record in the embedded JSON blob and populate the modal.
         "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`">
           <td$tip>$($r.ComputerName)</td>
+          <td>$($r.IPv4Address)</td>
           <td>$badge</td>
           <td>$($r.SignatureVersion)</td>
           <td>$($r.VersionStatus)</td>
@@ -1333,6 +1397,7 @@ function Build-DashboardHtml {
     $hostJsonBlob = @($Data | Sort-Object ComputerName | ForEach-Object {
         [ordered]@{
             computerName              = $_.ComputerName
+            ipv4Address               = $_.IPv4Address
             online                    = [bool]$_.Online
             defenderService           = $_.DefenderService
             signatureVersion          = $_.SignatureVersion
@@ -1372,7 +1437,8 @@ function Build-DashboardHtml {
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="$metaRefreshSecs">
   <title>Microsoft Defender Antivirus &#8211; Fleet Status</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxNiAxNic+PHBhdGggZmlsbD0nIzAwNzhkNCcgZD0nTTggMUwyIDN2NWMwIDMuNSAyLjUgNi41IDYgNyAzLjUtLjUgNi0zLjUgNi03VjNMOCAxeicvPjwvc3ZnPg==">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="shortcut icon" href="/favicon.ico">
   <script>
     // Early-load: apply per-browser theme preference (if any) BEFORE the
     // stylesheet renders, so we never flash the server-side default and
@@ -1389,27 +1455,31 @@ function Build-DashboardHtml {
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    /* Dark is the implicit base.  data-theme="light" overrides below. */
+    /* Dark is the implicit base.  data-theme="light" overrides below.
+       Palette: "Defender-blue dark" — deep near-black bg + electric blue
+       accent that ties visually to the Microsoft Defender brand. Replaces
+       the prior Catppuccin Mocha palette which read too soft/pastel for
+       a status dashboard. */
     :root {
-      --bg-page: #1e1e2e;
-      --bg-elev: #313244;
-      --bg-input: #45475a;
-      --bg-input-hover: #585b70;
+      --bg-page: #0d1117;
+      --bg-elev: #161b22;
+      --bg-input: #21262d;
+      --bg-input-hover: #30363d;
       --bg-row-hover: rgba(255,255,255,.04);
-      --text-primary: #cdd6f4;
-      --text-muted: #a6adc8;
-      --text-faint: #6c7086;
-      --accent: #cba6f7;
-      --link: #89b4fa;
-      --border: #45475a;
-      --border-strong: #585b70;
-      --th-bg: #45475a;
-      --th-text: #cba6f7;
+      --text-primary: #f0f6fc;
+      --text-muted: #8b949e;
+      --text-faint: #6e7681;
+      --accent: #3b9eff;
+      --link: #58a6ff;
+      --border: #30363d;
+      --border-strong: #484f58;
+      --th-bg: #1f6feb;
+      --th-text: #ffffff;
       /* Status colours — identical in both themes for visual continuity
          with the Forms GUI and HTML report. */
       --c-online-bg:   #107c10; --c-online-fg:   #ffffff;
       --c-offline-bg:  #4b5563; --c-offline-fg:  #ffffff;
-      --c-outdated-bg: #fab387; --c-outdated-fg: #1e1e2e;
+      --c-outdated-bg: #f59e0b; --c-outdated-fg: #1e1e2e;
       --c-rtoff-bg:    #f9e2af; --c-rtoff-fg:    #1e1e2e;
       --c-degraded-bg: #b8860b; --c-degraded-fg: #ffffff;
       --c-threats-bg:  #d13438; --c-threats-fg:  #ffffff;
@@ -1463,6 +1533,13 @@ function Build-DashboardHtml {
     .st-offline { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
     .st-out     { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
     .st-rt      { background: var(--c-rtoff-bg);    color: var(--c-rtoff-fg); }
+
+    .legend { display: inline-flex; flex-wrap: wrap; gap: 14px; align-items: center;
+              margin-left: 10px; font-size: .78em; color: var(--text-muted); }
+    .legend .lgnd-label { font-weight: 600; color: var(--text-primary); }
+    .legend .lgnd-chip  { display: inline-flex; align-items: center; gap: 6px; }
+    .legend .lgnd-dot   { display: inline-block; width: 10px; height: 10px;
+                          border-radius: 50%; border: 1px solid rgba(0,0,0,0.08); }
 
     .toolbar { padding: 12px 28px; display: flex; align-items: center; gap: 10px; }
     .toolbar input { background: var(--bg-input); border: 1px solid var(--border-strong);
@@ -1530,8 +1607,11 @@ function Build-DashboardHtml {
     .mdo-kv { display: grid; grid-template-columns: 220px 1fr; gap: 4px 12px; font-size: .9em; }
     .mdo-kv .k { color: var(--text-muted); }
     .mdo-kv .v { color: var(--text-primary); word-break: break-word; }
-    .mdo-kv .v.bool-true  { color: #4ade80; font-weight: 600; }
-    .mdo-kv .v.bool-false { color: #f87171; font-weight: 600; }
+    /* Use the same green/red as the Healthy/ThreatsDetected status badge
+       backgrounds so the bool values feel like part of the same palette
+       instead of a separate, brighter accent layer. */
+    .mdo-kv .v.bool-true  { color: var(--c-online-bg);  font-weight: 600; }
+    .mdo-kv .v.bool-false { color: var(--c-threats-bg); font-weight: 600; }
     .mdo-threats {
       width: 100%; margin-top: 8px; border-collapse: collapse;
       background: var(--bg-page); border-radius: 6px; overflow: hidden;
@@ -1561,15 +1641,23 @@ function Build-DashboardHtml {
     .mdo-threats th { background: var(--th-bg); color: var(--th-text); }
     .mdo-threats tr:last-child td { border-bottom: none; }
     .mdo-modal .mdo-err {
+      /* Text uses --text-primary so it's readable on both themes; the red
+         border + tinted background carry the "this is an error/detail"
+         semantic. Previously the salmon-on-pink combo was unreadable in
+         light mode. */
       background: rgba(209,52,56,.15); border: 1px solid #d13438;
-      color: #fca5a5; padding: 10px 12px; border-radius: 6px; font-size: .9em;
+      color: var(--text-primary); padding: 10px 12px; border-radius: 6px; font-size: .9em;
     }
     .mdo-modal-footer {
       display: flex; justify-content: flex-end; margin-top: 20px;
       padding-top: 14px; border-top: 1px solid var(--border);
     }
     .mdo-btn {
-      background: var(--accent); color: #1e1e2e; border: none;
+      /* White text matches the toolbar buttons (a.btn) and reads well on
+         both the dark-mode and light-mode accent colors. Previously this
+         used hardcoded #1e1e2e which was fine on Catppuccin mauve but
+         lost contrast on the brighter accent blues. */
+      background: var(--accent); color: #ffffff; border: none;
       padding: 8px 22px; border-radius: 6px; font-weight: 600;
       cursor: pointer; font-size: .95em;
     }
@@ -1590,7 +1678,7 @@ function Build-DashboardHtml {
 </head>
 <body>
   <div class="topbar">
-    <h1>&#x1F6E1; Microsoft Defender Antivirus &#8211; Fleet Status</h1>
+    <h1><svg viewBox="0 0 24 24" width="0.9em" height="0.9em" style="vertical-align:-0.12em" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.6 8 11 4.6-1.4 8-6 8-11V5l-8-3z" fill="currentColor"/><path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg> Microsoft Defender Antivirus &#8211; Fleet Status</h1>
     <div class="meta">
       <div class="meta-text">
         Available: <strong>$(if ($AvailableVersionStr) { "v$AvailableVersionStr" } else { 'N/A' })</strong><br>
@@ -1618,6 +1706,14 @@ function Build-DashboardHtml {
   <div class="toolbar">
     <input type="text" id="filter" placeholder="Filter by computer name…" oninput="applyFilter()">
     <a href="/refresh" class="btn">&#x21BB; Refresh Now</a>
+    <span class="legend">
+      <span class="lgnd-label">Status:</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-online-bg)"></i>Healthy</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-outdated-bg)"></i>Outdated</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-threats-bg)"></i>ThreatsDetected</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-degraded-bg)"></i>Degraded</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-offline-bg)"></i>Offline</span>
+    </span>
     <a href="#" class="clear-filter" id="clearFilter"
        onclick="clearAllFilters(); return false;">Clear filters</a>
   </div>
@@ -1628,14 +1724,15 @@ function Build-DashboardHtml {
     <table id="tbl">
       <thead><tr>
         <th onclick="sort(0)">Computer &#9651;</th>
-        <th onclick="sort(1)">Status</th>
-        <th onclick="sort(2)">Installed Version</th>
-        <th onclick="sort(3)">Currency</th>
-        <th onclick="sort(4)">RT Protection</th>
-        <th onclick="sort(5)">AV Enabled</th>
-        <th onclick="sort(6)">Last Quick Scan</th>
-        <th onclick="sort(7)">Threats</th>
-        <th onclick="sort(8)">Query Time</th>
+        <th onclick="sort(1)">IPv4</th>
+        <th onclick="sort(2)">Status</th>
+        <th onclick="sort(3)">Installed Version</th>
+        <th onclick="sort(4)">Currency</th>
+        <th onclick="sort(5)">RT Protection</th>
+        <th onclick="sort(6)">AV Enabled</th>
+        <th onclick="sort(7)">Last Quick Scan</th>
+        <th onclick="sort(8)">Threats</th>
+        <th onclick="sort(9)">Query Time</th>
       </tr></thead>
       <tbody>
         $($rows -join "`n        ")
@@ -1820,6 +1917,7 @@ function Build-DashboardHtml {
         + '<h3>Identity</h3>'
         + '<div class="mdo-kv">'
         +   kv('Computer',       h.computerName)
+        +   kv('IPv4 address',   (h.ipv4Address || '—'))
         +   kv('Online',         h.online ? 'Yes' : 'No', h.online ? 'bool-true' : 'bool-false')
         +   kv('Query duration', (h.queryDurationSec != null ? h.queryDurationSec + 's' : '—'))
         + '</div>'
@@ -1904,6 +2002,7 @@ function ConvertTo-DashboardJson {
         computers        = @($Data | Sort-Object ComputerName | ForEach-Object {
             [ordered]@{
                 computerName              = $_.ComputerName
+                ipv4Address               = $_.IPv4Address
                 online                    = $_.Online
                 defenderService           = $_.DefenderService
                 signatureVersion          = $_.SignatureVersion
@@ -1932,6 +2031,16 @@ function ConvertTo-DashboardJson {
 # ===================================================================
 # HTTP Response Helper
 # ===================================================================
+# Defender shield favicon — embedded SVG so the dashboard tab shows the
+# project icon instead of the browser's default globe glyph. Single source
+# of truth: referenced by the request handler (for /favicon.ico and
+# /favicon.svg) and indirectly by the HTML head <link rel="icon"> tag.
+# Designed at 24x24 viewport; renders cleanly at any tab-favicon size.
+# Color is the same Fluent blue (#0078d4) used elsewhere in the UI.
+$script:FaviconSvg = @'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.4 9.6 8 11 4.6-1.4 8-6 8-11V5l-8-3z" fill="#0078d4"/><path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+'@
+
 function Send-HttpResponse {
     param(
         [System.Net.HttpListenerContext]$Context,
@@ -2002,6 +2111,7 @@ Write-DashLog "HTTPS           : $(if ($UseHttps) { "enabled (cert $CertificateT
 Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
+Write-DashLog "Source share    : $(if ($SourceSharePath) { $SourceSharePath } else { '(none configured)' })"
 Write-StartupPhase 'banner'
 
 # ===================================================================
@@ -2163,8 +2273,12 @@ $AvailableVersion    = Get-LatestAvailableVersion -Root $SourceSharePath
 $AvailableVersionStr = if ($AvailableVersion) { $AvailableVersion.ToString() } else { '' }
 if ($AvailableVersionStr) {
     Write-DashLog "Available version: v$AvailableVersionStr" 'SUCCESS'
-} else {
-    Write-DashLog 'No SourceSharePath provided; version currency check disabled.' 'WARN'
+} elseif (-not $SourceSharePath) {
+    # Only log the "no path configured" branch here. All other failure
+    # branches (path unreachable, permission denied, layout mismatch)
+    # log their distinct reason from inside Get-LatestAvailableVersion
+    # itself so the operator sees the actual cause.
+    Write-DashLog 'Available version: SourceSharePath is not configured in conf/config.conf; version currency check disabled.' 'WARN'
 }
 Write-StartupPhase 'available_version'
 
@@ -2224,8 +2338,11 @@ if ($AuthMethod -eq 'ADIntegrated') {
 using System.Net;
 public static class DashboardAuthSelector {
     public static AuthenticationSchemes Decide(HttpListenerRequest req) {
-        if (req != null && req.Url != null && req.Url.LocalPath == "/health") {
-            return AuthenticationSchemes.Anonymous;
+        if (req != null && req.Url != null) {
+            string path = req.Url.LocalPath;
+            if (path == "/health" || path == "/favicon.ico" || path == "/favicon.svg") {
+                return AuthenticationSchemes.Anonymous;
+            }
         }
         return AuthenticationSchemes.Negotiate;
     }
@@ -2496,10 +2613,11 @@ try {
         }
 
         # Successful auth for human-facing paths: log who accessed what, from
-        # where (NIST 800-53 AU-2 / STIG AC-7 auditable events). /health and
-        # /status are excluded because they're polled by monitors and dashboard
-        # auto-refresh, which would flood the log without adding audit value.
-        if ($path -notin '/health', '/status' -and $authResult.Reason -ne 'health-bypass') {
+        # where (NIST 800-53 AU-2 / STIG AC-7 auditable events). /health,
+        # /status and /favicon.* are excluded because they're polled by
+        # monitors / auto-refresh / browser tab-icon fetches, which would
+        # flood the log without adding audit value.
+        if ($path -notin '/health', '/status', '/favicon.ico', '/favicon.svg' -and $authResult.Reason -ne 'health-bypass') {
             Write-DashLog ("event=auth_allowed path={0} user='{1}' src={2} reason={3} method={4}" -f $path, $auditUser, $auditFrom, $authResult.Reason, $AuthMethod) 'INFO'
         }
 
@@ -2525,6 +2643,10 @@ try {
 
             '/health' {
                 Send-HttpResponse -Context $context -Body 'OK' -ContentType 'text/plain; charset=utf-8'
+            }
+
+            { $_ -in '/favicon.ico', '/favicon.svg' } {
+                Send-HttpResponse -Context $context -Body $script:FaviconSvg -ContentType 'image/svg+xml; charset=utf-8'
             }
 
             '/refresh' {

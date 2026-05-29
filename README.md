@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.15-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.16-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 > 👉 **New here?** Read [QUICKSTART.md](QUICKSTART.md) — dashboard running and reachable from a remote workstation in under 10 minutes.
 
@@ -699,7 +699,51 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.15 (2026-05-28) — Current
+### v0.0.16 (2026-05-29) — Current
+
+ISSM round-1 review polish. Two ISSMs reviewed v0.0.14 pre-demo and produced a 14-item list; items 5 and 6 shipped in v0.0.15. The remaining 12 items landed here, alongside several bugs surfaced during round-2 lab testing and four QUICKSTART gaps identified in 2026-05-28 work-lab live-fire.
+
+**Both UIs — visual + UX consistency (ISSM #7-#12):**
+- ✨ Stat-card order normalised across `Start-DefenderDashboard.ps1` and `Show-DefenderStatus.ps1`: ONLINE / OFFLINE / OUTDATED / RT PROT OFF. GUI previously rendered RT OFF / ONLINE / OFFLINE / OUTDATED — inconsistent visual scan for operators switching between the two.
+- ✨ Forms GUI filter TextBox now shows "Filter by computer name…" placeholder via Win32 EM_SETCUEBANNER, matching the dashboard's HTML placeholder.
+- ✨ OUTDATED stat card and badge switched to amber (`#f59e0b`) on both UIs.
+- ✨ Status colour legend now visible on both UIs (Healthy / Outdated / ThreatsDetected / Degraded / Offline chips).
+- ✨ Defender shield-with-check favicon served at `/favicon.svg` and `/favicon.ico` from the dashboard. Same shield rendered as a GDI+ bitmap for the GUI's title-bar form icon. Inline SVG of the same shape replaces the legacy emoji in the dashboard `<h1>`.
+- ✨ IPv4 column added to the host table on both UIs (after Computer, before Status). Reduces round-trip to the host-details modal for simple triage.
+
+**`Start-DefenderDashboard.ps1` — version-currency robustness (ISSM #17):**
+- 🐛 `Get-LatestAvailableVersion` collapsed three distinct failure modes ("path not set", "path unreachable", "permission denied") into a single null return with one generic warning. Cost a half hour of diagnostic in 2026-05-28 lab session to figure out a service-account permission issue. Now emits a distinct WARN/ERROR per branch (no path set, path unreachable, no `mpam-fe.exe` found, exception during enumeration).
+- ✨ Resolved `SourceSharePath` is logged in the startup banner so operators see at a glance which share the dashboard loaded.
+
+**`Start-DefenderDashboard.ps1` — Force Refresh banner persistence:**
+- 🐛 The "Refresh in progress…" banner is server-rendered HTML, so it only clears when the page reloads. The meta-refresh interval was computed from `CachedAt + RefreshInterval`, which doesn't advance until the refresh completes. Clicking Force Refresh mid-cycle scheduled the next reload up to `RefreshInterval` seconds away, leaving the banner stuck even though the server-side job finished in ~10 seconds. Auto-refresh wasn't affected because by the time it fires, `CachedAt` is already stale.
+- ✨ Meta-refresh interval now overrides to 5 seconds whenever `IsRefreshing = true`, regardless of where the countdown is. Banner clears within ~10-15 seconds of job completion.
+
+**Both UIs — Currency: distinguish `Ahead` from `Current`:**
+- ✨ Three-way version comparison replaces the previous `-ge` two-way bucket. Hosts whose installed signature version exceeds the share's available version now report as `Ahead` instead of being silently grouped with `Current`. Operationally useful signal: either the share is stale (distribution loop falling behind) or the host received defs from another channel (cloud-connected, manual update, lingering MECM client).
+- ✨ Ahead status surfaces a detail string (`Newer than share (available: vX.X.X.X)`) in: GUI Error/Detail column, GUI Host Details modal "Error / Detail" section, dashboard hostname tooltip, dashboard Host Details modal "Error / Detail" section. Status badge stays `Healthy` — Ahead is informational, not a problem state.
+
+**`Show-DefenderStatus.ps1` — Host Details modal Reason line:**
+- 🐛 Modal builder used bare `(if ...)` at one line instead of `$(if ...)` (subexpression). PowerShell parsed the parens as a grouping expression and tried to resolve `if` as a command, throwing "The term 'if' is not recognized" every time a host modal was opened. Modal still rendered (non-terminating error) but the Reason field was silently empty.
+
+**`Start-DefenderDashboard.ps1` — Host Details modal palette:**
+- ✨ Boolean values in the modal (Yes/No, True/False) now use the same colour as the matching status badge backgrounds (`var(--c-online-bg)` / `var(--c-threats-bg)`) instead of the prior brighter `#4ade80` / `#f87171`. Unified palette feels coherent next to the Healthy / ThreatsDetected pills.
+- 🐛 The "Error / Detail" box used salmon text (`#fca5a5`) on a pink-tinted background. Readable in dark mode, near-invisible in light mode (same colour family). Text now uses `var(--text-primary)` so it adapts per theme; the red border + pink fill still carry the "this is an error/detail" semantic.
+
+**`Start-DefenderDashboard.ps1` — dark theme switched to Defender-blue:**
+- ✨ Prior dark theme used the Catppuccin Mocha palette (soft mauve accent on warm gray bg). For a status dashboard the soft pastels read as low-contrast and "cozy" — operators wanted something crisper. Replaced with a GitHub-Dark-style base (`#0d1117` / `#161b22`) and an electric Defender-blue accent (`#3b9eff`) that ties visually to the Microsoft Defender brand. All text and border variables retuned for higher contrast. Status badge colours unchanged (those stay constant across themes by design).
+- 🐛 `.mdo-btn` text was hardcoded to `#1e1e2e`. Worked on the old mauve, lost contrast on the new blue. Now `#ffffff` to match the toolbar buttons.
+
+**`Show-DefenderStatus.ps1` — Host Details modal discoverability (ISSM #13):**
+- ✨ The modal already existed (right-click → "View Details…" context menu, plus CellDoubleClick handler) but neither entry was visible without trying. Right-aligned status-strip hint added: "Tip: Double-click a row (or right-click → View Details) to see full host detail." Closes the last open ISSM round-1 item.
+
+**`QUICKSTART.md` — four operational gaps from lab live-fire:**
+- 📝 Step 1: `Get-ChildItem -Recurse -File | Unblock-File` after `Expand-Archive`. STIG-hardened systems carry Mark-of-the-Web on every extracted file, blocking ExecutionPolicy even for tab completion.
+- 📝 Step 4: "Available: N/A" callout. After granting share permissions on the SMB server, the dashboard's in-flight SMB session keeps using the old ACL evaluation until it expires (~10 min) or the connection is recycled. Documents the dashboard-task restart that picks up the new grant immediately.
+- 📝 New Step 4½: SPN registration for cross-host ADIntegrated auth. Without `HTTP/<host>` SPN on the service account, Firefox/Edge fail in ways that don't reach the dashboard log. Covers `setspn -S` syntax, the duplicate-check rationale, and `klist purge` on clients.
+- 📝 Step 4½: service-account naming caveat. An account named `svc-defender-auditor` is not guaranteed to be in any "Auditors" group — verify actual membership with `Get-ADUser ... MemberOf` before troubleshooting share-permission issues.
+
+### v0.0.15 (2026-05-28)
 
 Hotfix release for a long-latent HTTPS bug surfaced during ISSM demo review.
 

@@ -39,14 +39,20 @@ Allow remote server management through WinRM`
 In an **elevated PowerShell 7** window on the dashboard host:
 
 ```powershell
-$Zip = "$env:TEMP\manage-defenderoffline-0.0.12.zip"
+$Zip = "$env:TEMP\manage-defenderoffline-0.0.16.zip"
 
 Invoke-WebRequest `
-    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.12/manage-defenderoffline-0.0.12.zip' `
+    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.16/manage-defenderoffline-0.0.16.zip' `
     -OutFile $Zip
 
 Expand-Archive -Path $Zip -DestinationPath 'C:\Tools' -Force
 Set-Location 'C:\Tools\manage-defenderoffline'
+
+# STIG-hardened systems: files extracted from a downloaded ZIP carry the
+# Mark-of-the-Web (Zone.Identifier) ADS. PowerShell ExecutionPolicy will
+# refuse to load them — even parameter tab-completion is blocked. Strip
+# the marker on the whole bundle before running any script.
+Get-ChildItem -Recurse -File | Unblock-File
 ```
 
 ---
@@ -145,6 +151,82 @@ Expected lines:
 
 Common errors are self-diagnosing — if you see `[ERROR] HTTPS pre-flight FAILED`
 or `[WARN] URL-ACL collision`, the log includes the exact `netsh` command to fix it.
+
+### "Available: N/A" in the dashboard banner
+
+If the dashboard loads but shows `Available: N/A` (or you don't see *Outdated*
+pills despite stale endpoints), the dashboard couldn't enumerate
+`SourceSharePath`. The log emits a distinct WARN/ERROR per cause: path not
+configured, path unreachable, no `mpam-fe.exe` found, or permission denied.
+
+For the permission case specifically: after granting share/dataset
+permissions on the SMB server (TrueNAS, Windows file server, NAS appliance),
+**restart the dashboard scheduled task** before retrying. SMB session caching
+means the dashboard's in-flight session keeps using the old ACL evaluation —
+the new grant won't take effect until the session expires (~10 min) or the
+connection is recycled.
+
+```powershell
+Stop-ScheduledTask  -TaskName DefenderDashboard
+Start-ScheduledTask -TaskName DefenderDashboard
+```
+
+---
+
+## Step 4½ — Register service-account SPNs (for cross-host access)
+
+**Skip this if you'll only browse the dashboard from the host that's running
+it** — loopback uses local authentication and doesn't need Kerberos.
+
+If you'll access the dashboard from a **different machine** with
+`AuthMethod = ADIntegrated`, the service account must own the `HTTP/<host>`
+Service Principal Name so the client can request a Kerberos service ticket.
+Without it, browsers fail in confusing ways that don't reach the dashboard
+log: Firefox returns 401 with no server entry, Edge prompts for credentials
+then shows a blank page, and the server log captures a cryptic
+`EndGetContext: successfully authenticated context` exception.
+
+Run from a Domain Admin (or any account delegated "Write servicePrincipalName"
+on the target service account):
+
+```powershell
+# Replace the hostnames + account with your values
+setspn -S HTTP/util01                 CONTOSO\svc-defender
+setspn -S HTTP/util01.contoso.local   CONTOSO\svc-defender
+```
+
+Use `-S` (not `-A`) — it checks for duplicates first. The computer account
+(`UTIL01$`) sometimes holds `HOST/UTIL01` which can collide.
+
+After registration, **purge cached tickets on each client** so the new SPN is
+picked up on the next request:
+
+```powershell
+klist purge
+```
+
+Verify the SPNs landed:
+
+```powershell
+setspn -L CONTOSO\svc-defender
+# Expected output includes:
+#   HTTP/util01
+#   HTTP/util01.contoso.local
+```
+
+### Service-account naming is not authoritative
+
+Don't assume a service account's *name* reflects its *actual* AD group
+membership. An account called `svc-defender-auditor` may not be in the
+"Auditors" group — and the groups it *is* in determine which share/dataset
+permissions actually apply. When troubleshooting unexplained access failures
+(share permissions, SourceSharePath reachability, group-based allow-lists),
+verify membership directly:
+
+```powershell
+Get-ADUser CONTOSO\svc-defender -Properties MemberOf |
+    Select-Object -ExpandProperty MemberOf
+```
 
 ---
 

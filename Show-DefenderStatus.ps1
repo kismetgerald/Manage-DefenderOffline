@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.15'
+$ScriptVersion = '0.0.16'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
@@ -360,22 +360,48 @@ You have four ways to proceed:
 # ===================================================================
 function Get-LatestAvailableVersion {
     param([string]$Root)
-    if (-not $Root -or -not (Test-Path $Root -ErrorAction SilentlyContinue)) { return $null }
+    # Returns $null for any failure. "No path configured" stays silent;
+    # the caller checks $SourceSharePath separately. All other failures
+    # log a distinguishing reason so the operator doesn't have to guess
+    # between "path doesn't exist", "permission denied", and "share OK
+    # but layout doesn't match".
+    if (-not $Root) { return $null }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Root -ErrorAction Stop)) {
+            Write-Host "Note: SourceSharePath '$Root' is not reachable (path does not exist or current account lacks read access). Version currency check disabled." -ForegroundColor Yellow
+            return $null
+        }
+    } catch {
+        Write-Host "Error: accessing SourceSharePath '$Root' failed - $($_.Exception.Message). Version currency check disabled." -ForegroundColor Red
+        return $null
+    }
+
     # Supports two layouts (v0.0.8 introduced the per-arch subfolder layout):
     #   Flat (legacy)   : <version>\mpam-fe.exe                  -> parent matches ^v\d+...
     #   Per-arch (new)  : <version>\<arch>\mpam-fe.exe           -> parent is x64/x86/arm64; grandparent is ^v\d+...
-    $versions = Get-ChildItem -Path $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
-        ForEach-Object {
-            $parent      = $_.Directory.Name
-            $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
-            if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
-            } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
-                [version]$Matches[1]
+    try {
+        $versions = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'mpam-fe.exe' -ErrorAction Stop |
+            Where-Object { $_.FullName -notmatch '(?i)[/\\]_?archive[/\\]' } |
+            ForEach-Object {
+                $parent      = $_.Directory.Name
+                $grandparent = if ($_.Directory.Parent) { $_.Directory.Parent.Name } else { '' }
+                if ($parent -match '^(?i)(x64|x86|arm64)$' -and $grandparent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                } elseif ($parent -match '^v(\d+\.\d+\.\d+\.\d+)$') {
+                    [version]$Matches[1]
+                }
             }
-        }
-    return $versions | Sort-Object -Descending | Select-Object -First 1
+    } catch {
+        Write-Host "Error: enumerating SourceSharePath '$Root' failed - $($_.Exception.Message). Version currency check disabled." -ForegroundColor Red
+        return $null
+    }
+
+    $latest = $versions | Sort-Object -Descending | Select-Object -First 1
+    if (-not $latest) {
+        Write-Host "Note: SourceSharePath '$Root' contains no 'mpam-fe.exe' matching the expected '<YYYYMMDD>\v#.#.#.#\[arch\]\mpam-fe.exe' structure. Version currency check disabled." -ForegroundColor Yellow
+    }
+    return $latest
 }
 
 # ===================================================================
@@ -455,6 +481,7 @@ function Get-DefenderStatus {
 
     $result = [pscustomobject]@{
         ComputerName              = $Computer
+        IPv4Address               = ''
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
@@ -479,22 +506,32 @@ function Get-DefenderStatus {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        # Reachability check.  When DisableIPv6 is set (LAN default), resolve
-        # the hostname to IPv4 only and connect directly — avoids the ~21s
-        # TCP timeout that Test-NetConnection eats on IPv6 ULA addresses
+        # Resolve IPv4 once, up front, regardless of reachability strategy —
+        # the address surfaces in the grid whether the host is online,
+        # offline, or DNS-known-but-unreachable. The DisableIPv6 reachability
+        # path reuses this lookup to avoid a duplicate DNS hit.
+        $ipv4 = $null
+        try {
+            $ipv4 = [System.Net.Dns]::GetHostAddresses($Computer) |
+                Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+                Select-Object -First 1
+            if ($ipv4) { $result.IPv4Address = $ipv4.IPAddressToString }
+        } catch {}
+
+        # Reachability check.  When DisableIPv6 is set (LAN default), connect
+        # directly to the IPv4 we already resolved — avoids the ~21s TCP
+        # timeout that Test-NetConnection eats on IPv6 ULA addresses
         # advertised in DNS but not actually routed.
         $reachable = $false
         if ($DisableIPv6) {
-            try {
-                $addrs = [System.Net.Dns]::GetHostAddresses($Computer) |
-                    Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
-                if ($addrs) {
+            if ($ipv4) {
+                try {
                     $client = [System.Net.Sockets.TcpClient]::new()
-                    $task   = $client.ConnectAsync($addrs[0], 5985)
+                    $task   = $client.ConnectAsync($ipv4, 5985)
                     $reachable = $task.Wait(3000) -and -not $task.IsFaulted -and $client.Connected
                     try { $client.Close() } catch {}
-                }
-            } catch { $reachable = $false }
+                } catch { $reachable = $false }
+            }
         } else {
             $reachable = [bool](Test-NetConnection -ComputerName $Computer -Port 5985 `
                 -InformationLevel Quiet -WarningAction SilentlyContinue)
@@ -594,9 +631,20 @@ function Get-DefenderStatus {
 
             if ($result.SignatureVersion -and $AvailableVersionStr) {
                 try {
-                    $result.VersionStatus = if ([version]$result.SignatureVersion -ge [version]$AvailableVersionStr) {
-                        'Current'
-                    } else { 'Outdated' }
+                    # Three-way compare so hosts that received defs from
+                    # another channel (cloud, manual, lingering MECM) — or
+                    # a stale share — surface as 'Ahead' instead of being
+                    # silently bucketed with 'Current'. Ahead is informational,
+                    # not an error; the detail string is written to .Error so
+                    # it shows in the GUI's Error/Detail column and the Host
+                    # Details modal's Error/Detail section.
+                    $cmp = ([version]$result.SignatureVersion).CompareTo([version]$AvailableVersionStr)
+                    if     ($cmp -lt 0) { $result.VersionStatus = 'Outdated' }
+                    elseif ($cmp -gt 0) {
+                        $result.VersionStatus = 'Ahead'
+                        $result.Error         = "Newer than share (available: v$AvailableVersionStr)"
+                    }
+                    else { $result.VersionStatus = 'Current' }
                 } catch { $result.VersionStatus = 'Unknown' }
             } elseif ($result.SignatureVersion) {
                 $result.VersionStatus = 'Unknown'
@@ -650,6 +698,7 @@ function ConvertTo-StatusHtml {
 
         "<tr>
           <td$tip>$($r.ComputerName)</td>
+          <td>$($r.IPv4Address)</td>
           <td><span class='tag $cls'>$status</span></td>
           <td>$($r.SignatureVersion)</td>
           <td>$($r.AvailableVersion)</td>
@@ -702,7 +751,7 @@ tr:nth-child(even) td { background: #f9f9f9; }
 </div>
 <table>
 <thead><tr>
-  <th>Computer</th><th>Status</th><th>Installed Version</th><th>Available Version</th>
+  <th>Computer</th><th>IPv4</th><th>Status</th><th>Installed Version</th><th>Available Version</th>
   <th>Currency</th><th>RT Protection</th><th>AV Enabled</th><th>Last Quick Scan</th>
   <th>Threats</th><th>Query Time</th>
 </tr></thead>
@@ -754,7 +803,10 @@ $AvailableVersionStr = if ($AvailableVersion) { $AvailableVersion.ToString() } e
 
 if ($AvailableVersionStr) {
     Write-Host "Latest available version: v$AvailableVersionStr" -ForegroundColor Cyan
-} else {
+} elseif (-not $SourceSharePath) {
+    # Only log the "no path configured" branch here. All other failure
+    # branches (path unreachable, permission denied, layout mismatch)
+    # log their distinct reason from inside Get-LatestAvailableVersion.
     Write-Host 'Note: No -SourceSharePath provided; version currency check disabled.' -ForegroundColor Yellow
 }
 
@@ -764,6 +816,25 @@ if ($AvailableVersionStr) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Win32 EM_SETCUEBANNER for placeholder ("hint") text on the filter
+# TextBox — Windows Forms doesn't expose a managed equivalent on the
+# .NET Framework runtime PowerShell uses. The cue draws when the
+# control is empty and unfocused; passes through normally on focus.
+if (-not ('CueBannerHelper' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CueBannerHelper {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, string lParam);
+    private const int EM_SETCUEBANNER = 0x1501;
+    public static void SetCue(IntPtr hWnd, string text) {
+        SendMessage(hWnd, EM_SETCUEBANNER, 0, text);
+    }
+}
+'@
+}
 
 #region Colour palette  (mirrors the HTML report exported by Export HTML)
 $clrPrimary       = [System.Drawing.Color]::FromArgb(0,   120, 212)  # #0078d4 Fluent blue
@@ -781,10 +852,52 @@ $clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 -
 $clrOutdatedPill  = [System.Drawing.Color]::FromArgb(156, 81,  0)    # #9c5100 - Outdated pill (HTML .skipped)
 $clrWarn          = [System.Drawing.Color]::FromArgb(184, 134, 11)   # #b8860b - Degraded pill (HTML .warn)
 $clrOffline       = [System.Drawing.Color]::FromArgb(75,  85,  99)   # #4b5563 - Offline (no comms — informational, not a critical signal)
-$clrOutdatedCard  = [System.Drawing.Color]::FromArgb(250, 179, 135)  # #fab387 - Outdated stat card (HTML .s3)
+$clrOutdatedCard  = [System.Drawing.Color]::FromArgb(245, 158, 11)   # #f59e0b - Outdated stat card (amber per ISSM round-1 feedback)
 $clrRtOffCard     = [System.Drawing.Color]::FromArgb(249, 226, 175)  # #f9e2af - RT Off stat card (HTML .s4)
 $clrWhite         = [System.Drawing.Color]::White
 #endregion
+
+# Defender shield-with-checkmark icon, rendered via GDI+ so we don't ship
+# a binary PNG/ICO file in the bundle. Shape mirrors the inline SVG used
+# by the dashboard's /favicon.svg endpoint; curves are approximated as
+# straight segments at icon size where the difference is invisible. Used
+# for both the in-form header PictureBox and the Windows title-bar Icon.
+function script:New-DefenderShieldBitmap {
+    param([int]$Size = 24)
+    $bmp = [System.Drawing.Bitmap]::new($Size, $Size)
+    $g   = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::Transparent)
+
+    $s = $Size / 24.0
+    $shieldPts = [System.Drawing.PointF[]]@(
+        [System.Drawing.PointF]::new(12 * $s,  2 * $s),
+        [System.Drawing.PointF]::new( 4 * $s,  5 * $s),
+        [System.Drawing.PointF]::new( 4 * $s, 11 * $s),
+        [System.Drawing.PointF]::new( 6 * $s, 17 * $s),
+        [System.Drawing.PointF]::new(12 * $s, 22 * $s),
+        [System.Drawing.PointF]::new(18 * $s, 17 * $s),
+        [System.Drawing.PointF]::new(20 * $s, 11 * $s),
+        [System.Drawing.PointF]::new(20 * $s,  5 * $s)
+    )
+    $shieldBrush = [System.Drawing.SolidBrush]::new($clrPrimary)
+    $g.FillPolygon($shieldBrush, $shieldPts)
+    $shieldBrush.Dispose()
+
+    $checkPen = [System.Drawing.Pen]::new([System.Drawing.Color]::White, [single](2.2 * $s))
+    $checkPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $checkPen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+    $checkPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+    $checkPts = [System.Drawing.PointF[]]@(
+        [System.Drawing.PointF]::new( 8.5 * $s, 12.0 * $s),
+        [System.Drawing.PointF]::new(11.0 * $s, 14.5 * $s),
+        [System.Drawing.PointF]::new(15.5 * $s,  9.5 * $s)
+    )
+    $g.DrawLines($checkPen, $checkPts)
+    $checkPen.Dispose()
+    $g.Dispose()
+    return $bmp
+}
 
 #region Form
 $form               = [System.Windows.Forms.Form]::new()
@@ -795,6 +908,15 @@ $form.StartPosition = 'CenterScreen'
 $form.BackColor     = $clrBackground
 $form.ForeColor     = $clrTextDark
 $form.Font          = [System.Drawing.Font]::new('Segoe UI', 9)
+
+# Windows title-bar icon. Render at 32x32 then convert via GetHicon —
+# Windows scales the result for taskbar / alt-tab / title bar as needed.
+try {
+    $iconBmp = New-DefenderShieldBitmap -Size 32
+    $hIcon   = $iconBmp.GetHicon()
+    $form.Icon = [System.Drawing.Icon]::FromHandle($hIcon)
+    $iconBmp.Dispose()
+} catch {}
 #endregion
 
 #region Header  (matches HTML <h1> with blue underline + status subline)
@@ -803,12 +925,21 @@ $pnlHeader.Dock      = 'Top'
 $pnlHeader.Height    = 84
 $pnlHeader.BackColor = $clrCardBg
 
+# Shield icon to the left of the title. Same shape as the dashboard's
+# /favicon.svg so the two UIs look like siblings rather than cousins.
+$picTitleIcon            = [System.Windows.Forms.PictureBox]::new()
+$picTitleIcon.Image      = New-DefenderShieldBitmap -Size 32
+$picTitleIcon.SizeMode   = 'Zoom'
+$picTitleIcon.Size       = [System.Drawing.Size]::new(32, 32)
+$picTitleIcon.Location   = [System.Drawing.Point]::new(20, 12)
+$picTitleIcon.BackColor  = $clrCardBg
+
 $lblTitle            = [System.Windows.Forms.Label]::new()
 $lblTitle.Text       = 'Microsoft Defender Antivirus – Fleet Status'
 $lblTitle.Font       = [System.Drawing.Font]::new('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor  = $clrPrimary
 $lblTitle.AutoSize   = $true
-$lblTitle.Location   = [System.Drawing.Point]::new(20, 14)
+$lblTitle.Location   = [System.Drawing.Point]::new(60, 14)
 
 $lblInfo             = [System.Windows.Forms.Label]::new()
 $lblInfo.Text        = if ($AvailableVersionStr) {
@@ -819,7 +950,7 @@ $lblInfo.Text        = if ($AvailableVersionStr) {
 $lblInfo.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
 $lblInfo.ForeColor   = $clrTextMuted
 $lblInfo.AutoSize    = $true
-$lblInfo.Location    = [System.Drawing.Point]::new(20, 50)
+$lblInfo.Location    = [System.Drawing.Point]::new(60, 50)
 
 # 3px blue accent line at the bottom (matches HTML h1 border-bottom)
 $pnlHeaderAccent           = [System.Windows.Forms.Panel]::new()
@@ -827,7 +958,7 @@ $pnlHeaderAccent.Dock      = 'Bottom'
 $pnlHeaderAccent.Height    = 3
 $pnlHeaderAccent.BackColor = $clrPrimary
 
-$pnlHeader.Controls.AddRange(@($lblTitle, $lblInfo, $pnlHeaderAccent))
+$pnlHeader.Controls.AddRange(@($picTitleIcon, $lblTitle, $lblInfo, $pnlHeaderAccent))
 #endregion
 
 #region Stat cards  (4 cards mirroring the HTML stats grid)
@@ -889,7 +1020,12 @@ $statRtOff    = New-StatCard 'RT OFF'   $clrRtOffCard    $clrTextDark
 # filter key ('Online' / 'Offline' / 'Outdated' / 'RTOff').  A Paint
 # handler draws a 3px primary-blue outline when the card is the
 # currently-selected filter.
-$cardMap = @{
+#
+# [ordered] is significant: the GUI paints the cards in the order this
+# dictionary enumerates its keys (see foreach below). An unordered
+# Hashtable would scramble the visual order, producing inconsistency
+# with the dashboard's stat-card layout.
+$cardMap = [ordered]@{
     'Online'   = $statOnline
     'Offline'  = $statOffline
     'Outdated' = $statOutdated
@@ -952,6 +1088,61 @@ foreach ($key in $cardMap.Keys) {
 #endregion
 
 #region Toolbar
+# Status color legend — a small row of colored chips below the stat cards
+# matching the dashboard's legend. Reuses the existing palette so the
+# colors track any future palette change without a second source of truth.
+$pnlLegend                = [System.Windows.Forms.FlowLayoutPanel]::new()
+$pnlLegend.Dock           = 'Top'
+$pnlLegend.AutoSize       = $true
+$pnlLegend.FlowDirection  = 'LeftToRight'
+$pnlLegend.WrapContents   = $false
+$pnlLegend.BackColor      = $clrBackground
+$pnlLegend.Padding        = [System.Windows.Forms.Padding]::new(20, 4, 16, 4)
+
+function script:Add-LegendChip {
+    param(
+        [System.Windows.Forms.FlowLayoutPanel]$Parent,
+        [string]$Label,
+        [System.Drawing.Color]$Color
+    )
+    $chip               = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $chip.AutoSize      = $true
+    $chip.FlowDirection = 'LeftToRight'
+    $chip.WrapContents  = $false
+    $chip.Margin        = [System.Windows.Forms.Padding]::new(0, 0, 14, 0)
+    $chip.Padding       = [System.Windows.Forms.Padding]::new(0)
+
+    $dot               = [System.Windows.Forms.Panel]::new()
+    $dot.Size          = [System.Drawing.Size]::new(10, 10)
+    $dot.BackColor     = $Color
+    $dot.Margin        = [System.Windows.Forms.Padding]::new(0, 5, 6, 0)
+    [void]$chip.Controls.Add($dot)
+
+    $txt               = [System.Windows.Forms.Label]::new()
+    $txt.Text          = $Label
+    $txt.AutoSize      = $true
+    $txt.ForeColor     = $clrTextMuted
+    $txt.Margin        = [System.Windows.Forms.Padding]::new(0, 1, 0, 0)
+    [void]$chip.Controls.Add($txt)
+
+    [void]$Parent.Controls.Add($chip)
+}
+
+$lblLegendTitle           = [System.Windows.Forms.Label]::new()
+$lblLegendTitle.Text      = 'Status:'
+$lblLegendTitle.AutoSize  = $true
+$lblLegendTitle.ForeColor = $clrTextDark
+$lblLegendTitle.Font      = [System.Drawing.Font]::new(
+    $lblLegendTitle.Font.FontFamily, $lblLegendTitle.Font.Size, [System.Drawing.FontStyle]::Bold)
+$lblLegendTitle.Margin    = [System.Windows.Forms.Padding]::new(0, 1, 12, 0)
+[void]$pnlLegend.Controls.Add($lblLegendTitle)
+
+Add-LegendChip -Parent $pnlLegend -Label 'Healthy'         -Color $clrSuccess
+Add-LegendChip -Parent $pnlLegend -Label 'Outdated'        -Color $clrOutdatedPill
+Add-LegendChip -Parent $pnlLegend -Label 'ThreatsDetected' -Color $clrError
+Add-LegendChip -Parent $pnlLegend -Label 'Degraded'        -Color $clrWarn
+Add-LegendChip -Parent $pnlLegend -Label 'Offline'         -Color $clrOffline
+
 $pnlToolbar           = [System.Windows.Forms.FlowLayoutPanel]::new()
 $pnlToolbar.Dock      = 'Top'
 $pnlToolbar.Height    = 46
@@ -993,6 +1184,14 @@ $txtFilter.Height      = 24
 $txtFilter.Margin      = [System.Windows.Forms.Padding]::new(2, 5, 0, 0)
 $txtFilter.BorderStyle = 'FixedSingle'
 
+# Set the placeholder ("hint") text once the Win32 handle exists. Wires
+# via HandleCreated rather than after-the-fact so the cue is in place
+# the first time the textbox renders, matching the dashboard's HTML
+# placeholder behaviour.
+$txtFilter.add_HandleCreated({
+    [CueBannerHelper]::SetCue($txtFilter.Handle, 'Filter by computer name…')
+})
+
 $chkAuto             = [System.Windows.Forms.CheckBox]::new()
 $chkAuto.Text        = 'Auto-refresh (5 min)'
 $chkAuto.AutoSize    = $true
@@ -1019,6 +1218,17 @@ $statusLabel            = [System.Windows.Forms.ToolStripStatusLabel]::new()
 $statusLabel.Text       = "Ready – $($TargetComputers.Count) computers loaded"
 $statusLabel.ForeColor  = $clrTextDark
 $statusStrip.Items.Add($statusLabel) | Out-Null
+
+# Right-aligned discoverability hint for the Host Details modal. The
+# modal is reachable via double-click or right-click → View Details,
+# but neither surface is visible without the user trying. Status-strip
+# hint is always on screen, costs no toolbar real estate, and matches
+# the precedent set by file-explorer-style "Tip:" affordances.
+$statusHint            = [System.Windows.Forms.ToolStripStatusLabel]::new()
+$statusHint.Text       = 'Tip: Double-click a row (or right-click → View Details) to see full host detail'
+$statusHint.ForeColor  = $clrTextMuted
+$statusHint.Alignment  = [System.Windows.Forms.ToolStripItemAlignment]::Right
+$statusStrip.Items.Add($statusHint) | Out-Null
 #endregion
 
 #region Host Details dialog  (right-click / double-click drill-in)
@@ -1114,6 +1324,7 @@ function Show-HostDetailsDialog {
     # ---- Identity --------------------------------------------------------
     & $addSectionHeader 'Identity'
     & $addKeyValue 'Computer'        $HostData.ComputerName
+    & $addKeyValue 'IPv4 address'    $(if ($HostData.IPv4Address) { $HostData.IPv4Address } else { '-' })
     & $addKeyValue 'Online'          $(if ($HostData.Online) { 'Yes' } else { 'No' }) (& $boolColor ($HostData.Online.ToString()))
     & $addKeyValue 'Query duration'  ("{0}s" -f $HostData.QueryDuration)
 
@@ -1139,7 +1350,7 @@ function Show-HostDetailsDialog {
     $pill.Padding   = [System.Windows.Forms.Padding]::new(10, 3, 10, 3)
     $pillRow.Controls.Add($pill, 1, 0)
     $stack.Controls.Add($pillRow)
-    & $addKeyValue 'Reason' (if ($HostData.HealthReason) { $HostData.HealthReason } else { '—' })
+    & $addKeyValue 'Reason' $(if ($HostData.HealthReason) { $HostData.HealthReason } else { '—' })
 
     # ---- Defender state --------------------------------------------------
     & $addSectionHeader 'Defender State'
@@ -1273,13 +1484,16 @@ $grid.AlternatingRowsDefaultCellStyle.BackColor = $clrRowAlt
 $grid.AlternatingRowsDefaultCellStyle.SelectionBackColor = $clrSelection
 $grid.RowTemplate.Height                      = 32
 
-# 11 columns matching the HTML report (Online dropped — Status pill covers it; Error / Detail kept as GUI extra).
+# 12 columns matching the HTML report (Online dropped — Status pill covers it; Error / Detail kept as GUI extra).
+# IPv4 sits between Computer and Status per ISSM feedback so operators can
+# triage by hostname or address without drilling into Host Details.
 # AutoSizeColumnsMode = Fill on the grid + per-column FillWeight makes every
 # column resize proportionally with the form, and MinimumWidth keeps content
 # legible when the window is narrowed.
 $grid.AutoSizeColumnsMode = 'Fill'
 $colDefs = @(
     @{ Name = 'Computer';          Weight = 14; Min = 110 }
+    @{ Name = 'IPv4';              Weight =  9; Min =  95 }
     @{ Name = 'Status';            Weight = 11; Min = 110 }
     @{ Name = 'Installed Version'; Weight = 12; Min = 110 }
     @{ Name = 'Available Version'; Weight = 12; Min = 110 }
@@ -1304,7 +1518,9 @@ foreach ($cd in $colDefs) {
 # Custom-paint the Status column as a rounded pill, matching the HTML report's .tag styling.
 $grid.add_CellPainting({
     param($src, $e)
-    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 1) { return }
+    # Status pill custom-paint lives in column index 2 (was 1 before the
+    # IPv4 column inserted itself between Computer and Status in v0.0.16).
+    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 2) { return }
     $statusText = "$($e.Value)"
     if (-not $statusText) { return }
 
@@ -1467,7 +1683,8 @@ $pnlOverlay.Controls.Add($pnlOverlayContent, 1, 1)
 $form.Controls.Add($grid)         # Dock=Fill (added first, behind the overlay)
 $form.Controls.Add($pnlOverlay)   # Dock=Fill (front of grid; hidden by default)
 $form.Controls.Add($pnlToolbar)   # Dock=Top — lowest of the top-docked
-$form.Controls.Add($pnlStats)     # Dock=Top — above the toolbar
+$form.Controls.Add($pnlLegend)    # Dock=Top — above the toolbar
+$form.Controls.Add($pnlStats)     # Dock=Top — above the legend
 $form.Controls.Add($pnlHeader)    # Dock=Top — very top
 $form.Controls.Add($statusStrip)  # Dock=Bottom
 
@@ -1514,6 +1731,7 @@ function Update-Grid {
 
         $idx = $grid.Rows.Add(
             $r.ComputerName,
+            $r.IPv4Address,
             $status,
             $r.SignatureVersion,
             $r.AvailableVersion,
