@@ -631,9 +631,20 @@ function Get-DefenderStatus {
 
             if ($result.SignatureVersion -and $AvailableVersionStr) {
                 try {
-                    $result.VersionStatus = if ([version]$result.SignatureVersion -ge [version]$AvailableVersionStr) {
-                        'Current'
-                    } else { 'Outdated' }
+                    # Three-way compare so hosts that received defs from
+                    # another channel (cloud, manual, lingering MECM) — or
+                    # a stale share — surface as 'Ahead' instead of being
+                    # silently bucketed with 'Current'. Ahead is informational,
+                    # not an error; the detail string is written to .Error so
+                    # it shows in the GUI's Error/Detail column and the Host
+                    # Details modal's Error/Detail section.
+                    $cmp = ([version]$result.SignatureVersion).CompareTo([version]$AvailableVersionStr)
+                    if     ($cmp -lt 0) { $result.VersionStatus = 'Outdated' }
+                    elseif ($cmp -gt 0) {
+                        $result.VersionStatus = 'Ahead'
+                        $result.Error         = "Newer than share (available: v$AvailableVersionStr)"
+                    }
+                    else { $result.VersionStatus = 'Current' }
                 } catch { $result.VersionStatus = 'Unknown' }
             } elseif ($result.SignatureVersion) {
                 $result.VersionStatus = 'Unknown'
