@@ -1320,7 +1320,18 @@ function Build-DashboardHtml {
     # reaches 0 — instead of the previous hardcoded $RefreshInterval
     # which could be wildly out of sync (page sat at 'Next refresh: 0s'
     # for up to 5 minutes before actually reloading).
-    $metaRefreshSecs = [math]::Max(5, $secsUntil + 5)
+    #
+    # When a refresh is in-flight (Force Refresh, or auto-refresh that
+    # kicked off a new collection), tighten the cadence to 5s so the
+    # banner clears promptly once the job finishes. Without this, Force
+    # Refresh clicked mid-cycle would leave the banner up for nearly the
+    # full RefreshInterval (since secsUntil is computed from CachedAt,
+    # which doesn't move until the refresh completes).
+    $metaRefreshSecs = if ($IsRefreshing) {
+        5
+    } else {
+        [math]::Max(5, $secsUntil + 5)
+    }
 
     $rows = foreach ($r in $Data | Sort-Object ComputerName) {
         # Same priority order as Show-DefenderStatus:
