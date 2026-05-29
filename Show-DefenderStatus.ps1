@@ -1339,7 +1339,7 @@ function Show-HostDetailsDialog {
     $pill.Padding   = [System.Windows.Forms.Padding]::new(10, 3, 10, 3)
     $pillRow.Controls.Add($pill, 1, 0)
     $stack.Controls.Add($pillRow)
-    & $addKeyValue 'Reason' (if ($HostData.HealthReason) { $HostData.HealthReason } else { '—' })
+    & $addKeyValue 'Reason' $(if ($HostData.HealthReason) { $HostData.HealthReason } else { '—' })
 
     # ---- Defender state --------------------------------------------------
     & $addSectionHeader 'Defender State'
