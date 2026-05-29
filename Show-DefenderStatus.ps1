@@ -873,6 +873,7 @@ if ($AvailableVersionStr) {
 # ===================================================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Drawing.Printing   # v0.0.18: PrintDocument + PrintPreviewDialog for the new Print toolbar button
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # Win32 EM_SETCUEBANNER for placeholder ("hint") text on the filter
@@ -1265,6 +1266,7 @@ function New-ToolButton ([string]$Text) {
 $btnRefresh     = New-ToolButton '⟳  Refresh Now'
 $btnExportCsv   = New-ToolButton '⬇  Export CSV'
 $btnExportHtml  = New-ToolButton '⬇  Export HTML'
+$btnPrint       = New-ToolButton '⎙  Print'
 
 $sep            = [System.Windows.Forms.Label]::new()
 $sep.Width      = 24
@@ -1304,7 +1306,7 @@ $lblCountdown.ForeColor  = $clrTextMuted
 $lblCountdown.Padding    = [System.Windows.Forms.Padding]::new(6, 9, 0, 0)
 $lblCountdown.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
 
-$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
+$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $btnPrint, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
 #endregion
 
 #region Status bar
@@ -1917,9 +1919,12 @@ $form.Controls.Add($statusStrip)  # Dock=Bottom
 $script:AllResults = $null
 $script:FilterText = ''
 
-function Update-Grid {
+# Apply the active name + card filters to $script:AllResults and return the
+# post-filter rows. Used by Update-Grid for live rendering and by
+# Invoke-FleetPrint (v0.0.18) so "print" matches "what's on screen".
+function Get-FilteredResults {
     $data = $script:AllResults
-    if (-not $data) { return }
+    if (-not $data) { return @() }
 
     $filter = $script:FilterText.Trim()
     if ($filter) { $data = @($data | Where-Object { $_.ComputerName -like "*$filter*" }) }
@@ -1945,6 +1950,12 @@ function Update-Grid {
             $keep
         })
     }
+    return $data
+}
+
+function Update-Grid {
+    if (-not $script:AllResults) { return }
+    $data = Get-FilteredResults
 
     $grid.SuspendLayout()
     $grid.Rows.Clear()
@@ -2187,6 +2198,210 @@ $chkAuto.add_CheckedChanged({
         $lblCountdown.Text = ''
         $autoTimer.Stop()
     }
+})
+
+# Print the current grid (post-filter) to a PrintPreviewDialog. Color
+# rendering matches the on-screen grid; the printer/driver dialog at
+# print time owns the color-vs-grayscale and orientation choice. v0.0.18
+# (demo feedback #2).
+function Invoke-FleetPrint {
+    param([object[]]$Rows)
+
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show($form,
+            'Nothing to print — the current filter has no matching hosts.',
+            'Print', 'OK', 'Information') | Out-Null
+        return
+    }
+
+    # Mutable counters carried across PrintPage events. Closure-scoped so a
+    # second print job after the first completes starts fresh.
+    $script:PrintRowIdx = 0
+    $script:PrintPgNum  = 0
+
+    $titleFont  = [System.Drawing.Font]::new('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+    $infoFont   = [System.Drawing.Font]::new('Segoe UI', 9)
+    $headerFont = [System.Drawing.Font]::new('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+    $rowFont    = [System.Drawing.Font]::new('Segoe UI', 7.5)
+    $footerFont = [System.Drawing.Font]::new('Segoe UI', 7)
+    $pillFont   = [System.Drawing.Font]::new('Segoe UI', 7, [System.Drawing.FontStyle]::Bold)
+
+    # Column layout — proportional weights against the page width. Error /
+    # Detail is included but trimmed with ellipsis when long. RT Prot / AV
+    # use compact labels to save horizontal space.
+    $printCols = @(
+        @{ Name='Computer';          Weight=12 }
+        @{ Name='IPv4';              Weight= 8 }
+        @{ Name='Type';              Weight= 6 }
+        @{ Name='Platform';          Weight= 7 }
+        @{ Name='Status';            Weight= 9 }
+        @{ Name='Installed Version'; Weight= 9 }
+        @{ Name='Definitions Date';  Weight= 8 }
+        @{ Name='Currency';          Weight= 7 }
+        @{ Name='RT Prot';           Weight= 5 }
+        @{ Name='AV';                Weight= 4 }
+        @{ Name='Last Quick Scan';   Weight=10 }
+        @{ Name='Threats';           Weight= 5 }
+        @{ Name='Error / Detail';    Weight=10 }
+    )
+    $totalWeight = ($printCols | Measure-Object Weight -Sum).Sum
+
+    $doc = [System.Drawing.Printing.PrintDocument]::new()
+    $doc.DocumentName = "Defender Fleet Status - $(Get-Date -Format 'yyyy-MM-dd HH-mm')"
+    $doc.DefaultPageSettings.Landscape = $true
+
+    $doc.add_PrintPage({
+        param($sender, $ev)
+        $script:PrintPgNum++
+        $g = $ev.Graphics
+        $mb = $ev.MarginBounds
+        $left   = [int]$mb.Left
+        $top    = [int]$mb.Top
+        $right  = [int]$mb.Right
+        $bottom = [int]$mb.Bottom
+        $width  = $right - $left
+
+        # Reserve ~30px at the bottom for the footer line.
+        $rowsBottom = $bottom - 22
+
+        $colW = $printCols | ForEach-Object {
+            [int]([math]::Floor($width * $_.Weight / $totalWeight))
+        }
+
+        $y = $top
+
+        # Header band — page 1 only. Carry-over pages get the table headers
+        # directly so the table is consistent top-of-page.
+        if ($script:PrintPgNum -eq 1) {
+            $g.DrawString('Microsoft Defender Antivirus – Fleet Status',
+                $titleFont, [System.Drawing.Brushes]::Black, [float]$left, [float]$y)
+            $y += 28
+
+            $hdrParts = @(
+                "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                if ($AvailableVersionStr) { "Available: v$AvailableVersionStr" } else { 'Available: N/A' }
+                "Hosts shown: $($Rows.Count)"
+            )
+            $g.DrawString(($hdrParts -join '   |   '),
+                $infoFont, [System.Drawing.Brushes]::Black, [float]$left, [float]$y)
+            $y += 20
+
+            $accentPen = [System.Drawing.Pen]::new($clrPrimary, 2)
+            $g.DrawLine($accentPen, $left, $y, $right, $y)
+            $accentPen.Dispose()
+            $y += 8
+        }
+
+        # Column header band
+        $hdrRowH = 18
+        $hdrBg = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(232, 232, 232))
+        $g.FillRectangle($hdrBg, $left, $y, $width, $hdrRowH)
+        $hdrBg.Dispose()
+        $sf = [System.Drawing.StringFormat]::new()
+        $sf.Trimming    = [System.Drawing.StringTrimming]::EllipsisCharacter
+        $sf.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+        $x = $left
+        for ($i = 0; $i -lt $printCols.Count; $i++) {
+            $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 3), [float]($colW[$i] - 6), [float]($hdrRowH - 4))
+            $g.DrawString($printCols[$i].Name, $headerFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
+            $x += $colW[$i]
+        }
+        $y += $hdrRowH
+        $borderPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(180, 180, 180))
+        $g.DrawLine($borderPen, $left, $y, $right, $y)
+
+        # Data rows
+        $dataRowH = 16
+        $reachedEnd = $false
+        while ($script:PrintRowIdx -lt $Rows.Count) {
+            if (($y + $dataRowH) -gt $rowsBottom) { break }
+
+            $r = $Rows[$script:PrintRowIdx]
+
+            # Status priority mirrors the grid:
+            $status = if (-not $r.Online) { 'Offline' }
+                      elseif ($r.VersionStatus -eq 'Outdated') { 'Outdated' }
+                      elseif ($r.HealthStatus) { $r.HealthStatus }
+                      elseif ($r.RealTimeProtection -eq 'False' -or $r.AntivirusEnabled -eq 'False') { 'Degraded' }
+                      else { 'Healthy' }
+
+            # Alternating row tint matches the grid.
+            if ($script:PrintRowIdx % 2 -eq 1) {
+                $altBg = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(249, 249, 249))
+                $g.FillRectangle($altBg, $left, $y, $width, $dataRowH)
+                $altBg.Dispose()
+            }
+
+            $vals = @(
+                $r.ComputerName, $r.IPv4Address, $r.NodeType, $r.Platform,
+                $status, $r.SignatureVersion, $r.SignatureLastUpdated,
+                $r.VersionStatus, $r.RealTimeProtection, $r.AntivirusEnabled,
+                $r.LastQuickScan, $r.ThreatCount, $r.Error
+            )
+
+            $x = $left
+            for ($i = 0; $i -lt $printCols.Count; $i++) {
+                if ($i -eq 4) {
+                    # Status pill — small rounded-ish badge with the status color.
+                    $pillBg = switch ($status) {
+                        'Healthy'         { $clrSuccess }
+                        'Offline'         { $clrOffline }
+                        'Outdated'        { $clrOutdatedPill }
+                        'Degraded'        { $clrWarn }
+                        'ThreatsDetected' { $clrError }
+                        default           { [System.Drawing.Color]::Gray }
+                    }
+                    $pillFg = if ($status -eq 'Outdated') { $clrTextDark } else { $clrWhite }
+                    $pillBgBrush = [System.Drawing.SolidBrush]::new($pillBg)
+                    $pillFgBrush = [System.Drawing.SolidBrush]::new($pillFg)
+                    $pillRect = [System.Drawing.Rectangle]::new($x + 4, $y + 2, $colW[$i] - 8, $dataRowH - 4)
+                    $g.FillRectangle($pillBgBrush, $pillRect)
+                    $textRect = [System.Drawing.RectangleF]::new([float]($x + 6), [float]($y + 3), [float]($colW[$i] - 12), [float]($dataRowH - 4))
+                    $g.DrawString("$status", $pillFont, $pillFgBrush, $textRect, $sf)
+                    $pillBgBrush.Dispose()
+                    $pillFgBrush.Dispose()
+                } else {
+                    $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 2), [float]($colW[$i] - 6), [float]($dataRowH - 2))
+                    $g.DrawString("$($vals[$i])", $rowFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
+                }
+                $x += $colW[$i]
+            }
+            $g.DrawLine($borderPen, $left, $y + $dataRowH, $right, $y + $dataRowH)
+            $y += $dataRowH
+            $script:PrintRowIdx++
+        }
+        if ($script:PrintRowIdx -ge $Rows.Count) { $reachedEnd = $true }
+        $borderPen.Dispose()
+
+        # Footer on every page
+        $footerText = "Page $($script:PrintPgNum)   |   Show-DefenderStatus.ps1 v$ScriptVersion   |   $(if ($SourceSharePath) { "Source: $SourceSharePath" } else { 'No source share configured' })"
+        $g.DrawString($footerText, $footerFont, [System.Drawing.Brushes]::Gray,
+            [float]$left, [float]($bottom + 4))
+
+        $ev.HasMorePages = -not $reachedEnd
+    })
+
+    try {
+        $preview = [System.Windows.Forms.PrintPreviewDialog]::new()
+        $preview.Document = $doc
+        $preview.WindowState = 'Maximized'
+        # Some Forms versions don't show the preview correctly without setting
+        # ShowIcon/UseAntiAlias; defaults are fine in modern .NET 6+.
+        [void]$preview.ShowDialog($form)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($form,
+            "Print preview failed: $($_.Exception.Message)",
+            'Print', 'OK', 'Error') | Out-Null
+    } finally {
+        if ($preview) { $preview.Dispose() }
+        $doc.Dispose()
+        $titleFont.Dispose(); $infoFont.Dispose(); $headerFont.Dispose()
+        $rowFont.Dispose();   $footerFont.Dispose(); $pillFont.Dispose()
+    }
+}
+
+$btnPrint.add_Click({
+    Invoke-FleetPrint -Rows (Get-FilteredResults)
 })
 
 $btnExportCsv.add_Click({
