@@ -1218,6 +1218,17 @@ $statusLabel            = [System.Windows.Forms.ToolStripStatusLabel]::new()
 $statusLabel.Text       = "Ready – $($TargetComputers.Count) computers loaded"
 $statusLabel.ForeColor  = $clrTextDark
 $statusStrip.Items.Add($statusLabel) | Out-Null
+
+# Right-aligned discoverability hint for the Host Details modal. The
+# modal is reachable via double-click or right-click → View Details,
+# but neither surface is visible without the user trying. Status-strip
+# hint is always on screen, costs no toolbar real estate, and matches
+# the precedent set by file-explorer-style "Tip:" affordances.
+$statusHint            = [System.Windows.Forms.ToolStripStatusLabel]::new()
+$statusHint.Text       = 'Tip: Double-click a row (or right-click → View Details) to see full host detail'
+$statusHint.ForeColor  = $clrTextMuted
+$statusHint.Alignment  = [System.Windows.Forms.ToolStripItemAlignment]::Right
+$statusStrip.Items.Add($statusHint) | Out-Null
 #endregion
 
 #region Host Details dialog  (right-click / double-click drill-in)
