@@ -1272,6 +1272,7 @@ function New-ToolButton ([string]$Text) {
 $btnRefresh     = New-ToolButton '⟳  Refresh Now'
 $btnExportCsv   = New-ToolButton '⬇  Export CSV'
 $btnExportHtml  = New-ToolButton '⬇  Export HTML'
+$btnPreview     = New-ToolButton '🔍  Print Preview'
 $btnPrint       = New-ToolButton '⎙  Print'
 
 $sep            = [System.Windows.Forms.Label]::new()
@@ -1312,7 +1313,7 @@ $lblCountdown.ForeColor  = $clrTextMuted
 $lblCountdown.Padding    = [System.Windows.Forms.Padding]::new(6, 9, 0, 0)
 $lblCountdown.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
 
-$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $btnPrint, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
+$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $btnPreview, $btnPrint, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
 #endregion
 
 #region Status bar
@@ -2206,12 +2207,17 @@ $chkAuto.add_CheckedChanged({
     }
 })
 
-# Print the current grid (post-filter) to a PrintPreviewDialog. Color
-# rendering matches the on-screen grid; the printer/driver dialog at
-# print time owns the color-vs-grayscale and orientation choice. v0.0.18
-# (demo feedback #2).
+# Render the current grid (post-filter) to either a PrintPreviewDialog or
+# direct-to-printer via PrintDialog, depending on which toolbar button
+# fired. Color rendering matches the on-screen grid; the printer/driver
+# at print time owns color-vs-grayscale and orientation choice. v0.0.18
+# (demo feedback #2, refined 2026-05-30).
 function Invoke-FleetPrint {
-    param([object[]]$Rows)
+    param(
+        [object[]]$Rows,
+        [ValidateSet('Preview','Print')]
+        [string]$Mode = 'Print'
+    )
 
     if (-not $Rows -or $Rows.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show($form,
@@ -2387,25 +2393,35 @@ function Invoke-FleetPrint {
         $ev.HasMorePages = -not $reachedEnd
     })
 
-    # Use the standard Windows PrintDialog (XP-era EX variant) so the
-    # operator sees the same printer-selection + orientation + copies +
-    # properties experience as any other Windows app — instead of the
-    # toolbar-and-preview PrintPreviewDialog this used through 0.0.18b
-    # (operator feedback 2026-05-30: "not a fan of the print control UI").
-    # Page range selection is intentionally disabled: the printable
-    # content is driven by the on-screen filter (WYSIWYG); operators
-    # who want a subset narrow the grid first.
+    # Two paths share the same rendered $doc:
+    #   Preview - PrintPreviewDialog, maximised window. Operator gets a
+    #             paginated visual check; preview's own toolbar has a
+    #             Print button that uses the default printer when clicked.
+    #   Print   - PrintDialog (XP-era EX variant). Standard Windows
+    #             printer-selection + Properties + Copies + orientation
+    #             experience; on OK, the job goes to the selected printer.
+    #
+    # Page-range selection is intentionally disabled on the Print path:
+    # the printable content is driven by the on-screen filter (WYSIWYG);
+    # operators who want a subset narrow the grid first.
     try {
-        $dlg = [System.Windows.Forms.PrintDialog]::new()
-        $dlg.Document         = $doc
-        $dlg.UseEXDialog      = $true
-        $dlg.AllowSomePages   = $false
-        $dlg.AllowSelection   = $false
-        $dlg.AllowCurrentPage = $false
-        $dlg.AllowPrintToFile = $true
-        if ($dlg.ShowDialog($form) -eq 'OK') {
-            $doc.Print()
-            $statusLabel.Text = "Print job sent to $($doc.PrinterSettings.PrinterName) ($($Rows.Count) hosts)"
+        if ($Mode -eq 'Preview') {
+            $dlg = [System.Windows.Forms.PrintPreviewDialog]::new()
+            $dlg.Document    = $doc
+            $dlg.WindowState = 'Maximized'
+            [void]$dlg.ShowDialog($form)
+        } else {
+            $dlg = [System.Windows.Forms.PrintDialog]::new()
+            $dlg.Document         = $doc
+            $dlg.UseEXDialog      = $true
+            $dlg.AllowSomePages   = $false
+            $dlg.AllowSelection   = $false
+            $dlg.AllowCurrentPage = $false
+            $dlg.AllowPrintToFile = $true
+            if ($dlg.ShowDialog($form) -eq 'OK') {
+                $doc.Print()
+                $statusLabel.Text = "Print job sent to $($doc.PrinterSettings.PrinterName) ($($Rows.Count) hosts)"
+            }
         }
     } catch {
         [System.Windows.Forms.MessageBox]::Show($form,
@@ -2419,8 +2435,12 @@ function Invoke-FleetPrint {
     }
 }
 
+$btnPreview.add_Click({
+    Invoke-FleetPrint -Rows (Get-FilteredResults) -Mode Preview
+})
+
 $btnPrint.add_Click({
-    Invoke-FleetPrint -Rows (Get-FilteredResults)
+    Invoke-FleetPrint -Rows (Get-FilteredResults) -Mode Print
 })
 
 $btnExportCsv.add_Click({
