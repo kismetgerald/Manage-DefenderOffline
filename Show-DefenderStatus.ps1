@@ -2387,19 +2387,32 @@ function Invoke-FleetPrint {
         $ev.HasMorePages = -not $reachedEnd
     })
 
+    # Use the standard Windows PrintDialog (XP-era EX variant) so the
+    # operator sees the same printer-selection + orientation + copies +
+    # properties experience as any other Windows app — instead of the
+    # toolbar-and-preview PrintPreviewDialog this used through 0.0.18b
+    # (operator feedback 2026-05-30: "not a fan of the print control UI").
+    # Page range selection is intentionally disabled: the printable
+    # content is driven by the on-screen filter (WYSIWYG); operators
+    # who want a subset narrow the grid first.
     try {
-        $preview = [System.Windows.Forms.PrintPreviewDialog]::new()
-        $preview.Document = $doc
-        $preview.WindowState = 'Maximized'
-        # Some Forms versions don't show the preview correctly without setting
-        # ShowIcon/UseAntiAlias; defaults are fine in modern .NET 6+.
-        [void]$preview.ShowDialog($form)
+        $dlg = [System.Windows.Forms.PrintDialog]::new()
+        $dlg.Document         = $doc
+        $dlg.UseEXDialog      = $true
+        $dlg.AllowSomePages   = $false
+        $dlg.AllowSelection   = $false
+        $dlg.AllowCurrentPage = $false
+        $dlg.AllowPrintToFile = $true
+        if ($dlg.ShowDialog($form) -eq 'OK') {
+            $doc.Print()
+            $statusLabel.Text = "Print job sent to $($doc.PrinterSettings.PrinterName) ($($Rows.Count) hosts)"
+        }
     } catch {
         [System.Windows.Forms.MessageBox]::Show($form,
-            "Print preview failed: $($_.Exception.Message)",
+            "Print failed: $($_.Exception.Message)",
             'Print', 'OK', 'Error') | Out-Null
     } finally {
-        if ($preview) { $preview.Dispose() }
+        if ($dlg) { $dlg.Dispose() }
         $doc.Dispose()
         $titleFont.Dispose(); $infoFont.Dispose(); $headerFont.Dispose()
         $rowFont.Dispose();   $footerFont.Dispose(); $pillFont.Dispose()
