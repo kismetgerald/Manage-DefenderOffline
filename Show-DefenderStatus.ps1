@@ -2394,9 +2394,13 @@ function Invoke-FleetPrint {
     })
 
     # Two paths share the same rendered $doc:
-    #   Preview - PrintPreviewDialog, maximised window. Operator gets a
-    #             paginated visual check; preview's own toolbar has a
-    #             Print button that uses the default printer when clicked.
+    #   Preview - render to a temp PDF via the 'Microsoft Print to PDF'
+    #             virtual printer, then open the PDF in the user's default
+    #             PDF viewer (Edge / Adobe / etc.). Modern, familiar
+    #             preview UI; users can save / search / share without a
+    #             re-render. Falls back to PrintPreviewDialog if the
+    #             Microsoft Print to PDF printer isn't installed (rare;
+    #             can be stripped on locked-down STIG images).
     #   Print   - PrintDialog (XP-era EX variant). Standard Windows
     #             printer-selection + Properties + Copies + orientation
     #             experience; on OK, the job goes to the selected printer.
@@ -2404,12 +2408,54 @@ function Invoke-FleetPrint {
     # Page-range selection is intentionally disabled on the Print path:
     # the printable content is driven by the on-screen filter (WYSIWYG);
     # operators who want a subset narrow the grid first.
+    $dlg = $null
     try {
         if ($Mode -eq 'Preview') {
-            $dlg = [System.Windows.Forms.PrintPreviewDialog]::new()
-            $dlg.Document    = $doc
-            $dlg.WindowState = 'Maximized'
-            [void]$dlg.ShowDialog($form)
+            $pdfPrinter = 'Microsoft Print to PDF'
+            $installed  = [System.Drawing.Printing.PrinterSettings]::InstalledPrinters
+            if ($installed -notcontains $pdfPrinter) {
+                # Graceful fallback. Hits the screen with the basic preview
+                # dialog so the operator still gets *something*; flag the
+                # gap so they can add the PDF printer if they want the
+                # modern UI back next time.
+                [System.Windows.Forms.MessageBox]::Show($form,
+                    "'$pdfPrinter' is not installed on this host, so the modern PDF-based preview is unavailable. Showing the basic preview dialog instead.`r`n`r`nTo restore the modern preview, install 'Microsoft Print to PDF' via Windows Features.",
+                    'Print Preview', 'OK', 'Information') | Out-Null
+                $dlg = [System.Windows.Forms.PrintPreviewDialog]::new()
+                $dlg.Document    = $doc
+                $dlg.WindowState = 'Maximized'
+                [void]$dlg.ShowDialog($form)
+            } else {
+                # Unique filename per click — operators may preview repeatedly
+                # while iterating on a filter, so don't collide if two clicks
+                # land in the same second. Milliseconds suffix covers it.
+                $tempPdf = Join-Path ([System.IO.Path]::GetTempPath()) `
+                    ("DefenderStatus_{0}.pdf" -f (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
+                $doc.PrinterSettings.PrinterName   = $pdfPrinter
+                $doc.PrinterSettings.PrintToFile   = $true
+                $doc.PrinterSettings.PrintFileName = $tempPdf
+                $statusLabel.Text = 'Generating PDF preview…'
+                [System.Windows.Forms.Application]::DoEvents()
+                $doc.Print()
+
+                # PrintDocument.Print() returns before the spool flushes to
+                # the file. Poll briefly for the file to appear (rare PDFs
+                # on large fleets take ~2s).
+                $waited = 0
+                while (-not (Test-Path $tempPdf -PathType Leaf) -and $waited -lt 50) {
+                    Start-Sleep -Milliseconds 100
+                    $waited++
+                }
+                if (Test-Path $tempPdf -PathType Leaf) {
+                    Start-Process $tempPdf
+                    $statusLabel.Text = "Preview opened ($($Rows.Count) hosts) — $tempPdf"
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show($form,
+                        "PDF preview generation timed out after 5 seconds. Try again, or use the Print button directly.",
+                        'Print Preview', 'OK', 'Warning') | Out-Null
+                    $statusLabel.Text = 'Preview generation timed out'
+                }
+            }
         } else {
             $dlg = [System.Windows.Forms.PrintDialog]::new()
             $dlg.Document         = $doc
