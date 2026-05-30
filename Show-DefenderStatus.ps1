@@ -873,7 +873,13 @@ if ($AvailableVersionStr) {
 # ===================================================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Drawing.Printing   # v0.0.18: PrintDocument + PrintPreviewDialog for the new Print toolbar button
+# Note: System.Drawing.Printing.PrintDocument (used by Invoke-FleetPrint,
+# v0.0.18 toolbar Print button) lives inside the System.Drawing assembly
+# already loaded above — System.Drawing.dll on PS 5.1 (.NET Framework) and
+# System.Drawing.Common.dll on PS 7+ (.NET 5+). A standalone
+# `System.Drawing.Printing.dll` does not exist on either runtime, so do
+# NOT add `-AssemblyName System.Drawing.Printing` here — it fails with a
+# "cannot find path" error before the Forms event loop ever starts.
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # Win32 EM_SETCUEBANNER for placeholder ("hint") text on the filter
