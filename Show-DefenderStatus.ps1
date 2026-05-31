@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.17'
+$ScriptVersion = '0.0.18'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
@@ -224,6 +224,11 @@ if (-not $PSBoundParameters.ContainsKey('ClassificationMethod')    -and $cfg['Cl
 if (-not $PSBoundParameters.ContainsKey('WorkstationPattern')      -and $cfg['WorkstationPattern'])      { $WorkstationPattern      = $cfg['WorkstationPattern'] }
 if (-not $PSBoundParameters.ContainsKey('DomainControllerPattern') -and $cfg['DomainControllerPattern']) { $DomainControllerPattern = $cfg['DomainControllerPattern'] }
 if (-not $PSBoundParameters.ContainsKey('DisableIPv6')              -and $cfg['DisableIPv6'])              { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
+
+# Issue-tracker URL surfaced by the GUI's "Report an Issue" header link.
+# Override via [Common] IssuesUrl in conf/config.conf (e.g. for a GHE
+# instance or internal tracker); otherwise use the public GitHub URL.
+$script:IssuesUrl = if ($cfg['IssuesUrl']) { $cfg['IssuesUrl'].Trim() } else { 'https://github.com/kismetgerald/Manage-DefenderOffline/issues' }
 
 $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
@@ -485,6 +490,10 @@ function Get-DefenderStatus {
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
+        # Per-host signature publication date — populated from
+        # Get-MpComputerStatus.AntivirusSignatureLastUpdated. Displayed as
+        # 'yyyy-MM-dd' in the new GUI column + dashboard column (v0.0.18).
+        SignatureLastUpdated      = ''
         AvailableVersion          = $AvailableVersionStr
         VersionStatus             = 'Unknown'
         RealTimeProtection        = 'Unknown'
@@ -500,6 +509,15 @@ function Get-DefenderStatus {
         ThreatList                = @()
         HealthStatus              = ''
         HealthReason              = ''
+        # System inventory surfaced as columns + modal section (v0.0.18 / ISSM
+        # demo feedback #1). NodeType derives from Win32_OperatingSystem
+        # ProductType; Platform from Win32_ComputerSystem Manufacturer + Model
+        # pattern match.
+        NodeType                  = 'Unknown'
+        Platform                  = 'Unknown'
+        OSCaption                 = ''
+        Manufacturer              = ''
+        Model                     = ''
         QueryDuration             = 0
         Error                     = ''
     }
@@ -549,6 +567,11 @@ function Get-DefenderStatus {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
+                # OS + ComputerSystem CIM for NodeType and Platform columns.
+                # Both classes are local on the target; ~50ms each.
+                $os = $null; $cs = $null
+                try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop } catch {}
+                try { $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop } catch {}
                 # Per-threat detail for the Host Details dialog. Get-MpThreat
                 # is the catalog of threat types ever seen — it doesn't reliably
                 # populate InitialDetectionTime / Resources for long-quarantined
@@ -580,6 +603,7 @@ function Get-DefenderStatus {
                     # render 'Running' rather than the deserialized object form.
                     SvcStatus            = if ($svc) { [string]$svc.Status } else { 'NotFound' }
                     SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }   else { $null }
+                    SignatureLastUpdated = if ($mp) { $mp.AntivirusSignatureLastUpdated } else { $null }
                     RealTimeProtection   = if ($mp) { $mp.RealTimeProtectionEnabled }  else { $null }
                     AMServiceEnabled     = if ($mp) { $mp.AMServiceEnabled }            else { $null }
                     AntivirusEnabled     = if ($mp) { $mp.AntivirusEnabled }            else { $null }
@@ -590,12 +614,19 @@ function Get-DefenderStatus {
                     LastFullScan         = if ($mp) { $mp.FullScanStartTime }           else { $null }
                     ThreatCount          = $threats.Count
                     ThreatList           = $threats
+                    # ProductType: 1 = Workstation, 2 = Domain Controller,
+                    # 3 = Member Server. OSCaption is the friendly OS name.
+                    ProductType          = if ($os) { [int]$os.ProductType } else { 0 }
+                    OSCaption            = if ($os) { [string]$os.Caption } else { '' }
+                    Manufacturer         = if ($cs) { [string]$cs.Manufacturer } else { '' }
+                    Model                = if ($cs) { [string]$cs.Model } else { '' }
                 }
             }
 
             $result.Online                    = $true
             $result.DefenderService           = $data.SvcStatus
             $result.SignatureVersion          = $data.SignatureVersion
+            $result.SignatureLastUpdated      = if ($data.SignatureLastUpdated) { $data.SignatureLastUpdated.ToString('yyyy-MM-dd') } else { '' }
             $result.RealTimeProtection        = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
             $result.AntivirusEnabled          = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
             $result.AmServiceEnabled          = if ($null -ne $data.AMServiceEnabled)   { $data.AMServiceEnabled.ToString() }   else { 'Unknown' }
@@ -606,6 +637,33 @@ function Get-DefenderStatus {
             $result.LastFullScan              = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
             $result.ThreatCount               = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
             $result.ThreatList                = @($data.ThreatList)
+
+            # Map raw CIM values to friendly column strings (v0.0.18).
+            #   ProductType: 1=Workstation, 2=DC, 3=Server (Microsoft definition).
+            #   Platform:    Manufacturer/Model pattern match against the common
+            #                hypervisor signatures. Anything unrecognised falls
+            #                back to 'Physical' — the actual manufacturer is
+            #                still surfaced in the modal's System section so
+            #                operators can verify.
+            $result.OSCaption    = $data.OSCaption
+            $result.Manufacturer = $data.Manufacturer
+            $result.Model        = $data.Model
+            $result.NodeType     = switch ([int]$data.ProductType) {
+                1       { 'Workstation' }
+                2       { 'DC' }
+                3       { 'Server' }
+                default { 'Unknown' }
+            }
+            $mfg   = "$($data.Manufacturer)".Trim()
+            $model = "$($data.Model)".Trim()
+            $result.Platform = if     ($mfg -like 'VMware*' -or $model -like 'VMware*')               { 'VMware' }
+                               elseif ($mfg -eq 'Microsoft Corporation' -and $model -eq 'Virtual Machine') { 'Hyper-V' }
+                               elseif ($mfg -eq 'innotek GmbH' -or $mfg -eq 'Oracle Corporation' -and $model -like '*VirtualBox*') { 'VirtualBox' }
+                               elseif ($mfg -like 'QEMU*' -or $model -like 'KVM*' -or $model -like 'QEMU*')                       { 'KVM/QEMU' }
+                               elseif ($mfg -like 'Xen*')                                                                          { 'Xen' }
+                               elseif ($mfg -like 'Parallels*')                                                                    { 'Parallels' }
+                               elseif ($mfg -eq '' -and $model -eq '')                                                             { 'Unknown' }
+                               else                                                                                                { 'Physical' }
 
             # Classify via the shared helper if Get-MpComputerStatus returned
             # the full toggle set. If any toggle is $null (Defender service
@@ -815,6 +873,13 @@ if ($AvailableVersionStr) {
 # ===================================================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# Note: System.Drawing.Printing.PrintDocument (used by Invoke-FleetPrint,
+# v0.0.18 toolbar Print button) lives inside the System.Drawing assembly
+# already loaded above — System.Drawing.dll on PS 5.1 (.NET Framework) and
+# System.Drawing.Common.dll on PS 7+ (.NET 5+). A standalone
+# `System.Drawing.Printing.dll` does not exist on either runtime, so do
+# NOT add `-AssemblyName System.Drawing.Printing` here — it fails with a
+# "cannot find path" error before the Forms event loop ever starts.
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # Win32 EM_SETCUEBANNER for placeholder ("hint") text on the filter
@@ -849,7 +914,7 @@ $clrSelection     = [System.Drawing.Color]::FromArgb(220, 233, 248)  # selection
 # Status colours (match HTML .tag classes and stat cards)
 $clrSuccess       = [System.Drawing.Color]::FromArgb(16,  124, 16)   # #107c10 - Healthy/Online
 $clrError         = [System.Drawing.Color]::FromArgb(209, 52,  56)   # #d13438 - ThreatsDetected (critical — Defender flagged threats on this host)
-$clrOutdatedPill  = [System.Drawing.Color]::FromArgb(156, 81,  0)    # #9c5100 - Outdated pill (HTML .skipped)
+$clrOutdatedPill  = [System.Drawing.Color]::FromArgb(245, 158, 11)   # #f59e0b - Outdated pill (matches dashboard --c-outdated-bg + stat card; pre-v0.0.18 was #9c5100 / white text — re-aligned for dashboard parity per first-demo feedback)
 $clrWarn          = [System.Drawing.Color]::FromArgb(184, 134, 11)   # #b8860b - Degraded pill (HTML .warn)
 $clrOffline       = [System.Drawing.Color]::FromArgb(75,  85,  99)   # #4b5563 - Offline (no comms — informational, not a critical signal)
 $clrOutdatedCard  = [System.Drawing.Color]::FromArgb(245, 158, 11)   # #f59e0b - Outdated stat card (amber per ISSM round-1 feedback)
@@ -952,25 +1017,50 @@ $lblInfo.ForeColor   = $clrTextMuted
 $lblInfo.AutoSize    = $true
 $lblInfo.Location    = [System.Drawing.Point]::new(60, 50)
 
+# "Report an Issue" link in the top-right of the header. Operators on this
+# air-gapped network need an obvious way to file feedback; click opens a
+# dialog with the URL ready to copy + instructions for taking it to an
+# internet-connected PC. Anchored Top+Right so it stays put on resize.
+$lnkIssues             = [System.Windows.Forms.LinkLabel]::new()
+$lnkIssues.Text        = 'Report an Issue / Feedback'
+$lnkIssues.AutoSize    = $true
+$lnkIssues.Font        = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$lnkIssues.LinkColor   = $clrPrimary
+$lnkIssues.ActiveLinkColor = $clrPrimary
+$lnkIssues.LinkBehavior = 'HoverUnderline'
+$lnkIssues.Cursor      = [System.Windows.Forms.Cursors]::Hand
+# Right-align: position at the panel's right edge minus its own width, and
+# re-position on resize so it tracks the right edge of the form.
+$lnkIssues.Anchor      = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+$lnkIssues.add_LinkClicked({ Show-IssuesFeedbackDialog -Url $script:IssuesUrl })
+
 # 3px blue accent line at the bottom (matches HTML h1 border-bottom)
 $pnlHeaderAccent           = [System.Windows.Forms.Panel]::new()
 $pnlHeaderAccent.Dock      = 'Bottom'
 $pnlHeaderAccent.Height    = 3
 $pnlHeaderAccent.BackColor = $clrPrimary
 
-$pnlHeader.Controls.AddRange(@($picTitleIcon, $lblTitle, $lblInfo, $pnlHeaderAccent))
+$pnlHeader.Controls.AddRange(@($picTitleIcon, $lblTitle, $lblInfo, $lnkIssues, $pnlHeaderAccent))
+# Position the link after AddRange so the panel's width is known. Re-runs on
+# header resize via the Layout event so the link stays right-aligned.
+$placeIssuesLink = {
+    $lnkIssues.Location = [System.Drawing.Point]::new(
+        $pnlHeader.Width - $lnkIssues.Width - 20, 32)
+}
+& $placeIssuesLink
+$pnlHeader.add_Resize($placeIssuesLink)
 #endregion
 
 #region Stat cards  (4 cards mirroring the HTML stats grid)
 $pnlStats              = [System.Windows.Forms.TableLayoutPanel]::new()
 $pnlStats.Dock         = 'Top'
 $pnlStats.Height       = 96
-$pnlStats.ColumnCount  = 4
+$pnlStats.ColumnCount  = 5
 $pnlStats.RowCount     = 1
 $pnlStats.BackColor    = $clrBackground
 $pnlStats.Padding      = [System.Windows.Forms.Padding]::new(16, 10, 16, 8)
-for ($c = 0; $c -lt 4; $c++) {
-    $pnlStats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 25)) | Out-Null
+for ($c = 0; $c -lt 5; $c++) {
+    $pnlStats.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent', 20)) | Out-Null
 }
 
 function New-StatCard ([string]$Label, [System.Drawing.Color]$Bg, [System.Drawing.Color]$Fg) {
@@ -1014,6 +1104,7 @@ $statOnline   = New-StatCard 'ONLINE'   $clrSuccess      $clrWhite
 $statOffline  = New-StatCard 'OFFLINE'  $clrOffline      $clrWhite
 $statOutdated = New-StatCard 'OUTDATED' $clrOutdatedCard $clrTextDark
 $statRtOff    = New-StatCard 'RT OFF'   $clrRtOffCard    $clrTextDark
+$statDegraded = New-StatCard 'DEGRADED' $clrWarn         $clrWhite
 
 # Make each card clickable so it acts as a quick filter (matches the
 # HTML report's clickable stat badges).  The card's Tag stores the
@@ -1030,6 +1121,7 @@ $cardMap = [ordered]@{
     'Offline'  = $statOffline
     'Outdated' = $statOutdated
     'RTOff'    = $statRtOff
+    'Degraded' = $statDegraded
 }
 # Multi-select card filter. Multiple cards combine with AND on Update-Grid.
 # Online/Offline are mutually exclusive (a host is one or the other) so
@@ -1177,9 +1269,12 @@ function New-ToolButton ([string]$Text) {
     return $b
 }
 
-$btnRefresh     = New-ToolButton '⟳  Refresh Now'
-$btnExportCsv   = New-ToolButton '⬇  Export CSV'
-$btnExportHtml  = New-ToolButton '⬇  Export HTML'
+$btnRefresh      = New-ToolButton '⟳  Refresh Now'
+$btnExportCsv    = New-ToolButton '⬇  Export CSV'
+$btnExportHtml   = New-ToolButton '⬇  Export HTML'
+$btnPrintColumns = New-ToolButton '🗂  Print Columns…'
+$btnPreview      = New-ToolButton '🔍  Print Preview'
+$btnPrint        = New-ToolButton '⎙  Print'
 
 $sep            = [System.Windows.Forms.Label]::new()
 $sep.Width      = 24
@@ -1219,7 +1314,7 @@ $lblCountdown.ForeColor  = $clrTextMuted
 $lblCountdown.Padding    = [System.Windows.Forms.Padding]::new(6, 9, 0, 0)
 $lblCountdown.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
 
-$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
+$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $btnPrintColumns, $btnPreview, $btnPrint, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
 #endregion
 
 #region Status bar
@@ -1241,6 +1336,109 @@ $statusHint.Text       = 'Tip: Double-click a row (or right-click → View Detai
 $statusHint.ForeColor  = $clrTextMuted
 $statusHint.Alignment  = [System.Windows.Forms.ToolStripItemAlignment]::Right
 $statusStrip.Items.Add($statusHint) | Out-Null
+#endregion
+
+#region Issues / Feedback dialog
+# Small modal surfaced by the header link. Designed for air-gapped operators
+# who can't click a URL directly to file feedback — the dialog shows the URL
+# in a read-only monospace box (selectable for copy-paste), a one-click
+# "Copy URL to Clipboard" button, and an instruction line telling them to
+# bring the URL to an internet-connected PC.
+function Show-IssuesFeedbackDialog {
+    param([Parameter(Mandatory)][string]$Url)
+
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'Report an Issue / Feedback'
+    $dlg.Size            = [System.Drawing.Size]::new(620, 320)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $clrCardBg
+    $dlg.Font            = [System.Drawing.Font]::new('Segoe UI', 9)
+
+    $lblTitle             = [System.Windows.Forms.Label]::new()
+    $lblTitle.Text        = 'File a bug or feature request on the project tracker'
+    $lblTitle.Font        = [System.Drawing.Font]::new('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.ForeColor   = $clrPrimary
+    $lblTitle.AutoSize    = $true
+    $lblTitle.Location    = [System.Drawing.Point]::new(20, 18)
+
+    $lblInstruction             = [System.Windows.Forms.Label]::new()
+    $lblInstruction.Text        = "This system is on an air-gapped network and cannot reach the internet directly.`r`nCopy the URL below (or photograph this dialog) and open it on an internet-connected PC."
+    $lblInstruction.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
+    $lblInstruction.ForeColor   = $clrTextDark
+    $lblInstruction.AutoSize    = $true
+    $lblInstruction.Location    = [System.Drawing.Point]::new(20, 52)
+
+    $lblUrlLabel             = [System.Windows.Forms.Label]::new()
+    $lblUrlLabel.Text        = 'URL:'
+    $lblUrlLabel.Font        = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblUrlLabel.ForeColor   = $clrTextDark
+    $lblUrlLabel.AutoSize    = $true
+    $lblUrlLabel.Location    = [System.Drawing.Point]::new(20, 108)
+
+    $txtUrl                = [System.Windows.Forms.TextBox]::new()
+    $txtUrl.Text           = $Url
+    $txtUrl.ReadOnly       = $true
+    $txtUrl.Font           = [System.Drawing.Font]::new('Consolas', 10)
+    $txtUrl.BackColor      = [System.Drawing.Color]::White
+    $txtUrl.Location       = [System.Drawing.Point]::new(20, 128)
+    $txtUrl.Size           = [System.Drawing.Size]::new(560, 24)
+    $txtUrl.BorderStyle    = 'FixedSingle'
+    # Auto-select on focus so a single keyboard shortcut (Ctrl+C) works.
+    $txtUrl.add_Enter({ $txtUrl.SelectAll() })
+
+    $btnCopy             = [System.Windows.Forms.Button]::new()
+    $btnCopy.Text        = 'Copy URL to Clipboard'
+    $btnCopy.AutoSize    = $true
+    $btnCopy.Height      = 32
+    $btnCopy.Padding     = [System.Windows.Forms.Padding]::new(14, 0, 14, 0)
+    $btnCopy.FlatStyle   = 'Flat'
+    $btnCopy.BackColor   = $clrPrimary
+    $btnCopy.ForeColor   = $clrWhite
+    $btnCopy.Font        = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $btnCopy.FlatAppearance.BorderSize = 0
+    $btnCopy.Cursor      = [System.Windows.Forms.Cursors]::Hand
+    $btnCopy.Location    = [System.Drawing.Point]::new(20, 170)
+    $btnCopy.add_Click({
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($Url)
+            $btnCopy.Text = '✓ Copied!'
+            # Reset the label after a moment so the user can copy again.
+            $resetTimer = [System.Windows.Forms.Timer]::new()
+            $resetTimer.Interval = 1500
+            $resetTimer.add_Tick({
+                $btnCopy.Text = 'Copy URL to Clipboard'
+                $resetTimer.Stop()
+                $resetTimer.Dispose()
+            })
+            $resetTimer.Start()
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                $dlg, "Couldn't copy to clipboard: $($_.Exception.Message)`r`n`r`nSelect the URL manually and use Ctrl+C.",
+                'Clipboard error', 'OK', 'Warning') | Out-Null
+        }
+    })
+
+    # Close button uses the system default look (no FlatStyle override) so it
+    # reads as a secondary action against the blue primary "Copy" button.
+    $btnClose            = [System.Windows.Forms.Button]::new()
+    $btnClose.Text       = 'Close'
+    $btnClose.AutoSize   = $true
+    $btnClose.Padding    = [System.Windows.Forms.Padding]::new(16, 4, 16, 4)
+    $btnClose.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
+    $btnClose.Cursor     = [System.Windows.Forms.Cursors]::Hand
+    $btnClose.Location   = [System.Drawing.Point]::new(500, 232)
+    $btnClose.Anchor     = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $btnClose.add_Click({ $dlg.Close() })
+
+    $dlg.AcceptButton = $btnClose
+    $dlg.CancelButton = $btnClose
+    $dlg.Controls.AddRange(@($lblTitle, $lblInstruction, $lblUrlLabel, $txtUrl, $btnCopy, $btnClose))
+    [void]$dlg.ShowDialog()
+    $dlg.Dispose()
+}
 #endregion
 
 #region Host Details dialog  (right-click / double-click drill-in)
@@ -1340,6 +1538,18 @@ function Show-HostDetailsDialog {
     & $addKeyValue 'Online'          $(if ($HostData.Online) { 'Yes' } else { 'No' }) (& $boolColor ($HostData.Online.ToString()))
     & $addKeyValue 'Query duration'  ("{0}s" -f $HostData.QueryDuration)
 
+    # ---- System inventory (v0.0.18) ------------------------------------
+    # Type + Platform are the new grid columns; Manufacturer/Model/OS show
+    # the raw CIM values that drive the Platform classification so an
+    # operator can sanity-check (e.g. confirm a host classified as
+    # 'Physical' really has a Dell/HP/Lenovo manufacturer string).
+    & $addSectionHeader 'System'
+    & $addKeyValue 'Type'            $(if ($HostData.NodeType)     { $HostData.NodeType }     else { '-' })
+    & $addKeyValue 'Platform'        $(if ($HostData.Platform)     { $HostData.Platform }     else { '-' })
+    & $addKeyValue 'Operating system' $(if ($HostData.OSCaption)   { $HostData.OSCaption }    else { '-' })
+    & $addKeyValue 'Manufacturer'    $(if ($HostData.Manufacturer) { $HostData.Manufacturer } else { '-' })
+    & $addKeyValue 'Model'           $(if ($HostData.Model)        { $HostData.Model }        else { '-' })
+
     # ---- Health classification (with pill) -------------------------------
     & $addSectionHeader 'Health Classification'
     $pillRow = [System.Windows.Forms.TableLayoutPanel]::new()
@@ -1357,7 +1567,11 @@ function Show-HostDetailsDialog {
     $pill.Text      = $pillStatus
     $pill.AutoSize  = $true
     $pill.BackColor = $pillBg
-    $pill.ForeColor = $clrWhite
+    # Outdated uses an amber pill bg now; dark text reads better on amber than
+    # white does, and matches the dashboard's --c-outdated-fg #1e1e2e. All
+    # other pills (Healthy/Offline/Degraded/ThreatsDetected) keep white text
+    # on their darker backgrounds.
+    $pill.ForeColor = if ($pillStatus -eq 'Outdated') { $clrTextDark } else { $clrWhite }
     $pill.Font      = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $pill.Padding   = [System.Windows.Forms.Padding]::new(10, 3, 10, 3)
     $pillRow.Controls.Add($pill, 1, 0)
@@ -1370,6 +1584,7 @@ function Show-HostDetailsDialog {
     $verLabel = $HostData.SignatureVersion
     if ($HostData.VersionStatus) { $verLabel = "$($HostData.SignatureVersion) ($($HostData.VersionStatus))" }
     & $addKeyValue 'Signature version' $verLabel
+    & $addKeyValue 'Definitions date'  $(if ($HostData.SignatureLastUpdated) { $HostData.SignatureLastUpdated } else { '-' })
     & $addKeyValue 'Available version' $HostData.AvailableVersion
     & $addKeyValue 'Real-time protection'  $HostData.RealTimeProtection         (& $boolColor $HostData.RealTimeProtection)
     & $addKeyValue 'Antimalware service'   $HostData.AmServiceEnabled           (& $boolColor $HostData.AmServiceEnabled)
@@ -1504,18 +1719,23 @@ $grid.RowTemplate.Height                      = 32
 # legible when the window is narrowed.
 $grid.AutoSizeColumnsMode = 'Fill'
 $colDefs = @(
-    @{ Name = 'Computer';          Weight = 14; Min = 110 }
+    @{ Name = 'Computer';          Weight = 13; Min = 110 }
     @{ Name = 'IPv4';              Weight =  9; Min =  95 }
-    @{ Name = 'Status';            Weight = 11; Min = 110 }
-    @{ Name = 'Installed Version'; Weight = 12; Min = 110 }
-    @{ Name = 'Available Version'; Weight = 12; Min = 110 }
-    @{ Name = 'Currency';          Weight =  9; Min =  85 }
-    @{ Name = 'RT Protection';     Weight = 10; Min =  90 }
-    @{ Name = 'AV Enabled';        Weight =  9; Min =  85 }
-    @{ Name = 'Last Quick Scan';   Weight = 14; Min = 130 }
-    @{ Name = 'Threats';           Weight =  6; Min =  60 }
-    @{ Name = 'Query Time';        Weight =  8; Min =  75 }
-    @{ Name = 'Error / Detail';    Weight = 22; Min = 180 }
+    @{ Name = 'Type';              Weight =  7; Min =  70 }   # v0.0.18: Workstation / Server / DC
+    @{ Name = 'Platform';          Weight =  8; Min =  80 }   # v0.0.18: VMware / Hyper-V / Physical / etc.
+    @{ Name = 'Status';            Weight = 10; Min = 110 }
+    @{ Name = 'Installed Version'; Weight = 11; Min = 110 }
+    # v0.0.18: 'Available Version' column dropped (info is already in the
+    # header), replaced with the per-host 'Definitions Date' (when this
+    # host's signatures were last updated).
+    @{ Name = 'Definitions Date';  Weight = 10; Min = 100 }
+    @{ Name = 'Currency';          Weight =  8; Min =  85 }
+    @{ Name = 'RT Protection';     Weight =  9; Min =  90 }
+    @{ Name = 'AV Enabled';        Weight =  8; Min =  85 }
+    @{ Name = 'Last Quick Scan';   Weight = 12; Min = 130 }
+    @{ Name = 'Threats';           Weight =  5; Min =  60 }
+    @{ Name = 'Query Time';        Weight =  7; Min =  75 }
+    @{ Name = 'Error / Detail';    Weight = 19; Min = 180 }
 )
 foreach ($cd in $colDefs) {
     $col              = [System.Windows.Forms.DataGridViewTextBoxColumn]::new()
@@ -1530,9 +1750,11 @@ foreach ($cd in $colDefs) {
 # Custom-paint the Status column as a rounded pill, matching the HTML report's .tag styling.
 $grid.add_CellPainting({
     param($src, $e)
-    # Status pill custom-paint lives in column index 2 (was 1 before the
-    # IPv4 column inserted itself between Computer and Status in v0.0.16).
-    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 2) { return }
+    # Status pill custom-paint lives in column index 4:
+    #   0 Computer | 1 IPv4 | 2 Type | 3 Platform | 4 Status
+    # Pre-v0.0.18: index 2 (Computer | IPv4 | Status).
+    # Pre-v0.0.16: index 1 (Computer | Status).
+    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne 4) { return }
     $statusText = "$($e.Value)"
     if (-not $statusText) { return }
 
@@ -1544,7 +1766,9 @@ $grid.add_CellPainting({
         'ThreatsDetected' { $clrError }
         default           { [System.Drawing.Color]::Gray }
     }
-    $pillFg = $clrWhite
+    # Outdated uses an amber bg — dark text reads better on it. See pill
+    # color note where $clrOutdatedPill is defined.
+    $pillFg = if ($statusText -eq 'Outdated') { $clrTextDark } else { $clrWhite }
 
     # Cell background — respect alternating row tint and selection
     $isSelected = ($e.State -band [System.Windows.Forms.DataGridViewElementStates]::Selected) -ne 0
@@ -1703,9 +1927,12 @@ $form.Controls.Add($statusStrip)  # Dock=Bottom
 $script:AllResults = $null
 $script:FilterText = ''
 
-function Update-Grid {
+# Apply the active name + card filters to $script:AllResults and return the
+# post-filter rows. Used by Update-Grid for live rendering and by
+# Invoke-FleetPrint (v0.0.18) so "print" matches "what's on screen".
+function Get-FilteredResults {
     $data = $script:AllResults
-    if (-not $data) { return }
+    if (-not $data) { return @() }
 
     $filter = $script:FilterText.Trim()
     if ($filter) { $data = @($data | Where-Object { $_.ComputerName -like "*$filter*" }) }
@@ -1723,6 +1950,7 @@ function Update-Grid {
                     'Offline'  { $item.Online -eq $false }
                     'Outdated' { $item.VersionStatus -eq 'Outdated' }
                     'RTOff'    { $item.RealTimeProtection -eq 'False' -and $item.Online -eq $true }
+                    'Degraded' { $item.HealthStatus -eq 'Degraded' -and $item.Online -eq $true }
                     default    { $true }
                 }
                 if (-not $match) { $keep = $false; break }
@@ -1730,6 +1958,12 @@ function Update-Grid {
             $keep
         })
     }
+    return $data
+}
+
+function Update-Grid {
+    if (-not $script:AllResults) { return }
+    $data = Get-FilteredResults
 
     $grid.SuspendLayout()
     $grid.Rows.Clear()
@@ -1751,9 +1985,11 @@ function Update-Grid {
         $idx = $grid.Rows.Add(
             $r.ComputerName,
             $r.IPv4Address,
+            $r.NodeType,
+            $r.Platform,
             $status,
             $r.SignatureVersion,
-            $r.AvailableVersion,
+            $r.SignatureLastUpdated,
             $r.VersionStatus,
             $r.RealTimeProtection,
             $r.AntivirusEnabled,
@@ -1775,11 +2011,16 @@ function Update-Grid {
     $offline  = $all.Count - $online
     $outdated = @($all | Where-Object VersionStatus -eq 'Outdated').Count
     $rtOff    = @($all | Where-Object { $_.RealTimeProtection -eq 'False' -and $_.Online }).Count
+    # Degraded = hosts where the shared health classifier flagged 'Degraded'.
+    # RT Off is a specific subset of degraded conditions; the two cards
+    # overlap by design (operators can filter on either lens).
+    $degraded = @($all | Where-Object { $_.HealthStatus -eq 'Degraded' -and $_.Online }).Count
 
     $statOnline.Number.Text   = "$online"
     $statOffline.Number.Text  = "$offline"
     $statOutdated.Number.Text = "$outdated"
     $statRtOff.Number.Text    = "$rtOff"
+    $statDegraded.Number.Text = "$degraded"
 
     # Refresh the info subline with the latest total
     $lblInfo.Text = if ($AvailableVersionStr) {
@@ -1965,6 +2206,492 @@ $chkAuto.add_CheckedChanged({
         $lblCountdown.Text = ''
         $autoTimer.Stop()
     }
+})
+
+# Persistent print state for the session — column selection, page setup,
+# and the cached per-job column widths set by the first PrintPage event.
+# Initial defaults: every column on, landscape Letter, default margins.
+$script:PrintColumns = @(
+    [pscustomobject]@{ Name='Computer';          Property='ComputerName';        Print=$true }
+    [pscustomobject]@{ Name='IPv4';              Property='IPv4Address';         Print=$true }
+    [pscustomobject]@{ Name='Type';              Property='NodeType';            Print=$true }
+    [pscustomobject]@{ Name='Platform';          Property='Platform';            Print=$true }
+    [pscustomobject]@{ Name='Status';            Property='__Status__';          Print=$true }
+    [pscustomobject]@{ Name='Installed Version'; Property='SignatureVersion';    Print=$true }
+    [pscustomobject]@{ Name='Definitions Date';  Property='SignatureLastUpdated';Print=$true }
+    [pscustomobject]@{ Name='Currency';          Property='VersionStatus';       Print=$true }
+    [pscustomobject]@{ Name='RT Prot';           Property='RealTimeProtection';  Print=$true }
+    [pscustomobject]@{ Name='AV';                Property='AntivirusEnabled';    Print=$true }
+    [pscustomobject]@{ Name='Last Quick Scan';   Property='LastQuickScan';       Print=$true }
+    [pscustomobject]@{ Name='Threats';           Property='ThreatCount';         Print=$true }
+    [pscustomobject]@{ Name='Error / Detail';    Property='Error';               Print=$true }
+)
+$script:PrintPageSettings = $null   # set on first Page Setup OK; null = use defaults
+$script:PrintColW         = $null   # populated by first PrintPage of each job
+
+function script:Get-PrintRowStatus {
+    param($Row)
+    if (-not $Row.Online) { return 'Offline' }
+    if ($Row.VersionStatus -eq 'Outdated') { return 'Outdated' }
+    if ($Row.HealthStatus) { return $Row.HealthStatus }
+    if ($Row.RealTimeProtection -eq 'False' -or $Row.AntivirusEnabled -eq 'False') { return 'Degraded' }
+    return 'Healthy'
+}
+
+function script:Get-PrintCellValue {
+    param($Row, $Column)
+    if ($Column.Property -eq '__Status__') { return (Get-PrintRowStatus -Row $Row) }
+    return "$($Row.($Column.Property))"
+}
+
+# Column-picker dialog. Operators tick the columns they want on the
+# printed report; selection persists for the session (until script
+# restart). Selection survives between Print Preview and Print clicks
+# so the two stay in sync.
+function Show-PrintColumnsDialog {
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'Print Columns'
+    $dlg.Size            = [System.Drawing.Size]::new(380, 470)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $clrCardBg
+    $dlg.Font            = [System.Drawing.Font]::new('Segoe UI', 9)
+
+    $lblIntro             = [System.Windows.Forms.Label]::new()
+    $lblIntro.Text        = 'Select which columns appear on the printed report. Unchecked columns stay visible on the on-screen grid and modal.'
+    $lblIntro.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
+    $lblIntro.ForeColor   = $clrTextDark
+    $lblIntro.Location    = [System.Drawing.Point]::new(16, 14)
+    $lblIntro.Size        = [System.Drawing.Size]::new(340, 50)
+
+    $list                  = [System.Windows.Forms.CheckedListBox]::new()
+    $list.Location         = [System.Drawing.Point]::new(16, 72)
+    $list.Size             = [System.Drawing.Size]::new(340, 280)
+    $list.CheckOnClick     = $true
+    $list.BorderStyle      = 'FixedSingle'
+    foreach ($c in $script:PrintColumns) {
+        $idx = $list.Items.Add($c.Name)
+        $list.SetItemChecked($idx, [bool]$c.Print)
+    }
+
+    $btnAll              = [System.Windows.Forms.Button]::new()
+    $btnAll.Text         = 'Select All'
+    $btnAll.Location     = [System.Drawing.Point]::new(16, 362)
+    $btnAll.Size         = [System.Drawing.Size]::new(90, 28)
+    $btnAll.add_Click({
+        for ($i = 0; $i -lt $list.Items.Count; $i++) { $list.SetItemChecked($i, $true) }
+    })
+
+    $btnNone             = [System.Windows.Forms.Button]::new()
+    $btnNone.Text        = 'Clear All'
+    $btnNone.Location    = [System.Drawing.Point]::new(112, 362)
+    $btnNone.Size        = [System.Drawing.Size]::new(90, 28)
+    $btnNone.add_Click({
+        for ($i = 0; $i -lt $list.Items.Count; $i++) { $list.SetItemChecked($i, $false) }
+    })
+
+    $btnOk               = [System.Windows.Forms.Button]::new()
+    $btnOk.Text          = 'OK'
+    $btnOk.Location      = [System.Drawing.Point]::new(196, 395)
+    $btnOk.Size          = [System.Drawing.Size]::new(76, 28)
+    $btnOk.BackColor     = $clrPrimary
+    $btnOk.ForeColor     = $clrWhite
+    $btnOk.FlatStyle     = 'Flat'
+    $btnOk.FlatAppearance.BorderSize = 0
+    $btnOk.add_Click({
+        for ($i = 0; $i -lt $list.Items.Count; $i++) {
+            $script:PrintColumns[$i].Print = [bool]$list.GetItemChecked($i)
+        }
+        $dlg.DialogResult = 'OK'
+        $dlg.Close()
+    })
+
+    $btnCancel           = [System.Windows.Forms.Button]::new()
+    $btnCancel.Text      = 'Cancel'
+    $btnCancel.Location  = [System.Drawing.Point]::new(280, 395)
+    $btnCancel.Size      = [System.Drawing.Size]::new(76, 28)
+    $btnCancel.add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
+
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+    $dlg.Controls.AddRange(@($lblIntro, $list, $btnAll, $btnNone, $btnOk, $btnCancel))
+    [void]$dlg.ShowDialog($form)
+    $dlg.Dispose()
+}
+
+# Render the current grid (post-filter) to either a temp PDF + default
+# viewer (Preview) or direct-to-printer via PrintDialog (Print). Color
+# rendering matches the on-screen grid; the printer/driver at print time
+# owns color-vs-grayscale and orientation choice. v0.0.18 (demo feedback
+# #2, refined 2026-05-30 then 2026-05-31).
+function Invoke-FleetPrint {
+    param(
+        [object[]]$Rows,
+        [ValidateSet('Preview','Print')]
+        [string]$Mode = 'Print'
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show($form,
+            'Nothing to print — the current filter has no matching hosts.',
+            'Print', 'OK', 'Information') | Out-Null
+        return
+    }
+
+    # Filter to the columns the operator has currently selected via the
+    # Print Columns dialog. If they've unchecked everything, fall back to
+    # all columns rather than printing a blank table — a misconfiguration
+    # shouldn't waste paper.
+    $enabledCols = @($script:PrintColumns | Where-Object { $_.Print })
+    if ($enabledCols.Count -eq 0) {
+        $enabledCols = @($script:PrintColumns)
+    }
+
+    # Mutable counters carried across PrintPage events. Reset per job so
+    # a second click of Print/Preview starts at row 0 / page 1.
+    $script:PrintRowIdx = 0
+    $script:PrintPgNum  = 0
+    $script:PrintColW   = $null
+
+    $titleFont  = [System.Drawing.Font]::new('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+    $infoFont   = [System.Drawing.Font]::new('Segoe UI', 9)
+    $headerFont = [System.Drawing.Font]::new('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
+    $rowFont    = [System.Drawing.Font]::new('Segoe UI', 7.5)
+    $footerFont = [System.Drawing.Font]::new('Segoe UI', 7)
+    $pillFont   = [System.Drawing.Font]::new('Segoe UI', 7, [System.Drawing.FontStyle]::Bold)
+
+    $doc = [System.Drawing.Printing.PrintDocument]::new()
+    $doc.DocumentName = "Defender Fleet Status - $(Get-Date -Format 'yyyy-MM-dd HH-mm')"
+    # Apply persistent page settings from the most recent Page Setup
+    # dialog, if any. Defaults to landscape Letter on first use.
+    if ($script:PrintPageSettings) {
+        $doc.DefaultPageSettings.PaperSize = $script:PrintPageSettings.PaperSize
+        $doc.DefaultPageSettings.Landscape = $script:PrintPageSettings.Landscape
+        $doc.DefaultPageSettings.Margins   = $script:PrintPageSettings.Margins.Clone()
+    } else {
+        $doc.DefaultPageSettings.Landscape = $true
+    }
+
+    $doc.add_PrintPage({
+        param($sender, $ev)
+        $script:PrintPgNum++
+        $g = $ev.Graphics
+        $mb = $ev.MarginBounds
+        $left   = [int]$mb.Left
+        $top    = [int]$mb.Top
+        $right  = [int]$mb.Right
+        $bottom = [int]$mb.Bottom
+        $width  = $right - $left
+
+        # Reserve ~30px at the bottom for the footer line.
+        $rowsBottom = $bottom - 22
+
+        # ---- Smart column sizing (computed once per job, on page 1) ----
+        # The naive proportional approach (just scale by natural widths) fails
+        # when one column has an extreme outlier — a 400-char WinRM error in
+        # Error / Detail can be wider than the entire page on its own, which
+        # makes the scaling factor crush every other column down to single
+        # characters (even truncating headers like "Computer" -> "Co").
+        #
+        # Two guards fix that:
+        #   (a) cap any single column at 25% of the page (Error / Detail
+        #       gets ample room but no longer dominates);
+        #   (b) every column gets *at least* its header width so the header
+        #       row always reads cleanly even on a crowded page.
+        #
+        # The slack between min and natural totals is distributed to the
+        # columns that asked for more room (proportional to nat - min), so
+        # a wide Computer column still gets noticeably more room than a
+        # narrow Type column even when the page is tight.
+        if ($null -eq $script:PrintColW) {
+            $padding   = 14
+            $maxColW   = [int]($width * 0.25)
+            $minWidths = @()
+            $natWidths = @()
+            foreach ($col in $enabledCols) {
+                $hdrSize = $g.MeasureString($col.Name, $headerFont)
+                $minW = [int][math]::Ceiling($hdrSize.Width) + $padding
+                $maxValW = [double]$hdrSize.Width
+                foreach ($r in $Rows) {
+                    $val = Get-PrintCellValue -Row $r -Column $col
+                    if ($val) {
+                        $vSize = $g.MeasureString($val, $rowFont)
+                        if ($vSize.Width -gt $maxValW) { $maxValW = [double]$vSize.Width }
+                    }
+                }
+                $natW = [int][math]::Ceiling($maxValW) + $padding
+                if ($natW -gt $maxColW) { $natW = $maxColW }
+                if ($natW -lt $minW)    { $natW = $minW }
+                $minWidths += $minW
+                $natWidths += $natW
+            }
+            $totalMin = ($minWidths | Measure-Object -Sum).Sum
+            $totalNat = ($natWidths | Measure-Object -Sum).Sum
+
+            if ($totalMin -ge $width) {
+                # Pathological: headers alone don't fit. Give every column
+                # an equal slice and let the StringFormat ellipsise.
+                $unit = [int]($width / $enabledCols.Count)
+                $script:PrintColW = @(0..($enabledCols.Count - 1) | ForEach-Object { $unit })
+            } elseif ($totalNat -le $width) {
+                # Everything fits with room to spare — distribute the
+                # surplus proportionally to natural width so the table
+                # still spans the page (no half-empty page).
+                $surplus = $width - $totalNat
+                $script:PrintColW = @($natWidths | ForEach-Object {
+                    [int]([math]::Floor($_ + $surplus * $_ / $totalNat))
+                })
+            } else {
+                # Doesn't all fit. Every column gets its minimum; the
+                # remaining slack goes to columns that asked for more,
+                # proportional to (nat - min).
+                $slack      = $width - $totalMin
+                $totalExtra = $totalNat - $totalMin
+                $script:PrintColW = @()
+                for ($i = 0; $i -lt $enabledCols.Count; $i++) {
+                    $extra = $natWidths[$i] - $minWidths[$i]
+                    $share = if ($totalExtra -gt 0) {
+                        [int]([math]::Floor($slack * $extra / $totalExtra))
+                    } else { 0 }
+                    $script:PrintColW += $minWidths[$i] + $share
+                }
+            }
+        }
+        $colW = $script:PrintColW
+
+        $y = $top
+
+        # Header band — page 1 only. Carry-over pages get the table headers
+        # directly so the table is consistent top-of-page.
+        if ($script:PrintPgNum -eq 1) {
+            $g.DrawString('Microsoft Defender Antivirus – Fleet Status',
+                $titleFont, [System.Drawing.Brushes]::Black, [float]$left, [float]$y)
+            $y += 28
+
+            $hdrParts = @(
+                "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                if ($AvailableVersionStr) { "Available: v$AvailableVersionStr" } else { 'Available: N/A' }
+                "Hosts shown: $($Rows.Count)"
+            )
+            $g.DrawString(($hdrParts -join '   |   '),
+                $infoFont, [System.Drawing.Brushes]::Black, [float]$left, [float]$y)
+            $y += 20
+
+            $accentPen = [System.Drawing.Pen]::new($clrPrimary, 2)
+            $g.DrawLine($accentPen, $left, $y, $right, $y)
+            $accentPen.Dispose()
+            $y += 8
+        }
+
+        # Column header band
+        $hdrRowH = 18
+        $hdrBg = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(232, 232, 232))
+        $g.FillRectangle($hdrBg, $left, $y, $width, $hdrRowH)
+        $hdrBg.Dispose()
+        $sf = [System.Drawing.StringFormat]::new()
+        $sf.Trimming    = [System.Drawing.StringTrimming]::EllipsisCharacter
+        $sf.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+        $x = $left
+        for ($i = 0; $i -lt $enabledCols.Count; $i++) {
+            $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 3), [float]($colW[$i] - 6), [float]($hdrRowH - 4))
+            $g.DrawString($enabledCols[$i].Name, $headerFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
+            $x += $colW[$i]
+        }
+        $y += $hdrRowH
+        $borderPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(180, 180, 180))
+        $g.DrawLine($borderPen, $left, $y, $right, $y)
+
+        # Data rows
+        $dataRowH = 16
+        $reachedEnd = $false
+        while ($script:PrintRowIdx -lt $Rows.Count) {
+            if (($y + $dataRowH) -gt $rowsBottom) { break }
+
+            $r = $Rows[$script:PrintRowIdx]
+            $status = Get-PrintRowStatus -Row $r
+
+            # Alternating row tint matches the grid.
+            if ($script:PrintRowIdx % 2 -eq 1) {
+                $altBg = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(249, 249, 249))
+                $g.FillRectangle($altBg, $left, $y, $width, $dataRowH)
+                $altBg.Dispose()
+            }
+
+            $x = $left
+            for ($i = 0; $i -lt $enabledCols.Count; $i++) {
+                $col = $enabledCols[$i]
+                if ($col.Property -eq '__Status__') {
+                    # Status pill — small rounded-ish badge with the status color.
+                    $pillBg = switch ($status) {
+                        'Healthy'         { $clrSuccess }
+                        'Offline'         { $clrOffline }
+                        'Outdated'        { $clrOutdatedPill }
+                        'Degraded'        { $clrWarn }
+                        'ThreatsDetected' { $clrError }
+                        default           { [System.Drawing.Color]::Gray }
+                    }
+                    $pillFg = if ($status -eq 'Outdated') { $clrTextDark } else { $clrWhite }
+                    $pillBgBrush = [System.Drawing.SolidBrush]::new($pillBg)
+                    $pillFgBrush = [System.Drawing.SolidBrush]::new($pillFg)
+                    $pillRect = [System.Drawing.Rectangle]::new($x + 4, $y + 2, $colW[$i] - 8, $dataRowH - 4)
+                    $g.FillRectangle($pillBgBrush, $pillRect)
+                    $textRect = [System.Drawing.RectangleF]::new([float]($x + 6), [float]($y + 3), [float]($colW[$i] - 12), [float]($dataRowH - 4))
+                    $g.DrawString($status, $pillFont, $pillFgBrush, $textRect, $sf)
+                    $pillBgBrush.Dispose()
+                    $pillFgBrush.Dispose()
+                } else {
+                    $val = Get-PrintCellValue -Row $r -Column $col
+                    $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 2), [float]($colW[$i] - 6), [float]($dataRowH - 2))
+                    $g.DrawString($val, $rowFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
+                }
+                $x += $colW[$i]
+            }
+            $g.DrawLine($borderPen, $left, $y + $dataRowH, $right, $y + $dataRowH)
+            $y += $dataRowH
+            $script:PrintRowIdx++
+        }
+        if ($script:PrintRowIdx -ge $Rows.Count) { $reachedEnd = $true }
+        $borderPen.Dispose()
+
+        # Footer on every page — script identity + source path on the left,
+        # page number right-aligned to the page's right margin (per operator
+        # feedback: page number is the first thing people look for when
+        # collating a multi-page report, so it gets the prime corner).
+        $footerLeft  = "Show-DefenderStatus.ps1 v$ScriptVersion   |   $(if ($SourceSharePath) { "Source: $SourceSharePath" } else { 'No source share configured' })"
+        $footerRight = "Page $($script:PrintPgNum)"
+        $footerY     = [float]($bottom + 4)
+        $g.DrawString($footerLeft, $footerFont, [System.Drawing.Brushes]::Gray,
+            [float]$left, $footerY)
+
+        $sfRight = [System.Drawing.StringFormat]::new()
+        $sfRight.Alignment    = [System.Drawing.StringAlignment]::Far
+        $sfRight.FormatFlags  = [System.Drawing.StringFormatFlags]::NoWrap
+        $footerRightRect = [System.Drawing.RectangleF]::new([float]$left, $footerY, [float]$width, 14)
+        $g.DrawString($footerRight, $footerFont, [System.Drawing.Brushes]::Gray, $footerRightRect, $sfRight)
+        $sfRight.Dispose()
+
+        $ev.HasMorePages = -not $reachedEnd
+    })
+
+    # Two paths share the same rendered $doc:
+    #   Preview - render to a temp PDF via the 'Microsoft Print to PDF'
+    #             virtual printer, then open the PDF in the user's default
+    #             PDF viewer (Edge / Adobe / etc.). Modern, familiar
+    #             preview UI; users can save / search / share without a
+    #             re-render. Falls back to PrintPreviewDialog if the
+    #             Microsoft Print to PDF printer isn't installed (rare;
+    #             can be stripped on locked-down STIG images).
+    #   Print   - PrintDialog (XP-era EX variant). Standard Windows
+    #             printer-selection + Properties + Copies + orientation
+    #             experience; on OK, the job goes to the selected printer.
+    #
+    # Page-range selection is intentionally disabled on the Print path:
+    # the printable content is driven by the on-screen filter (WYSIWYG);
+    # operators who want a subset narrow the grid first.
+    $dlg = $null
+    try {
+        if ($Mode -eq 'Preview') {
+            # Auto-open Page Setup before every preview so the operator
+            # confirms orientation, paper size, and margins each time.
+            # Cancel here aborts the preview entirely — no PDF, no spend
+            # of the Microsoft Print to PDF queue. On OK, the selected
+            # settings are stashed in $script:PrintPageSettings so the
+            # subsequent Print click uses the same paper/orientation.
+            $setupDlg = [System.Windows.Forms.PageSetupDialog]::new()
+            $setupDlg.Document = $doc
+            $setupDlg.AllowMargins      = $true
+            $setupDlg.AllowOrientation  = $true
+            $setupDlg.AllowPaper        = $true
+            $setupDlg.AllowPrinter      = $false
+            $setupResult = $setupDlg.ShowDialog($form)
+            $setupDlg.Dispose()
+            if ($setupResult -ne 'OK') {
+                return   # user cancelled; finally block cleans the fonts + doc
+            }
+            $script:PrintPageSettings = $doc.DefaultPageSettings.Clone()
+
+            $pdfPrinter = 'Microsoft Print to PDF'
+            $installed  = [System.Drawing.Printing.PrinterSettings]::InstalledPrinters
+            if ($installed -notcontains $pdfPrinter) {
+                # Graceful fallback. Hits the screen with the basic preview
+                # dialog so the operator still gets *something*; flag the
+                # gap so they can add the PDF printer if they want the
+                # modern UI back next time.
+                [System.Windows.Forms.MessageBox]::Show($form,
+                    "'$pdfPrinter' is not installed on this host, so the modern PDF-based preview is unavailable. Showing the basic preview dialog instead.`r`n`r`nTo restore the modern preview, install 'Microsoft Print to PDF' via Windows Features.",
+                    'Print Preview', 'OK', 'Information') | Out-Null
+                $dlg = [System.Windows.Forms.PrintPreviewDialog]::new()
+                $dlg.Document    = $doc
+                $dlg.WindowState = 'Maximized'
+                [void]$dlg.ShowDialog($form)
+            } else {
+                # Unique filename per click — operators may preview repeatedly
+                # while iterating on a filter, so don't collide if two clicks
+                # land in the same second. Milliseconds suffix covers it.
+                $tempPdf = Join-Path ([System.IO.Path]::GetTempPath()) `
+                    ("DefenderStatus_{0}.pdf" -f (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
+                $doc.PrinterSettings.PrinterName   = $pdfPrinter
+                $doc.PrinterSettings.PrintToFile   = $true
+                $doc.PrinterSettings.PrintFileName = $tempPdf
+                $statusLabel.Text = 'Generating PDF preview…'
+                [System.Windows.Forms.Application]::DoEvents()
+                $doc.Print()
+
+                # PrintDocument.Print() returns before the spool flushes to
+                # the file. Poll briefly for the file to appear (rare PDFs
+                # on large fleets take ~2s).
+                $waited = 0
+                while (-not (Test-Path $tempPdf -PathType Leaf) -and $waited -lt 50) {
+                    Start-Sleep -Milliseconds 100
+                    $waited++
+                }
+                if (Test-Path $tempPdf -PathType Leaf) {
+                    Start-Process $tempPdf
+                    $statusLabel.Text = "Preview opened ($($Rows.Count) hosts) — $tempPdf"
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show($form,
+                        "PDF preview generation timed out after 5 seconds. Try again, or use the Print button directly.",
+                        'Print Preview', 'OK', 'Warning') | Out-Null
+                    $statusLabel.Text = 'Preview generation timed out'
+                }
+            }
+        } else {
+            $dlg = [System.Windows.Forms.PrintDialog]::new()
+            $dlg.Document         = $doc
+            $dlg.UseEXDialog      = $true
+            $dlg.AllowSomePages   = $false
+            $dlg.AllowSelection   = $false
+            $dlg.AllowCurrentPage = $false
+            $dlg.AllowPrintToFile = $true
+            if ($dlg.ShowDialog($form) -eq 'OK') {
+                $doc.Print()
+                $statusLabel.Text = "Print job sent to $($doc.PrinterSettings.PrinterName) ($($Rows.Count) hosts)"
+            }
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($form,
+            "Print failed: $($_.Exception.Message)",
+            'Print', 'OK', 'Error') | Out-Null
+    } finally {
+        if ($dlg) { $dlg.Dispose() }
+        $doc.Dispose()
+        $titleFont.Dispose(); $infoFont.Dispose(); $headerFont.Dispose()
+        $rowFont.Dispose();   $footerFont.Dispose(); $pillFont.Dispose()
+    }
+}
+
+$btnPrintColumns.add_Click({
+    Show-PrintColumnsDialog
+})
+
+$btnPreview.add_Click({
+    Invoke-FleetPrint -Rows (Get-FilteredResults) -Mode Preview
+})
+
+$btnPrint.add_Click({
+    Invoke-FleetPrint -Rows (Get-FilteredResults) -Mode Print
 })
 
 $btnExportCsv.add_Click({

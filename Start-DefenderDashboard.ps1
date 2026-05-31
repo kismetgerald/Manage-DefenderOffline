@@ -145,7 +145,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.17'
+$ScriptVersion = '0.0.18'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -251,6 +251,11 @@ if (-not $PSBoundParameters.ContainsKey('LogPath')         -and $cfg['DashboardL
 if (-not $PSBoundParameters.ContainsKey('ParallelThreads') -and $cfg['ParallelThreads']) { try { $ParallelThreads = [int]$cfg['ParallelThreads'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('TimeoutSeconds')  -and $cfg['TimeoutSeconds'])  { try { $TimeoutSeconds  = [int]$cfg['TimeoutSeconds']  } catch {} }
 if (-not $PSBoundParameters.ContainsKey('DisableIPv6')     -and $cfg['DisableIPv6'])     { $DisableIPv6 = ($cfg['DisableIPv6'] -match '^(?i)true|1|yes$') }
+
+# Issue-tracker URL surfaced by the dashboard's footer "Report an Issue" link.
+# Override via [Common] IssuesUrl in conf/config.conf (e.g. for a GHE instance
+# or internal tracker); otherwise use the public GitHub URL.
+$IssuesUrl = if ($cfg['IssuesUrl']) { $cfg['IssuesUrl'].Trim() } else { 'https://github.com/kismetgerald/Manage-DefenderOffline/issues' }
 if (-not $PSBoundParameters.ContainsKey('DashboardTheme')  -and $cfg['DashboardTheme'])  {
     $t = $cfg['DashboardTheme'].Trim()
     if ($t -match '^(?i)light$|^(?i)dark$') { $DashboardTheme = (Get-Culture).TextInfo.ToTitleCase($t.ToLower()) }
@@ -1072,6 +1077,10 @@ function Get-DefenderStatus {
         Online                    = $false
         DefenderService           = 'Unknown'
         SignatureVersion          = ''
+        # Per-host signature publication date — populated from
+        # Get-MpComputerStatus.AntivirusSignatureLastUpdated. Displayed as
+        # 'yyyy-MM-dd' in the new dashboard column (v0.0.18).
+        SignatureLastUpdated      = ''
         AvailableVersion          = $AvailableVersionStr
         VersionStatus             = 'Unknown'
         RealTimeProtection        = 'Unknown'
@@ -1087,6 +1096,14 @@ function Get-DefenderStatus {
         ThreatList                = @()
         HealthStatus              = ''
         HealthReason              = ''
+        # System inventory surfaced as columns + modal section (v0.0.18 / ISSM
+        # demo feedback #1). NodeType from Win32_OperatingSystem ProductType;
+        # Platform from Win32_ComputerSystem Manufacturer + Model pattern match.
+        NodeType                  = 'Unknown'
+        Platform                  = 'Unknown'
+        OSCaption                 = ''
+        Manufacturer              = ''
+        Model                     = ''
         QueryDuration             = 0
         Error                     = ''
     }
@@ -1136,6 +1153,11 @@ function Get-DefenderStatus {
                 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
                 $mp  = $null
                 try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}
+                # OS + ComputerSystem CIM for NodeType and Platform columns.
+                # Both classes are local on the target; ~50ms each.
+                $os = $null; $cs = $null
+                try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop } catch {}
+                try { $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop } catch {}
                 # Per-threat detail for the row-click modal. Get-MpThreat is
                 # the *catalog* of threat types ever seen — it doesn't reliably
                 # populate InitialDetectionTime / Resources for long-quarantined
@@ -1167,6 +1189,7 @@ function Get-DefenderStatus {
                     # path renders 'Running' rather than '[object Object]'.
                     SvcStatus            = if ($svc) { [string]$svc.Status } else { 'NotFound' }
                     SignatureVersion     = if ($mp) { $mp.AntivirusSignatureVersion }  else { $null }
+                    SignatureLastUpdated = if ($mp) { $mp.AntivirusSignatureLastUpdated } else { $null }
                     RealTimeProtection   = if ($mp) { $mp.RealTimeProtectionEnabled } else { $null }
                     AMServiceEnabled     = if ($mp) { $mp.AMServiceEnabled }           else { $null }
                     AntivirusEnabled     = if ($mp) { $mp.AntivirusEnabled }          else { $null }
@@ -1177,12 +1200,19 @@ function Get-DefenderStatus {
                     LastFullScan         = if ($mp) { $mp.FullScanStartTime }         else { $null }
                     ThreatCount          = $threats.Count
                     ThreatList           = $threats
+                    # ProductType: 1 = Workstation, 2 = Domain Controller,
+                    # 3 = Member Server. OSCaption is the friendly OS name.
+                    ProductType          = if ($os) { [int]$os.ProductType } else { 0 }
+                    OSCaption            = if ($os) { [string]$os.Caption } else { '' }
+                    Manufacturer         = if ($cs) { [string]$cs.Manufacturer } else { '' }
+                    Model                = if ($cs) { [string]$cs.Model } else { '' }
                 }
             }
 
             $result.Online                    = $true
             $result.DefenderService           = $data.SvcStatus
             $result.SignatureVersion          = $data.SignatureVersion
+            $result.SignatureLastUpdated      = if ($data.SignatureLastUpdated) { $data.SignatureLastUpdated.ToString('yyyy-MM-dd') } else { '' }
             $result.RealTimeProtection        = if ($null -ne $data.RealTimeProtection) { $data.RealTimeProtection.ToString() } else { 'Unknown' }
             $result.AntivirusEnabled          = if ($null -ne $data.AntivirusEnabled)   { $data.AntivirusEnabled.ToString() }   else { 'Unknown' }
             $result.AmServiceEnabled          = if ($null -ne $data.AMServiceEnabled)   { $data.AMServiceEnabled.ToString() }   else { 'Unknown' }
@@ -1193,6 +1223,33 @@ function Get-DefenderStatus {
             $result.LastFullScan              = if ($data.LastFullScan)  { $data.LastFullScan.ToString('yyyy-MM-dd HH:mm') }  else { 'Never' }
             $result.ThreatCount               = if ($null -ne $data.ThreatCount) { $data.ThreatCount.ToString() } else { 'Unknown' }
             $result.ThreatList                = @($data.ThreatList)
+
+            # Map raw CIM values to friendly column strings (v0.0.18).
+            #   ProductType: 1=Workstation, 2=DC, 3=Server (Microsoft definition).
+            #   Platform:    Manufacturer/Model pattern match against the common
+            #                hypervisor signatures. Anything unrecognised falls
+            #                back to 'Physical' — the actual manufacturer is
+            #                still surfaced in the modal's System section so
+            #                operators can verify.
+            $result.OSCaption    = $data.OSCaption
+            $result.Manufacturer = $data.Manufacturer
+            $result.Model        = $data.Model
+            $result.NodeType     = switch ([int]$data.ProductType) {
+                1       { 'Workstation' }
+                2       { 'DC' }
+                3       { 'Server' }
+                default { 'Unknown' }
+            }
+            $mfg   = "$($data.Manufacturer)".Trim()
+            $model = "$($data.Model)".Trim()
+            $result.Platform = if     ($mfg -like 'VMware*' -or $model -like 'VMware*')               { 'VMware' }
+                               elseif ($mfg -eq 'Microsoft Corporation' -and $model -eq 'Virtual Machine') { 'Hyper-V' }
+                               elseif ($mfg -eq 'innotek GmbH' -or $mfg -eq 'Oracle Corporation' -and $model -like '*VirtualBox*') { 'VirtualBox' }
+                               elseif ($mfg -like 'QEMU*' -or $model -like 'KVM*' -or $model -like 'QEMU*')                       { 'KVM/QEMU' }
+                               elseif ($mfg -like 'Xen*')                                                                          { 'Xen' }
+                               elseif ($mfg -like 'Parallels*')                                                                    { 'Parallels' }
+                               elseif ($mfg -eq '' -and $model -eq '')                                                             { 'Unknown' }
+                               else                                                                                                { 'Physical' }
 
             # Health classification — see lib/Get-DefenderHealthProbe.ps1.
             if ($null -ne $data.RealTimeProtection -and
@@ -1304,7 +1361,8 @@ function Build-DashboardHtml {
         [datetime]$AsOf,
         [bool]$IsRefreshing,
         [ValidateSet('Dark','Light')]
-        [string]$Theme = 'Dark'
+        [string]$Theme = 'Dark',
+        [string]$IssuesUrl = 'https://github.com/kismetgerald/Manage-DefenderOffline/issues'
     )
 
     $themeAttr = if ($Theme -eq 'Light') { 'light' } else { 'dark' }
@@ -1313,6 +1371,11 @@ function Build-DashboardHtml {
     $offlineCount = $Data.Count - $onlineCount
     $outdated     = @($Data | Where-Object VersionStatus -eq 'Outdated').Count
     $rtOff        = @($Data | Where-Object { $_.RealTimeProtection -eq 'False' -and $_.Online }).Count
+    # Degraded count = hosts where the shared health classifier returned
+    # 'Degraded'. RT Off is one of many degraded conditions; the two cards
+    # overlap by design (operators may want either lens). Offline hosts are
+    # not counted here (they couldn't produce a HealthStatus reading).
+    $degraded     = @($Data | Where-Object { $_.HealthStatus -eq 'Degraded' -and $_.Online }).Count
 
     # When the async initial collection has not completed yet, $AsOf is
     # DateTime.MinValue (year 0001). Subtracting that from "now" yields
@@ -1369,14 +1432,18 @@ function Build-DashboardHtml {
         $isOnline   = if ($r.Online) { 'true' } else { 'false' }
         $isOutdated = if ($r.VersionStatus -eq 'Outdated') { 'true' } else { 'false' }
         $isRtOff    = if ($r.RealTimeProtection -eq 'False' -and $r.Online) { 'true' } else { 'false' }
+        $isDegraded = if ($r.HealthStatus -eq 'Degraded' -and $r.Online) { 'true' } else { 'false' }
 
         # data-host is the key the row-click handler uses to look up the
         # per-host record in the embedded JSON blob and populate the modal.
-        "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`">
+        "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`" data-degraded=`"$isDegraded`">
           <td$tip>$($r.ComputerName)</td>
           <td>$($r.IPv4Address)</td>
+          <td>$($r.NodeType)</td>
+          <td>$($r.Platform)</td>
           <td>$badge</td>
           <td>$($r.SignatureVersion)</td>
+          <td>$($r.SignatureLastUpdated)</td>
           <td>$($r.VersionStatus)</td>
           <td>$($r.RealTimeProtection)</td>
           <td>$($r.AntivirusEnabled)</td>
@@ -1398,9 +1465,15 @@ function Build-DashboardHtml {
         [ordered]@{
             computerName              = $_.ComputerName
             ipv4Address               = $_.IPv4Address
+            nodeType                  = $_.NodeType
+            platform                  = $_.Platform
+            osCaption                 = $_.OSCaption
+            manufacturer              = $_.Manufacturer
+            model                     = $_.Model
             online                    = [bool]$_.Online
             defenderService           = $_.DefenderService
             signatureVersion          = $_.SignatureVersion
+            signatureLastUpdated      = $_.SignatureLastUpdated
             availableVersion          = $_.AvailableVersion
             versionStatus             = $_.VersionStatus
             realTimeProtection        = $_.RealTimeProtection
@@ -1519,7 +1592,7 @@ function Build-DashboardHtml {
                     border-radius: 6px; font-size: 1.1em; line-height: 1; }
     .theme-toggle:hover { background: var(--bg-input-hover); }
 
-    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+    .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px;
              padding: 20px 28px 8px; }
     .stat { border-radius: 10px; padding: 14px 18px; cursor: pointer;
             border: 3px solid transparent; transition: filter .12s;
@@ -1533,6 +1606,7 @@ function Build-DashboardHtml {
     .st-offline { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
     .st-out     { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
     .st-rt      { background: var(--c-rtoff-bg);    color: var(--c-rtoff-fg); }
+    .st-deg     { background: var(--c-degraded-bg); color: var(--c-degraded-fg); }
 
     .legend { display: inline-flex; flex-wrap: wrap; gap: 14px; align-items: center;
               margin-left: 10px; font-size: .78em; color: var(--text-muted); }
@@ -1701,6 +1775,8 @@ function Build-DashboardHtml {
       <div class="lbl">Outdated</div><div class="val">$outdated</div></div>
     <div class="stat st-rt"      data-card="rtoff"    onclick="filterByCard('rtoff')">
       <div class="lbl">RT Prot Off</div><div class="val">$rtOff</div></div>
+    <div class="stat st-deg"     data-card="degraded" onclick="filterByCard('degraded')">
+      <div class="lbl">Degraded</div><div class="val">$degraded</div></div>
   </div>
 
   <div class="toolbar">
@@ -1725,14 +1801,17 @@ function Build-DashboardHtml {
       <thead><tr>
         <th onclick="sort(0)">Computer &#9651;</th>
         <th onclick="sort(1)">IPv4</th>
-        <th onclick="sort(2)">Status</th>
-        <th onclick="sort(3)">Installed Version</th>
-        <th onclick="sort(4)">Currency</th>
-        <th onclick="sort(5)">RT Protection</th>
-        <th onclick="sort(6)">AV Enabled</th>
-        <th onclick="sort(7)">Last Quick Scan</th>
-        <th onclick="sort(8)">Threats</th>
-        <th onclick="sort(9)">Query Time</th>
+        <th onclick="sort(2)">Type</th>
+        <th onclick="sort(3)">Platform</th>
+        <th onclick="sort(4)">Status</th>
+        <th onclick="sort(5)">Installed Version</th>
+        <th onclick="sort(6)">Definitions Date</th>
+        <th onclick="sort(7)">Currency</th>
+        <th onclick="sort(8)">RT Protection</th>
+        <th onclick="sort(9)">AV Enabled</th>
+        <th onclick="sort(10)">Last Quick Scan</th>
+        <th onclick="sort(11)">Threats</th>
+        <th onclick="sort(12)">Query Time</th>
       </tr></thead>
       <tbody>
         $($rows -join "`n        ")
@@ -1743,6 +1822,32 @@ function Build-DashboardHtml {
   <div class="footer">
     Start-DefenderDashboard.ps1 v$ScriptVersion &nbsp;|&nbsp;
     $($Data.Count) computers &nbsp;|&nbsp; $onlineCount online &nbsp;|&nbsp; $offlineCount offline
+    &nbsp;|&nbsp; <a href="#" onclick="openIssuesModal(); return false;">Report an Issue</a>
+  </div>
+
+  <!-- Issues / Feedback modal -->
+  <div class="mdo-modal-backdrop" id="issuesModal" onclick="if(event.target===this)closeIssuesModal()">
+    <div class="mdo-modal" role="dialog" aria-modal="true" aria-labelledby="issuesTitle">
+      <h2 id="issuesTitle">Report an Issue / Feedback</h2>
+      <div class="mdo-sub">
+        This system is on an air-gapped network and cannot reach the internet
+        directly. Copy the URL below (or photograph this dialog) and open it
+        on an internet-connected PC to file a bug or feature request.
+      </div>
+      <h3>URL</h3>
+      <div style="display:flex; gap:10px; align-items:center; margin-bottom:8px;">
+        <input id="issuesUrl" type="text" readonly value="$IssuesUrl"
+               onfocus="this.select()"
+               style="flex:1; font-family:Consolas,monospace; font-size:.95em;
+                      padding:8px 10px; border:1px solid var(--border-strong);
+                      background:var(--bg-input); color:var(--text-primary);
+                      border-radius:6px;">
+        <button class="mdo-btn" id="issuesCopyBtn" onclick="copyIssuesUrl()">Copy URL</button>
+      </div>
+      <div class="mdo-modal-footer">
+        <button class="mdo-btn" onclick="closeIssuesModal()">Close</button>
+      </div>
+    </div>
   </div>
 
   <!-- Host Details modal (hidden until a row is clicked) -->
@@ -1832,6 +1937,7 @@ function Build-DashboardHtml {
         if (activeCards.offline  && row.dataset.online   !== 'false') cardMatch = false;
         if (activeCards.outdated && row.dataset.outdated !== 'true')  cardMatch = false;
         if (activeCards.rtoff    && row.dataset.rtoff    !== 'true')  cardMatch = false;
+        if (activeCards.degraded && row.dataset.degraded !== 'true')  cardMatch = false;
         row.style.display = (nameMatch && cardMatch) ? '' : 'none';
       }
       updateClearVisibility();
@@ -1936,6 +2042,17 @@ function Build-DashboardHtml {
         +   kv('Online',         h.online ? 'Yes' : 'No', h.online ? 'bool-true' : 'bool-false')
         +   kv('Query duration', (h.queryDurationSec != null ? h.queryDurationSec + 's' : '—'))
         + '</div>'
+        // System inventory: NodeType + Platform are the new grid columns;
+        // Manufacturer/Model/OS show the raw CIM values that drive Platform
+        // classification so operators can sanity-check the mapping.
+        + '<h3>System</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Type',             (h.nodeType     || '—'))
+        +   kv('Platform',         (h.platform     || '—'))
+        +   kv('Operating system', (h.osCaption    || '—'))
+        +   kv('Manufacturer',     (h.manufacturer || '—'))
+        +   kv('Model',            (h.model        || '—'))
+        + '</div>'
         + '<h3>Health Classification</h3>'
         + '<div class="mdo-kv">'
         +   '<div class="k">Status :</div><div class="v">' + pill + '</div>'
@@ -1945,6 +2062,7 @@ function Build-DashboardHtml {
         + '<div class="mdo-kv">'
         +   kv('WinDefend service',     h.defenderService)
         +   kv('Signature version',     h.signatureVersion + (h.versionStatus ? ' (' + h.versionStatus + ')' : ''))
+        +   kv('Definitions date',      (h.signatureLastUpdated || '—'))
         +   kv('Available version',     h.availableVersion)
         +   kv('Real-time protection',  h.realTimeProtection,        boolClass(h.realTimeProtection))
         +   kv('Antimalware service',   h.amServiceEnabled,          boolClass(h.amServiceEnabled))
@@ -1974,8 +2092,45 @@ function Build-DashboardHtml {
     function closeHostModal() {
       document.getElementById('mdoModal').classList.remove('show');
     }
+
+    // Issues / Feedback modal — separate from Host Details, surfaced by the
+    // footer link. Air-gapped operators copy the URL out to an internet-
+    // connected PC to file the actual issue.
+    function openIssuesModal() {
+      document.getElementById('issuesModal').classList.add('show');
+      // Focus + select so Ctrl+C works immediately.
+      var input = document.getElementById('issuesUrl');
+      if (input) { input.focus(); input.select(); }
+    }
+    function closeIssuesModal() {
+      document.getElementById('issuesModal').classList.remove('show');
+    }
+    function copyIssuesUrl() {
+      var input = document.getElementById('issuesUrl');
+      var btn   = document.getElementById('issuesCopyBtn');
+      if (!input) return;
+      var done = function() {
+        if (!btn) return;
+        var original = btn.textContent;
+        btn.textContent = '✓ Copied!';
+        setTimeout(function() { btn.textContent = original; }, 1500);
+      };
+      // Prefer the modern Clipboard API; fall back to execCommand for older
+      // browsers and for http:// contexts where Clipboard API is unavailable.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(input.value).then(done, function() {
+          input.select(); document.execCommand('copy'); done();
+        });
+      } else {
+        input.select(); document.execCommand('copy'); done();
+      }
+    }
+
     document.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') closeHostModal();
+      if (e.key === 'Escape') {
+        closeHostModal();
+        closeIssuesModal();
+      }
     });
     // Delegate row clicks (avoids re-binding after DOM mutations from sort).
     var tbl = document.getElementById('tbl');
@@ -2018,9 +2173,15 @@ function ConvertTo-DashboardJson {
             [ordered]@{
                 computerName              = $_.ComputerName
                 ipv4Address               = $_.IPv4Address
+                nodeType                  = $_.NodeType
+                platform                  = $_.Platform
+                osCaption                 = $_.OSCaption
+                manufacturer              = $_.Manufacturer
+                model                     = $_.Model
                 online                    = $_.Online
                 defenderService           = $_.DefenderService
                 signatureVersion          = $_.SignatureVersion
+                signatureLastUpdated      = $_.SignatureLastUpdated
                 availableVersion          = $_.AvailableVersion
                 versionStatus             = $_.VersionStatus
                 realTimeProtection        = $_.RealTimeProtection
@@ -2643,7 +2804,8 @@ try {
                     -AvailableVersionStr $AvailableVersionStr `
                     -AsOf               $script:CachedAt `
                     -IsRefreshing       $script:IsRefreshing `
-                    -Theme              $DashboardTheme
+                    -Theme              $DashboardTheme `
+                    -IssuesUrl          $IssuesUrl
                 Send-HttpResponse -Context $context -Body $html
             }
 
