@@ -2241,7 +2241,65 @@ function script:Get-PrintRowStatus {
 function script:Get-PrintCellValue {
     param($Row, $Column)
     if ($Column.Property -eq '__Status__') { return (Get-PrintRowStatus -Row $Row) }
-    return "$($Row.($Column.Property))"
+    $val = "$($Row.($Column.Property))"
+    if ($Column.Property -eq 'Error') {
+        # Strip the "(available: v…)" suffix the Ahead branch attaches to
+        # the .Error field — it's already in the sub-header, redundant on
+        # the printed report.
+        $val = $val -replace '\s*\(available:\s*v[\d.]+\)\s*', ''
+    }
+    return $val
+}
+
+# Rounded-rectangle path for the printed status pill. Mirrors the visual
+# style of the on-screen grid pill so the printed report looks like a
+# direct render of what the operator sees.
+function script:Get-RoundedRectPath {
+    param([System.Drawing.Rectangle]$Rect, [int]$Radius)
+    $r = [math]::Max(1, [math]::Min($Radius, [int]([math]::Min($Rect.Width, $Rect.Height) / 2)))
+    $d = $r * 2
+    $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
+    $path.AddArc($Rect.X,                     $Rect.Y,                      $d, $d, 180, 90)
+    $path.AddArc($Rect.Right  - $d,           $Rect.Y,                      $d, $d, 270, 90)
+    $path.AddArc($Rect.Right  - $d,           $Rect.Bottom - $d,            $d, $d,   0, 90)
+    $path.AddArc($Rect.X,                     $Rect.Bottom - $d,            $d, $d,  90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+# Build a human-readable description of the active filter state for the
+# printed report's sub-header. Audit-friendly — every printed report
+# carries the answer to "what subset of the fleet does this show?".
+function script:Get-PrintFilterDescription {
+    $parts = @()
+    if ($script:FilterText -and $script:FilterText.Trim()) {
+        $parts += "Filter: '$($script:FilterText.Trim())'"
+    }
+    if ($script:CardFilters -and $script:CardFilters.Count -gt 0) {
+        $parts += "Cards: $(@($script:CardFilters) -join ' + ')"
+    }
+    if ($parts.Count -eq 0) { return 'Filters: none (full fleet)' }
+    return ($parts -join '   |   ')
+}
+
+# Return the rows in the order the operator sees them on screen — same
+# filter (Get-FilteredResults) plus any active grid sort. Walking
+# $grid.Rows pulls the live DataGridView's current sort order so a
+# Computer-DESC click on the grid header is reflected on paper.
+function script:Get-PrintOrderedRows {
+    if (-not $script:AllResults) { return @() }
+    $filtered = Get-FilteredResults
+    if (-not $grid -or $grid.Rows.Count -eq 0) { return $filtered }
+    $byName = @{}
+    foreach ($r in $filtered) { $byName[$r.ComputerName] = $r }
+    $ordered = New-Object 'System.Collections.Generic.List[pscustomobject]'
+    foreach ($gr in $grid.Rows) {
+        $name = "$($gr.Cells[0].Value)"
+        if ($name -and $byName.ContainsKey($name)) {
+            [void]$ordered.Add($byName[$name])
+        }
+    }
+    return $ordered.ToArray()
 }
 
 # Column-picker dialog. Operators tick the columns they want on the
@@ -2410,18 +2468,36 @@ function Invoke-FleetPrint {
             $maxColW   = [int]($width * 0.25)
             $minWidths = @()
             $natWidths = @()
+            # Pre-measure every possible status string in the bold pill
+            # font so the Status column gets enough room for the widest
+            # ("ThreatsDetected") even on small fleets where the data
+            # happens to only contain shorter statuses.
+            $statusList = @('Healthy','Offline','Outdated','Degraded','ThreatsDetected')
+            $statusMaxW = 0.0
+            foreach ($s in $statusList) {
+                $sz = $g.MeasureString($s, $pillFont)
+                if ($sz.Width -gt $statusMaxW) { $statusMaxW = [double]$sz.Width }
+            }
             foreach ($col in $enabledCols) {
                 $hdrSize = $g.MeasureString($col.Name, $headerFont)
                 $minW = [int][math]::Ceiling($hdrSize.Width) + $padding
-                $maxValW = [double]$hdrSize.Width
-                foreach ($r in $Rows) {
-                    $val = Get-PrintCellValue -Row $r -Column $col
-                    if ($val) {
-                        $vSize = $g.MeasureString($val, $rowFont)
-                        if ($vSize.Width -gt $maxValW) { $maxValW = [double]$vSize.Width }
+                if ($col.Property -eq '__Status__') {
+                    # Pill column: account for the pill border inset (8px
+                    # total from column edges to pill edges) plus internal
+                    # text breathing room (~6px each side). Without this,
+                    # 'ThreatsDetected' ellipsises mid-word.
+                    $natW = [int][math]::Ceiling($statusMaxW) + 20
+                } else {
+                    $maxValW = [double]$hdrSize.Width
+                    foreach ($r in $Rows) {
+                        $val = Get-PrintCellValue -Row $r -Column $col
+                        if ($val) {
+                            $vSize = $g.MeasureString($val, $rowFont)
+                            if ($vSize.Width -gt $maxValW) { $maxValW = [double]$vSize.Width }
+                        }
                     }
+                    $natW = [int][math]::Ceiling($maxValW) + $padding
                 }
-                $natW = [int][math]::Ceiling($maxValW) + $padding
                 if ($natW -gt $maxColW) { $natW = $maxColW }
                 if ($natW -lt $minW)    { $natW = $minW }
                 $minWidths += $minW
@@ -2477,6 +2553,19 @@ function Invoke-FleetPrint {
             )
             $g.DrawString(($hdrParts -join '   |   '),
                 $infoFont, [System.Drawing.Brushes]::Black, [float]$left, [float]$y)
+
+            # Right-aligned filter description on the same line. Audit-
+            # friendly: every printed report carries the answer to "what
+            # subset of the fleet does this show?" — even when no filter
+            # is active ("Filters: none (full fleet)").
+            $filterDesc = Get-PrintFilterDescription
+            $sfFilterRight = [System.Drawing.StringFormat]::new()
+            $sfFilterRight.Alignment   = [System.Drawing.StringAlignment]::Far
+            $sfFilterRight.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+            $sfFilterRight.Trimming    = [System.Drawing.StringTrimming]::EllipsisCharacter
+            $filterRect = [System.Drawing.RectangleF]::new([float]$left, [float]$y, [float]$width, 18)
+            $g.DrawString($filterDesc, $infoFont, [System.Drawing.Brushes]::Black, $filterRect, $sfFilterRight)
+            $sfFilterRight.Dispose()
             $y += 20
 
             $accentPen = [System.Drawing.Pen]::new($clrPrimary, 2)
@@ -2502,6 +2591,14 @@ function Invoke-FleetPrint {
         $sfWrap.Trimming      = [System.Drawing.StringTrimming]::EllipsisCharacter
         $sfWrap.FormatFlags   = 0
         $sfWrap.LineAlignment = [System.Drawing.StringAlignment]::Near
+        # Pill text uses center-center alignment (item 2 of the
+        # 2026-05-31 print refinement feedback) and matches the on-screen
+        # grid pill aesthetic.
+        $sfPillCenter = [System.Drawing.StringFormat]::new()
+        $sfPillCenter.Alignment     = [System.Drawing.StringAlignment]::Center
+        $sfPillCenter.LineAlignment = [System.Drawing.StringAlignment]::Center
+        $sfPillCenter.FormatFlags   = [System.Drawing.StringFormatFlags]::NoWrap
+        $sfPillCenter.Trimming      = [System.Drawing.StringTrimming]::EllipsisCharacter
         $x = $left
         for ($i = 0; $i -lt $enabledCols.Count; $i++) {
             $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 3), [float]($colW[$i] - 6), [float]($hdrRowH - 4))
@@ -2557,6 +2654,7 @@ function Invoke-FleetPrint {
                 if ($col.Property -eq '__Status__') {
                     # Status pill stays fixed-height + top-aligned in the
                     # cell — don't stretch it to match a wrapped row.
+                    # Rounded edges + centered text mirror the GUI pill.
                     $pillBg = switch ($status) {
                         'Healthy'         { $clrSuccess }
                         'Offline'         { $clrOffline }
@@ -2570,9 +2668,19 @@ function Invoke-FleetPrint {
                     $pillFgBrush = [System.Drawing.SolidBrush]::new($pillFg)
                     $pillH = $baseRowH - 4
                     $pillRect = [System.Drawing.Rectangle]::new($x + 4, $y + 2, $colW[$i] - 8, $pillH)
-                    $g.FillRectangle($pillBgBrush, $pillRect)
-                    $textRect = [System.Drawing.RectangleF]::new([float]($x + 6), [float]($y + 3), [float]($colW[$i] - 12), [float]$pillH)
-                    $g.DrawString($status, $pillFont, $pillFgBrush, $textRect, $sf)
+                    # Anti-aliased rounded-rectangle fill mirrors the
+                    # GUI's CellPainting pill. Radius is half the pill
+                    # height — fully-pill-shaped ends — capped at 6px.
+                    $prevSmoothing = $g.SmoothingMode
+                    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+                    $pillPath = Get-RoundedRectPath -Rect $pillRect -Radius 6
+                    $g.FillPath($pillBgBrush, $pillPath)
+                    $pillPath.Dispose()
+                    $g.SmoothingMode = $prevSmoothing
+                    # Text rectangle = pill rectangle; center-center
+                    # alignment via $sfPillCenter handles the positioning.
+                    $textRect = [System.Drawing.RectangleF]::new([float]$pillRect.X, [float]$pillRect.Y, [float]$pillRect.Width, [float]$pillRect.Height)
+                    $g.DrawString($status, $pillFont, $pillFgBrush, $textRect, $sfPillCenter)
                     $pillBgBrush.Dispose()
                     $pillFgBrush.Dispose()
                 } elseif ($i -eq $errorIdx) {
@@ -2595,7 +2703,9 @@ function Invoke-FleetPrint {
         }
         if ($script:PrintRowIdx -ge $Rows.Count) { $reachedEnd = $true }
         $borderPen.Dispose()
+        $sf.Dispose()
         $sfWrap.Dispose()
+        $sfPillCenter.Dispose()
 
         # Footer on every page — script identity + source path on the left,
         # page number right-aligned to the page's right margin (per operator
@@ -2729,11 +2839,11 @@ $btnPrintColumns.add_Click({
 })
 
 $btnPreview.add_Click({
-    Invoke-FleetPrint -Rows (Get-FilteredResults) -Mode Preview
+    Invoke-FleetPrint -Rows (Get-PrintOrderedRows) -Mode Preview
 })
 
 $btnPrint.add_Click({
-    Invoke-FleetPrint -Rows (Get-FilteredResults) -Mode Print
+    Invoke-FleetPrint -Rows (Get-PrintOrderedRows) -Mode Print
 })
 
 $btnExportCsv.add_Click({
