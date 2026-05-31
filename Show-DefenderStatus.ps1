@@ -2389,42 +2389,74 @@ function Invoke-FleetPrint {
         $rowsBottom = $bottom - 22
 
         # ---- Smart column sizing (computed once per job, on page 1) ----
-        # Each column's natural width = max(header width, widest cell
-        # content) + horizontal padding. If the sum fits the available
-        # width, columns get their natural widths and stay readable. If it
-        # exceeds the page, all columns scale down proportionally so the
-        # table still spans the page but no single column gets squished
-        # disproportionately (Error / Detail still ellipsises when needed).
+        # The naive proportional approach (just scale by natural widths) fails
+        # when one column has an extreme outlier — a 400-char WinRM error in
+        # Error / Detail can be wider than the entire page on its own, which
+        # makes the scaling factor crush every other column down to single
+        # characters (even truncating headers like "Computer" -> "Co").
+        #
+        # Two guards fix that:
+        #   (a) cap any single column at 25% of the page (Error / Detail
+        #       gets ample room but no longer dominates);
+        #   (b) every column gets *at least* its header width so the header
+        #       row always reads cleanly even on a crowded page.
+        #
+        # The slack between min and natural totals is distributed to the
+        # columns that asked for more room (proportional to nat - min), so
+        # a wide Computer column still gets noticeably more room than a
+        # narrow Type column even when the page is tight.
         if ($null -eq $script:PrintColW) {
-            $padding = 14
+            $padding   = 14
+            $maxColW   = [int]($width * 0.25)
+            $minWidths = @()
             $natWidths = @()
             foreach ($col in $enabledCols) {
                 $hdrSize = $g.MeasureString($col.Name, $headerFont)
-                $maxW = [double]$hdrSize.Width
+                $minW = [int][math]::Ceiling($hdrSize.Width) + $padding
+                $maxValW = [double]$hdrSize.Width
                 foreach ($r in $Rows) {
                     $val = Get-PrintCellValue -Row $r -Column $col
                     if ($val) {
                         $vSize = $g.MeasureString($val, $rowFont)
-                        if ($vSize.Width -gt $maxW) { $maxW = [double]$vSize.Width }
+                        if ($vSize.Width -gt $maxValW) { $maxValW = [double]$vSize.Width }
                     }
                 }
-                $natWidths += [int][math]::Ceiling($maxW) + $padding
+                $natW = [int][math]::Ceiling($maxValW) + $padding
+                if ($natW -gt $maxColW) { $natW = $maxColW }
+                if ($natW -lt $minW)    { $natW = $minW }
+                $minWidths += $minW
+                $natWidths += $natW
             }
-            $total = ($natWidths | Measure-Object -Sum).Sum
-            if ($total -le $width) {
-                # Fits naturally — distribute the leftover width
-                # proportionally to natural sizes so the table still spans
-                # the page (avoids a half-empty page with a narrow strip).
-                $remaining = $width - $total
+            $totalMin = ($minWidths | Measure-Object -Sum).Sum
+            $totalNat = ($natWidths | Measure-Object -Sum).Sum
+
+            if ($totalMin -ge $width) {
+                # Pathological: headers alone don't fit. Give every column
+                # an equal slice and let the StringFormat ellipsise.
+                $unit = [int]($width / $enabledCols.Count)
+                $script:PrintColW = @(0..($enabledCols.Count - 1) | ForEach-Object { $unit })
+            } elseif ($totalNat -le $width) {
+                # Everything fits with room to spare — distribute the
+                # surplus proportionally to natural width so the table
+                # still spans the page (no half-empty page).
+                $surplus = $width - $totalNat
                 $script:PrintColW = @($natWidths | ForEach-Object {
-                    [int]([math]::Floor($_ + $remaining * $_ / $total))
+                    [int]([math]::Floor($_ + $surplus * $_ / $totalNat))
                 })
             } else {
-                # Overflow — scale proportionally to fit. Columns that need
-                # more room still get more room; the squish is even.
-                $script:PrintColW = @($natWidths | ForEach-Object {
-                    [int]([math]::Floor($_ * $width / $total))
-                })
+                # Doesn't all fit. Every column gets its minimum; the
+                # remaining slack goes to columns that asked for more,
+                # proportional to (nat - min).
+                $slack      = $width - $totalMin
+                $totalExtra = $totalNat - $totalMin
+                $script:PrintColW = @()
+                for ($i = 0; $i -lt $enabledCols.Count; $i++) {
+                    $extra = $natWidths[$i] - $minWidths[$i]
+                    $share = if ($totalExtra -gt 0) {
+                        [int]([math]::Floor($slack * $extra / $totalExtra))
+                    } else { 0 }
+                    $script:PrintColW += $minWidths[$i] + $share
+                }
             }
         }
         $colW = $script:PrintColW
@@ -2523,10 +2555,22 @@ function Invoke-FleetPrint {
         if ($script:PrintRowIdx -ge $Rows.Count) { $reachedEnd = $true }
         $borderPen.Dispose()
 
-        # Footer on every page
-        $footerText = "Page $($script:PrintPgNum)   |   Show-DefenderStatus.ps1 v$ScriptVersion   |   $(if ($SourceSharePath) { "Source: $SourceSharePath" } else { 'No source share configured' })"
-        $g.DrawString($footerText, $footerFont, [System.Drawing.Brushes]::Gray,
-            [float]$left, [float]($bottom + 4))
+        # Footer on every page — script identity + source path on the left,
+        # page number right-aligned to the page's right margin (per operator
+        # feedback: page number is the first thing people look for when
+        # collating a multi-page report, so it gets the prime corner).
+        $footerLeft  = "Show-DefenderStatus.ps1 v$ScriptVersion   |   $(if ($SourceSharePath) { "Source: $SourceSharePath" } else { 'No source share configured' })"
+        $footerRight = "Page $($script:PrintPgNum)"
+        $footerY     = [float]($bottom + 4)
+        $g.DrawString($footerLeft, $footerFont, [System.Drawing.Brushes]::Gray,
+            [float]$left, $footerY)
+
+        $sfRight = [System.Drawing.StringFormat]::new()
+        $sfRight.Alignment    = [System.Drawing.StringAlignment]::Far
+        $sfRight.FormatFlags  = [System.Drawing.StringFormatFlags]::NoWrap
+        $footerRightRect = [System.Drawing.RectangleF]::new([float]$left, $footerY, [float]$width, 14)
+        $g.DrawString($footerRight, $footerFont, [System.Drawing.Brushes]::Gray, $footerRightRect, $sfRight)
+        $sfRight.Dispose()
 
         $ev.HasMorePages = -not $reachedEnd
     })
