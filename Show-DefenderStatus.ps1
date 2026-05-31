@@ -2490,9 +2490,18 @@ function Invoke-FleetPrint {
         $hdrBg = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(232, 232, 232))
         $g.FillRectangle($hdrBg, $left, $y, $width, $hdrRowH)
         $hdrBg.Dispose()
+        # Two StringFormats: $sf is NoWrap (truncates with ellipsis) for the
+        # short-string columns and headers; $sfWrap allows wrapping for the
+        # Error / Detail column so long error messages stay readable
+        # instead of getting cut off at one line.
         $sf = [System.Drawing.StringFormat]::new()
-        $sf.Trimming    = [System.Drawing.StringTrimming]::EllipsisCharacter
-        $sf.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+        $sf.Trimming      = [System.Drawing.StringTrimming]::EllipsisCharacter
+        $sf.FormatFlags   = [System.Drawing.StringFormatFlags]::NoWrap
+        $sf.LineAlignment = [System.Drawing.StringAlignment]::Near
+        $sfWrap = [System.Drawing.StringFormat]::new()
+        $sfWrap.Trimming      = [System.Drawing.StringTrimming]::EllipsisCharacter
+        $sfWrap.FormatFlags   = 0
+        $sfWrap.LineAlignment = [System.Drawing.StringAlignment]::Near
         $x = $left
         for ($i = 0; $i -lt $enabledCols.Count; $i++) {
             $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 3), [float]($colW[$i] - 6), [float]($hdrRowH - 4))
@@ -2503,19 +2512,42 @@ function Invoke-FleetPrint {
         $borderPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(180, 180, 180))
         $g.DrawLine($borderPen, $left, $y, $right, $y)
 
-        # Data rows
-        $dataRowH = 16
+        # Find the Error / Detail column index (if it's currently enabled)
+        # so we can pre-measure each row's wrapped height before painting.
+        $errorIdx = -1
+        for ($i = 0; $i -lt $enabledCols.Count; $i++) {
+            if ($enabledCols[$i].Property -eq 'Error') { $errorIdx = $i; break }
+        }
+
+        # Data rows. Row height is variable now — short / empty errors
+        # render at the base 16px; long ones grow to fit the wrapped text.
+        # This means fewer rows per page when errors are long, which is
+        # the right trade for keeping the content readable.
+        $baseRowH = 16
         $reachedEnd = $false
         while ($script:PrintRowIdx -lt $Rows.Count) {
-            if (($y + $dataRowH) -gt $rowsBottom) { break }
-
             $r = $Rows[$script:PrintRowIdx]
             $status = Get-PrintRowStatus -Row $r
 
-            # Alternating row tint matches the grid.
+            # Pre-measure this row's height. Error / Detail is the only
+            # column that wraps; everything else fits on one line by
+            # construction (smart sizing already capped column widths).
+            $thisRowH = $baseRowH
+            if ($errorIdx -ge 0 -and $r.Error) {
+                $errorTxt = "$($r.Error)"
+                $errorW   = [float]($colW[$errorIdx] - 6)
+                $measured = $g.MeasureString($errorTxt, $rowFont, $errorW, $sfWrap)
+                $needed   = [int][math]::Ceiling($measured.Height) + 4
+                if ($needed -gt $thisRowH) { $thisRowH = $needed }
+            }
+
+            if (($y + $thisRowH) -gt $rowsBottom) { break }
+
+            # Alternating row tint matches the grid; spans the full
+            # (variable) row height.
             if ($script:PrintRowIdx % 2 -eq 1) {
                 $altBg = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(249, 249, 249))
-                $g.FillRectangle($altBg, $left, $y, $width, $dataRowH)
+                $g.FillRectangle($altBg, $left, $y, $width, $thisRowH)
                 $altBg.Dispose()
             }
 
@@ -2523,7 +2555,8 @@ function Invoke-FleetPrint {
             for ($i = 0; $i -lt $enabledCols.Count; $i++) {
                 $col = $enabledCols[$i]
                 if ($col.Property -eq '__Status__') {
-                    # Status pill — small rounded-ish badge with the status color.
+                    # Status pill stays fixed-height + top-aligned in the
+                    # cell — don't stretch it to match a wrapped row.
                     $pillBg = switch ($status) {
                         'Healthy'         { $clrSuccess }
                         'Offline'         { $clrOffline }
@@ -2535,25 +2568,34 @@ function Invoke-FleetPrint {
                     $pillFg = if ($status -eq 'Outdated') { $clrTextDark } else { $clrWhite }
                     $pillBgBrush = [System.Drawing.SolidBrush]::new($pillBg)
                     $pillFgBrush = [System.Drawing.SolidBrush]::new($pillFg)
-                    $pillRect = [System.Drawing.Rectangle]::new($x + 4, $y + 2, $colW[$i] - 8, $dataRowH - 4)
+                    $pillH = $baseRowH - 4
+                    $pillRect = [System.Drawing.Rectangle]::new($x + 4, $y + 2, $colW[$i] - 8, $pillH)
                     $g.FillRectangle($pillBgBrush, $pillRect)
-                    $textRect = [System.Drawing.RectangleF]::new([float]($x + 6), [float]($y + 3), [float]($colW[$i] - 12), [float]($dataRowH - 4))
+                    $textRect = [System.Drawing.RectangleF]::new([float]($x + 6), [float]($y + 3), [float]($colW[$i] - 12), [float]$pillH)
                     $g.DrawString($status, $pillFont, $pillFgBrush, $textRect, $sf)
                     $pillBgBrush.Dispose()
                     $pillFgBrush.Dispose()
+                } elseif ($i -eq $errorIdx) {
+                    # Wrapped Error / Detail — full row height, top-aligned.
+                    $val = "$($r.Error)"
+                    $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 2), [float]($colW[$i] - 6), [float]($thisRowH - 2))
+                    $g.DrawString($val, $rowFont, [System.Drawing.Brushes]::Black, $cellRect, $sfWrap)
                 } else {
+                    # Non-wrapping cell — top-aligned in a tall row so it
+                    # lines up with the first line of any wrapped Error.
                     $val = Get-PrintCellValue -Row $r -Column $col
-                    $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 2), [float]($colW[$i] - 6), [float]($dataRowH - 2))
+                    $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 2), [float]($colW[$i] - 6), [float]($thisRowH - 2))
                     $g.DrawString($val, $rowFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
                 }
                 $x += $colW[$i]
             }
-            $g.DrawLine($borderPen, $left, $y + $dataRowH, $right, $y + $dataRowH)
-            $y += $dataRowH
+            $g.DrawLine($borderPen, $left, $y + $thisRowH, $right, $y + $thisRowH)
+            $y += $thisRowH
             $script:PrintRowIdx++
         }
         if ($script:PrintRowIdx -ge $Rows.Count) { $reachedEnd = $true }
         $borderPen.Dispose()
+        $sfWrap.Dispose()
 
         # Footer on every page — script identity + source path on the left,
         # page number right-aligned to the page's right margin (per operator
