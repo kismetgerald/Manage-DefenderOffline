@@ -2629,13 +2629,19 @@ function Invoke-FleetPrint {
             # Pre-measure this row's height. Error / Detail is the only
             # column that wraps; everything else fits on one line by
             # construction (smart sizing already capped column widths).
+            # Read the value through Get-PrintCellValue so the
+            # "(available: v…)" strip applied in the Error branch runs
+            # against the measured text (otherwise the row reserves
+            # height for content that won't actually print).
             $thisRowH = $baseRowH
-            if ($errorIdx -ge 0 -and $r.Error) {
-                $errorTxt = "$($r.Error)"
-                $errorW   = [float]($colW[$errorIdx] - 6)
-                $measured = $g.MeasureString($errorTxt, $rowFont, $errorW, $sfWrap)
-                $needed   = [int][math]::Ceiling($measured.Height) + 4
-                if ($needed -gt $thisRowH) { $thisRowH = $needed }
+            if ($errorIdx -ge 0) {
+                $errorTxt = Get-PrintCellValue -Row $r -Column $enabledCols[$errorIdx]
+                if ($errorTxt) {
+                    $errorW   = [float]($colW[$errorIdx] - 6)
+                    $measured = $g.MeasureString($errorTxt, $rowFont, $errorW, $sfWrap)
+                    $needed   = [int][math]::Ceiling($measured.Height) + 4
+                    if ($needed -gt $thisRowH) { $thisRowH = $needed }
+                }
             }
 
             if (($y + $thisRowH) -gt $rowsBottom) { break }
@@ -2685,7 +2691,11 @@ function Invoke-FleetPrint {
                     $pillFgBrush.Dispose()
                 } elseif ($i -eq $errorIdx) {
                     # Wrapped Error / Detail — full row height, top-aligned.
-                    $val = "$($r.Error)"
+                    # Route through Get-PrintCellValue so the
+                    # "(available: v…)" strip actually applies on render
+                    # (previously this branch read $r.Error raw, so the
+                    # strip silently no-op'd on Ahead hosts).
+                    $val = Get-PrintCellValue -Row $r -Column $col
                     $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 2), [float]($colW[$i] - 6), [float]($thisRowH - 2))
                     $g.DrawString($val, $rowFont, [System.Drawing.Brushes]::Black, $cellRect, $sfWrap)
                 } else {

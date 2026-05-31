@@ -1644,8 +1644,13 @@ function Build-DashboardHtml {
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: var(--bg-row-hover); }
 
+    /* Uniform pill width across all statuses — sized so 'ThreatsDetected'
+       (the widest label) fits comfortably; shorter labels center inside
+       the fixed width. Mirrors the GUI grid, where the Status column
+       paints a full-cell-width pill so every row's pill is the same size. */
     .badge { display: inline-block; padding: 3px 12px; border-radius: 12px;
-             font-size: .78em; font-weight: 700; }
+             font-size: .78em; font-weight: 700;
+             min-width: 130px; text-align: center; box-sizing: border-box; }
     .b-ok  { background: var(--c-online-bg);   color: var(--c-online-fg); }
     .b-off { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
     .b-out { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
