@@ -4,7 +4,7 @@
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
-[![Version](https://img.shields.io/badge/Version-0.0.17-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
+[![Version](https://img.shields.io/badge/Version-0.0.18-orange.svg)](https://github.com/kismetgerald/Manage-DefenderOffline)
 
 > 👉 **New here?** Read [QUICKSTART.md](QUICKSTART.md) — dashboard running and reachable from a remote workstation in under 10 minutes.
 
@@ -699,7 +699,35 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.17 (2026-05-29) — Current
+### v0.0.18 (2026-05-31) — Current
+
+First-demo-feedback batch from an operator review of v0.0.17 on the work lab. Six core feature items, plus a Print path that went through several rounds of refinement based on observed output.
+
+**Both UIs — first-demo feedback batch:**
+- ✨ **Type + Platform columns** on both grids and modals. Per-host CIM (`Win32_OperatingSystem.ProductType` + `Win32_ComputerSystem.Manufacturer`/`Model`) classifies hosts as Workstation/Server/DC and VMware/Hyper-V/VirtualBox/KVM-QEMU/Xen/Parallels/Physical. Modals gain a new "System" section showing the raw CIM strings so operators can sanity-check the platform mapping.
+- ✨ **Virus Definitions Date column** sourced from `Get-MpComputerStatus.AntivirusSignatureLastUpdated`. Replaces the GUI's redundant "Available Version" column (info was already in the header banner); added as a new column on the dashboard. Both modals get a "Definitions date" key.
+- ✨ **Degraded stat card** as the 5th card on both UIs. The colour legend listed 5 statuses (Healthy / Outdated / ThreatsDetected / Degraded / Offline) but only 4 were filterable; this closes the gap. ThreatsDetected stays as a row-level pill only — rare enough that the red pill already draws the eye.
+- 🐛 **Outdated pill colour parity**. The Outdated stat cards already shared #f59e0b amber from v0.0.16, but the row-level Outdated badge in the GUI was still #9c5100 (dark brown) with white text. GUI now uses #f59e0b + dark text to match the dashboard.
+- ✨ **Issues / Feedback link with air-gap guidance**. Operators on an air-gapped network need an obvious way to file bugs. GUI: bold blue LinkLabel top-right of the header opens a dialog with the URL in a Consolas TextBox + Copy URL to Clipboard button + "copy to an internet-connected PC" instructions. Dashboard: footer link opens a corresponding modal. Config-driven via new `[Common] IssuesUrl` setting; defaults to the public GitHub URL, overridable for GHE / Jira / etc.
+
+**`Show-DefenderStatus.ps1` — Print from GUI:**
+- ✨ New toolbar buttons: 🗂 Print Columns…, 🔍 Print Preview, ⎙ Print.
+- ✨ **Print** opens the standard Windows `PrintDialog` (XP-era EX variant) — printer dropdown, Properties for driver preferences, copies, orientation. OK sends the job; status bar confirms "Print job sent to <PrinterName> (N hosts)".
+- ✨ **Print Preview** opens `PageSetupDialog` first (orientation, paper size, margins; selections persist for the session and apply to both Preview and Print), then renders the report to a temp PDF via the "Microsoft Print to PDF" virtual printer, and opens it in the operator's default viewer (Edge, Adobe, etc.) for the modern preview experience. Falls back to the basic `PrintPreviewDialog` if Microsoft Print to PDF is missing.
+- ✨ **Print Columns…** opens a CheckedListBox where operators tick the columns they want printed. Selection persists for the session; an empty selection falls back to all columns so a misconfiguration doesn't print a blank table.
+- ✨ Rendered output: title + sub-header band (`Generated: …  |  Available: v…  |  Hosts shown: N` on the left, filter description `"Filter: 'pst' | Cards: Online + Outdated"` or `"Filters: none (full fleet)"` right-aligned on the same line), 3px Defender-blue accent line, alternating-row tinted table with rounded-edge centered status pills matching the GUI grid, and a per-page footer (script + version + source share on the left, `Page N` right-aligned). Honours the GUI's column sort — clicking a grid header to sort by Status DESC reflects on paper.
+- ✨ Smart column sizing measures every value via `Graphics.MeasureString` and assigns proportional widths within page constraints. Status column uses the bold pill font for measurement so 'ThreatsDetected' fits without ellipsis; any single column capped at 25% of page width so one outlier (typically a long WinRM error) doesn't crush every other column.
+- ✨ Error / Detail wraps to multiple lines when long; row heights become variable accordingly. The "(available: vX.X.X.X)" suffix is stripped on print (redundant with the header banner; still visible in the on-screen grid + modal).
+- 🐛 Bugfix on the way: a now-removed `Add-Type -AssemblyName System.Drawing.Printing` was crashing startup (no standalone DLL exists on either PS 5.1 or 7+). The Printing types are reachable via the existing `System.Drawing` load.
+
+**`Start-DefenderDashboard.ps1` — uniform pill widths:**
+- ✨ Status pills are now `min-width: 130px` + `text-align: center` + `box-sizing: border-box`, so every pill renders the same width regardless of label length. Mirrors the GUI grid where the Status column paints a full-cell-width pill. Shorter labels ('Healthy', 'Offline') centre inside the fixed width.
+
+**Docs / config:**
+- 📝 `conf/config.conf`: new `[Common] IssuesUrl` setting documented inline.
+- 📝 `docs/plans/v0.0.18-demo-feedback.md` (gitignored maintainer plan) captures the design rationale and decision log for each of the six items.
+
+### v0.0.17 (2026-05-29)
 
 Focused single-feature release: multi-card AND combinations on both UIs (ISSM #14, leaner scope).
 
