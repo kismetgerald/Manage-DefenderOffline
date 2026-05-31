@@ -1269,11 +1269,12 @@ function New-ToolButton ([string]$Text) {
     return $b
 }
 
-$btnRefresh     = New-ToolButton '⟳  Refresh Now'
-$btnExportCsv   = New-ToolButton '⬇  Export CSV'
-$btnExportHtml  = New-ToolButton '⬇  Export HTML'
-$btnPreview     = New-ToolButton '🔍  Print Preview'
-$btnPrint       = New-ToolButton '⎙  Print'
+$btnRefresh      = New-ToolButton '⟳  Refresh Now'
+$btnExportCsv    = New-ToolButton '⬇  Export CSV'
+$btnExportHtml   = New-ToolButton '⬇  Export HTML'
+$btnPrintColumns = New-ToolButton '🗂  Print Columns…'
+$btnPreview      = New-ToolButton '🔍  Print Preview'
+$btnPrint        = New-ToolButton '⎙  Print'
 
 $sep            = [System.Windows.Forms.Label]::new()
 $sep.Width      = 24
@@ -1313,7 +1314,7 @@ $lblCountdown.ForeColor  = $clrTextMuted
 $lblCountdown.Padding    = [System.Windows.Forms.Padding]::new(6, 9, 0, 0)
 $lblCountdown.Font       = [System.Drawing.Font]::new('Segoe UI', 9)
 
-$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $btnPreview, $btnPrint, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
+$pnlToolbar.Controls.AddRange(@($btnRefresh, $btnExportCsv, $btnExportHtml, $btnPrintColumns, $btnPreview, $btnPrint, $sep, $lblFilter, $txtFilter, $chkAuto, $lblCountdown))
 #endregion
 
 #region Status bar
@@ -2207,11 +2208,124 @@ $chkAuto.add_CheckedChanged({
     }
 })
 
-# Render the current grid (post-filter) to either a PrintPreviewDialog or
-# direct-to-printer via PrintDialog, depending on which toolbar button
-# fired. Color rendering matches the on-screen grid; the printer/driver
-# at print time owns color-vs-grayscale and orientation choice. v0.0.18
-# (demo feedback #2, refined 2026-05-30).
+# Persistent print state for the session — column selection, page setup,
+# and the cached per-job column widths set by the first PrintPage event.
+# Initial defaults: every column on, landscape Letter, default margins.
+$script:PrintColumns = @(
+    [pscustomobject]@{ Name='Computer';          Property='ComputerName';        Print=$true }
+    [pscustomobject]@{ Name='IPv4';              Property='IPv4Address';         Print=$true }
+    [pscustomobject]@{ Name='Type';              Property='NodeType';            Print=$true }
+    [pscustomobject]@{ Name='Platform';          Property='Platform';            Print=$true }
+    [pscustomobject]@{ Name='Status';            Property='__Status__';          Print=$true }
+    [pscustomobject]@{ Name='Installed Version'; Property='SignatureVersion';    Print=$true }
+    [pscustomobject]@{ Name='Definitions Date';  Property='SignatureLastUpdated';Print=$true }
+    [pscustomobject]@{ Name='Currency';          Property='VersionStatus';       Print=$true }
+    [pscustomobject]@{ Name='RT Prot';           Property='RealTimeProtection';  Print=$true }
+    [pscustomobject]@{ Name='AV';                Property='AntivirusEnabled';    Print=$true }
+    [pscustomobject]@{ Name='Last Quick Scan';   Property='LastQuickScan';       Print=$true }
+    [pscustomobject]@{ Name='Threats';           Property='ThreatCount';         Print=$true }
+    [pscustomobject]@{ Name='Error / Detail';    Property='Error';               Print=$true }
+)
+$script:PrintPageSettings = $null   # set on first Page Setup OK; null = use defaults
+$script:PrintColW         = $null   # populated by first PrintPage of each job
+
+function script:Get-PrintRowStatus {
+    param($Row)
+    if (-not $Row.Online) { return 'Offline' }
+    if ($Row.VersionStatus -eq 'Outdated') { return 'Outdated' }
+    if ($Row.HealthStatus) { return $Row.HealthStatus }
+    if ($Row.RealTimeProtection -eq 'False' -or $Row.AntivirusEnabled -eq 'False') { return 'Degraded' }
+    return 'Healthy'
+}
+
+function script:Get-PrintCellValue {
+    param($Row, $Column)
+    if ($Column.Property -eq '__Status__') { return (Get-PrintRowStatus -Row $Row) }
+    return "$($Row.($Column.Property))"
+}
+
+# Column-picker dialog. Operators tick the columns they want on the
+# printed report; selection persists for the session (until script
+# restart). Selection survives between Print Preview and Print clicks
+# so the two stay in sync.
+function Show-PrintColumnsDialog {
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'Print Columns'
+    $dlg.Size            = [System.Drawing.Size]::new(380, 470)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $clrCardBg
+    $dlg.Font            = [System.Drawing.Font]::new('Segoe UI', 9)
+
+    $lblIntro             = [System.Windows.Forms.Label]::new()
+    $lblIntro.Text        = 'Select which columns appear on the printed report. Unchecked columns stay visible on the on-screen grid and modal.'
+    $lblIntro.Font        = [System.Drawing.Font]::new('Segoe UI', 9)
+    $lblIntro.ForeColor   = $clrTextDark
+    $lblIntro.Location    = [System.Drawing.Point]::new(16, 14)
+    $lblIntro.Size        = [System.Drawing.Size]::new(340, 50)
+
+    $list                  = [System.Windows.Forms.CheckedListBox]::new()
+    $list.Location         = [System.Drawing.Point]::new(16, 72)
+    $list.Size             = [System.Drawing.Size]::new(340, 280)
+    $list.CheckOnClick     = $true
+    $list.BorderStyle      = 'FixedSingle'
+    foreach ($c in $script:PrintColumns) {
+        $idx = $list.Items.Add($c.Name)
+        $list.SetItemChecked($idx, [bool]$c.Print)
+    }
+
+    $btnAll              = [System.Windows.Forms.Button]::new()
+    $btnAll.Text         = 'Select All'
+    $btnAll.Location     = [System.Drawing.Point]::new(16, 362)
+    $btnAll.Size         = [System.Drawing.Size]::new(90, 28)
+    $btnAll.add_Click({
+        for ($i = 0; $i -lt $list.Items.Count; $i++) { $list.SetItemChecked($i, $true) }
+    })
+
+    $btnNone             = [System.Windows.Forms.Button]::new()
+    $btnNone.Text        = 'Clear All'
+    $btnNone.Location    = [System.Drawing.Point]::new(112, 362)
+    $btnNone.Size        = [System.Drawing.Size]::new(90, 28)
+    $btnNone.add_Click({
+        for ($i = 0; $i -lt $list.Items.Count; $i++) { $list.SetItemChecked($i, $false) }
+    })
+
+    $btnOk               = [System.Windows.Forms.Button]::new()
+    $btnOk.Text          = 'OK'
+    $btnOk.Location      = [System.Drawing.Point]::new(196, 395)
+    $btnOk.Size          = [System.Drawing.Size]::new(76, 28)
+    $btnOk.BackColor     = $clrPrimary
+    $btnOk.ForeColor     = $clrWhite
+    $btnOk.FlatStyle     = 'Flat'
+    $btnOk.FlatAppearance.BorderSize = 0
+    $btnOk.add_Click({
+        for ($i = 0; $i -lt $list.Items.Count; $i++) {
+            $script:PrintColumns[$i].Print = [bool]$list.GetItemChecked($i)
+        }
+        $dlg.DialogResult = 'OK'
+        $dlg.Close()
+    })
+
+    $btnCancel           = [System.Windows.Forms.Button]::new()
+    $btnCancel.Text      = 'Cancel'
+    $btnCancel.Location  = [System.Drawing.Point]::new(280, 395)
+    $btnCancel.Size      = [System.Drawing.Size]::new(76, 28)
+    $btnCancel.add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
+
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+    $dlg.Controls.AddRange(@($lblIntro, $list, $btnAll, $btnNone, $btnOk, $btnCancel))
+    [void]$dlg.ShowDialog($form)
+    $dlg.Dispose()
+}
+
+# Render the current grid (post-filter) to either a temp PDF + default
+# viewer (Preview) or direct-to-printer via PrintDialog (Print). Color
+# rendering matches the on-screen grid; the printer/driver at print time
+# owns color-vs-grayscale and orientation choice. v0.0.18 (demo feedback
+# #2, refined 2026-05-30 then 2026-05-31).
 function Invoke-FleetPrint {
     param(
         [object[]]$Rows,
@@ -2226,10 +2340,20 @@ function Invoke-FleetPrint {
         return
     }
 
-    # Mutable counters carried across PrintPage events. Closure-scoped so a
-    # second print job after the first completes starts fresh.
+    # Filter to the columns the operator has currently selected via the
+    # Print Columns dialog. If they've unchecked everything, fall back to
+    # all columns rather than printing a blank table — a misconfiguration
+    # shouldn't waste paper.
+    $enabledCols = @($script:PrintColumns | Where-Object { $_.Print })
+    if ($enabledCols.Count -eq 0) {
+        $enabledCols = @($script:PrintColumns)
+    }
+
+    # Mutable counters carried across PrintPage events. Reset per job so
+    # a second click of Print/Preview starts at row 0 / page 1.
     $script:PrintRowIdx = 0
     $script:PrintPgNum  = 0
+    $script:PrintColW   = $null
 
     $titleFont  = [System.Drawing.Font]::new('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
     $infoFont   = [System.Drawing.Font]::new('Segoe UI', 9)
@@ -2238,29 +2362,17 @@ function Invoke-FleetPrint {
     $footerFont = [System.Drawing.Font]::new('Segoe UI', 7)
     $pillFont   = [System.Drawing.Font]::new('Segoe UI', 7, [System.Drawing.FontStyle]::Bold)
 
-    # Column layout — proportional weights against the page width. Error /
-    # Detail is included but trimmed with ellipsis when long. RT Prot / AV
-    # use compact labels to save horizontal space.
-    $printCols = @(
-        @{ Name='Computer';          Weight=12 }
-        @{ Name='IPv4';              Weight= 8 }
-        @{ Name='Type';              Weight= 6 }
-        @{ Name='Platform';          Weight= 7 }
-        @{ Name='Status';            Weight= 9 }
-        @{ Name='Installed Version'; Weight= 9 }
-        @{ Name='Definitions Date';  Weight= 8 }
-        @{ Name='Currency';          Weight= 7 }
-        @{ Name='RT Prot';           Weight= 5 }
-        @{ Name='AV';                Weight= 4 }
-        @{ Name='Last Quick Scan';   Weight=10 }
-        @{ Name='Threats';           Weight= 5 }
-        @{ Name='Error / Detail';    Weight=10 }
-    )
-    $totalWeight = ($printCols | Measure-Object Weight -Sum).Sum
-
     $doc = [System.Drawing.Printing.PrintDocument]::new()
     $doc.DocumentName = "Defender Fleet Status - $(Get-Date -Format 'yyyy-MM-dd HH-mm')"
-    $doc.DefaultPageSettings.Landscape = $true
+    # Apply persistent page settings from the most recent Page Setup
+    # dialog, if any. Defaults to landscape Letter on first use.
+    if ($script:PrintPageSettings) {
+        $doc.DefaultPageSettings.PaperSize = $script:PrintPageSettings.PaperSize
+        $doc.DefaultPageSettings.Landscape = $script:PrintPageSettings.Landscape
+        $doc.DefaultPageSettings.Margins   = $script:PrintPageSettings.Margins.Clone()
+    } else {
+        $doc.DefaultPageSettings.Landscape = $true
+    }
 
     $doc.add_PrintPage({
         param($sender, $ev)
@@ -2276,9 +2388,46 @@ function Invoke-FleetPrint {
         # Reserve ~30px at the bottom for the footer line.
         $rowsBottom = $bottom - 22
 
-        $colW = $printCols | ForEach-Object {
-            [int]([math]::Floor($width * $_.Weight / $totalWeight))
+        # ---- Smart column sizing (computed once per job, on page 1) ----
+        # Each column's natural width = max(header width, widest cell
+        # content) + horizontal padding. If the sum fits the available
+        # width, columns get their natural widths and stay readable. If it
+        # exceeds the page, all columns scale down proportionally so the
+        # table still spans the page but no single column gets squished
+        # disproportionately (Error / Detail still ellipsises when needed).
+        if ($null -eq $script:PrintColW) {
+            $padding = 14
+            $natWidths = @()
+            foreach ($col in $enabledCols) {
+                $hdrSize = $g.MeasureString($col.Name, $headerFont)
+                $maxW = [double]$hdrSize.Width
+                foreach ($r in $Rows) {
+                    $val = Get-PrintCellValue -Row $r -Column $col
+                    if ($val) {
+                        $vSize = $g.MeasureString($val, $rowFont)
+                        if ($vSize.Width -gt $maxW) { $maxW = [double]$vSize.Width }
+                    }
+                }
+                $natWidths += [int][math]::Ceiling($maxW) + $padding
+            }
+            $total = ($natWidths | Measure-Object -Sum).Sum
+            if ($total -le $width) {
+                # Fits naturally — distribute the leftover width
+                # proportionally to natural sizes so the table still spans
+                # the page (avoids a half-empty page with a narrow strip).
+                $remaining = $width - $total
+                $script:PrintColW = @($natWidths | ForEach-Object {
+                    [int]([math]::Floor($_ + $remaining * $_ / $total))
+                })
+            } else {
+                # Overflow — scale proportionally to fit. Columns that need
+                # more room still get more room; the squish is even.
+                $script:PrintColW = @($natWidths | ForEach-Object {
+                    [int]([math]::Floor($_ * $width / $total))
+                })
+            }
         }
+        $colW = $script:PrintColW
 
         $y = $top
 
@@ -2313,9 +2462,9 @@ function Invoke-FleetPrint {
         $sf.Trimming    = [System.Drawing.StringTrimming]::EllipsisCharacter
         $sf.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
         $x = $left
-        for ($i = 0; $i -lt $printCols.Count; $i++) {
+        for ($i = 0; $i -lt $enabledCols.Count; $i++) {
             $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 3), [float]($colW[$i] - 6), [float]($hdrRowH - 4))
-            $g.DrawString($printCols[$i].Name, $headerFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
+            $g.DrawString($enabledCols[$i].Name, $headerFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
             $x += $colW[$i]
         }
         $y += $hdrRowH
@@ -2329,13 +2478,7 @@ function Invoke-FleetPrint {
             if (($y + $dataRowH) -gt $rowsBottom) { break }
 
             $r = $Rows[$script:PrintRowIdx]
-
-            # Status priority mirrors the grid:
-            $status = if (-not $r.Online) { 'Offline' }
-                      elseif ($r.VersionStatus -eq 'Outdated') { 'Outdated' }
-                      elseif ($r.HealthStatus) { $r.HealthStatus }
-                      elseif ($r.RealTimeProtection -eq 'False' -or $r.AntivirusEnabled -eq 'False') { 'Degraded' }
-                      else { 'Healthy' }
+            $status = Get-PrintRowStatus -Row $r
 
             # Alternating row tint matches the grid.
             if ($script:PrintRowIdx % 2 -eq 1) {
@@ -2344,16 +2487,10 @@ function Invoke-FleetPrint {
                 $altBg.Dispose()
             }
 
-            $vals = @(
-                $r.ComputerName, $r.IPv4Address, $r.NodeType, $r.Platform,
-                $status, $r.SignatureVersion, $r.SignatureLastUpdated,
-                $r.VersionStatus, $r.RealTimeProtection, $r.AntivirusEnabled,
-                $r.LastQuickScan, $r.ThreatCount, $r.Error
-            )
-
             $x = $left
-            for ($i = 0; $i -lt $printCols.Count; $i++) {
-                if ($i -eq 4) {
+            for ($i = 0; $i -lt $enabledCols.Count; $i++) {
+                $col = $enabledCols[$i]
+                if ($col.Property -eq '__Status__') {
                     # Status pill — small rounded-ish badge with the status color.
                     $pillBg = switch ($status) {
                         'Healthy'         { $clrSuccess }
@@ -2369,12 +2506,13 @@ function Invoke-FleetPrint {
                     $pillRect = [System.Drawing.Rectangle]::new($x + 4, $y + 2, $colW[$i] - 8, $dataRowH - 4)
                     $g.FillRectangle($pillBgBrush, $pillRect)
                     $textRect = [System.Drawing.RectangleF]::new([float]($x + 6), [float]($y + 3), [float]($colW[$i] - 12), [float]($dataRowH - 4))
-                    $g.DrawString("$status", $pillFont, $pillFgBrush, $textRect, $sf)
+                    $g.DrawString($status, $pillFont, $pillFgBrush, $textRect, $sf)
                     $pillBgBrush.Dispose()
                     $pillFgBrush.Dispose()
                 } else {
+                    $val = Get-PrintCellValue -Row $r -Column $col
                     $cellRect = [System.Drawing.RectangleF]::new([float]($x + 4), [float]($y + 2), [float]($colW[$i] - 6), [float]($dataRowH - 2))
-                    $g.DrawString("$($vals[$i])", $rowFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
+                    $g.DrawString($val, $rowFont, [System.Drawing.Brushes]::Black, $cellRect, $sf)
                 }
                 $x += $colW[$i]
             }
@@ -2411,6 +2549,25 @@ function Invoke-FleetPrint {
     $dlg = $null
     try {
         if ($Mode -eq 'Preview') {
+            # Auto-open Page Setup before every preview so the operator
+            # confirms orientation, paper size, and margins each time.
+            # Cancel here aborts the preview entirely — no PDF, no spend
+            # of the Microsoft Print to PDF queue. On OK, the selected
+            # settings are stashed in $script:PrintPageSettings so the
+            # subsequent Print click uses the same paper/orientation.
+            $setupDlg = [System.Windows.Forms.PageSetupDialog]::new()
+            $setupDlg.Document = $doc
+            $setupDlg.AllowMargins      = $true
+            $setupDlg.AllowOrientation  = $true
+            $setupDlg.AllowPaper        = $true
+            $setupDlg.AllowPrinter      = $false
+            $setupResult = $setupDlg.ShowDialog($form)
+            $setupDlg.Dispose()
+            if ($setupResult -ne 'OK') {
+                return   # user cancelled; finally block cleans the fonts + doc
+            }
+            $script:PrintPageSettings = $doc.DefaultPageSettings.Clone()
+
             $pdfPrinter = 'Microsoft Print to PDF'
             $installed  = [System.Drawing.Printing.PrinterSettings]::InstalledPrinters
             if ($installed -notcontains $pdfPrinter) {
@@ -2480,6 +2637,10 @@ function Invoke-FleetPrint {
         $rowFont.Dispose();   $footerFont.Dispose(); $pillFont.Dispose()
     }
 }
+
+$btnPrintColumns.add_Click({
+    Show-PrintColumnsDialog
+})
 
 $btnPreview.add_Click({
     Invoke-FleetPrint -Rows (Get-FilteredResults) -Mode Preview
