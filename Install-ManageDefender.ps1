@@ -78,6 +78,19 @@
     conf/SmtpCredential.xml under the service identity's DPAPI. Only relevant when
     [Email] SendEmail = true in conf/config.conf.
 
+.PARAMETER WinRmUsername
+    Pre-populates the username field of the WinRM credential prompt (operator just
+    types the password). Priority: CLI > [Credentials] WinRmUsername in config > blank.
+    Accepted formats: DOMAIN\username, username@domain.tld, or username.
+
+.PARAMETER AdUsername
+    Pre-populates the username field of the AD credential prompt. Same priority and
+    format rules as -WinRmUsername.
+
+.PARAMETER SmtpUsername
+    Pre-populates the username field of the SMTP credential prompt. Same priority and
+    format rules as -WinRmUsername. Only prompted when [Email] SendEmail = true.
+
 .PARAMETER Force
     Overwrite any existing scheduled task(s) with the same name(s) without prompting.
 
@@ -204,6 +217,12 @@ param(
     [pscredential]$AdCredential,
     [pscredential]$SmtpCredential,
 
+    # Pre-population for the username field of each Get-Credential prompt.
+    # Priority: CLI > [Credentials] *Username keys in config > blank.
+    [string]$WinRmUsername,
+    [string]$AdUsername,
+    [string]$SmtpUsername,
+
     [string]$ConfigPath
 )
 
@@ -255,6 +274,9 @@ if (-not $PSBoundParameters.ContainsKey('CanaryComputers') -and $cfg['CanaryComp
 if (-not $PSBoundParameters.ContainsKey('MaxCanaryFailures') -and $cfg['MaxCanaryFailures']) { try { $MaxCanaryFailures = [int]$cfg['MaxCanaryFailures'] } catch {} }
 if (-not $PSBoundParameters.ContainsKey('UseHttps')              -and $cfg['UseHttps'] -eq 'true')   { $UseHttps              = $true }
 if (-not $PSBoundParameters.ContainsKey('CertificateThumbprint') -and $cfg['CertificateThumbprint']) { $CertificateThumbprint = $cfg['CertificateThumbprint'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('WinRmUsername')         -and $cfg['WinRmUsername'])         { $WinRmUsername = $cfg['WinRmUsername'] }
+if (-not $PSBoundParameters.ContainsKey('AdUsername')            -and $cfg['AdUsername'])            { $AdUsername    = $cfg['AdUsername']    }
+if (-not $PSBoundParameters.ContainsKey('SmtpUsername')          -and $cfg['SmtpUsername'])          { $SmtpUsername  = $cfg['SmtpUsername']  }
 
 # Inherit Updates task folder from main TaskFolder unless explicitly set
 if (-not $UpdateTaskFolder) { $UpdateTaskFolder = $TaskFolder }
@@ -784,6 +806,9 @@ function Initialize-ServiceCredentials {
         [pscredential]$PreSuppliedWinRm,
         [pscredential]$PreSuppliedAd,
         [pscredential]$PreSuppliedSmtp,
+        [string]$WinRmUsername,
+        [string]$AdUsername,
+        [string]$SmtpUsername,
         [bool]$Skip,
         [bool]$Force
     )
@@ -802,11 +827,28 @@ function Initialize-ServiceCredentials {
 
     Write-Section "Credential Setup ($IdentityLabel)"
 
+    # ----- Surface which prompts will be pre-populated and which won't -----
+    $prefillRows = @()
+    if ($plan.WinRm) { $prefillRows += [pscustomobject]@{ Type='WinRM'; User = $(if ($WinRmUsername) { $WinRmUsername } else { '(blank — operator will type)' }) } }
+    if ($plan.AD)    { $prefillRows += [pscustomobject]@{ Type='AD';    User = $(if ($AdUsername)    { $AdUsername    } else { '(blank — operator will type)' }) } }
+    if ($plan.Smtp)  { $prefillRows += [pscustomobject]@{ Type='SMTP';  User = $(if ($SmtpUsername)  { $SmtpUsername  } else { '(blank — operator will type)' }) } }
+    if ($prefillRows.Count -gt 0) {
+        Write-Info 'Prompt username pre-fills (from -*Username CLI / [Credentials] config):'
+        foreach ($row in $prefillRows) { Write-Info ("  {0,-6} -> {1}" -f $row.Type, $row.User) }
+        Write-Host ''
+    }
+
     # ----- Gather (prompt or use pre-supplied) -----
+    # Prompts pre-populate the username field from -*Username (CLI) or the
+    # [Credentials] *Username keys in conf/config.conf. Format hints in the
+    # prompt message: DOMAIN\username or username@domain.tld.
     $toSave = [System.Collections.Generic.List[object]]::new()
+    $fmtHint = '  (format: DOMAIN\username or username@domain.tld)'
     if ($plan.WinRm) {
         $c = if ($PreSuppliedWinRm) { $PreSuppliedWinRm } else {
-            Get-Credential -Message 'WinRM credential — used by the scheduled tasks to query endpoint Defender state.'
+            $msg = "WinRM credential - used by the scheduled tasks to query endpoint Defender state.$fmtHint"
+            if ($WinRmUsername) { Get-Credential -UserName $WinRmUsername -Message $msg }
+            else                 { Get-Credential                          -Message $msg }
         }
         if (-not $c) { Write-Fail 'WinRM credential prompt cancelled.'; return $false }
         $toSave.Add([pscustomobject]@{
@@ -816,7 +858,9 @@ function Initialize-ServiceCredentials {
     }
     if ($plan.AD) {
         $c = if ($PreSuppliedAd) { $PreSuppliedAd } else {
-            Get-Credential -Message 'AD credential — used for AD-based fleet discovery and Negotiate auth context.'
+            $msg = "AD credential - used for AD-based fleet discovery and Negotiate auth context.$fmtHint"
+            if ($AdUsername) { Get-Credential -UserName $AdUsername -Message $msg }
+            else              { Get-Credential                       -Message $msg }
         }
         if (-not $c) { Write-Fail 'AD credential prompt cancelled.'; return $false }
         $toSave.Add([pscustomobject]@{
@@ -826,7 +870,11 @@ function Initialize-ServiceCredentials {
     }
     if ($plan.Smtp) {
         $c = if ($PreSuppliedSmtp) { $PreSuppliedSmtp } else {
-            Get-Credential -Message 'SMTP credential — used by the Updates task to send notification emails.'
+            # SMTP format varies by relay (often user@domain.tld); show a relay-aware hint.
+            $smtpHint = '  (format: depends on your SMTP relay - often user@domain.tld)'
+            $msg = "SMTP credential - used by the Updates task to send notification emails.$smtpHint"
+            if ($SmtpUsername) { Get-Credential -UserName $SmtpUsername -Message $msg }
+            else                { Get-Credential                         -Message $msg }
         }
         if (-not $c) { Write-Fail 'SMTP credential prompt cancelled.'; return $false }
         $toSave.Add([pscustomobject]@{
@@ -1645,6 +1693,9 @@ $credentialsOk = Initialize-ServiceCredentials `
     -PreSuppliedWinRm          $WinRmCredential `
     -PreSuppliedAd             $AdCredential `
     -PreSuppliedSmtp           $SmtpCredential `
+    -WinRmUsername             $WinRmUsername `
+    -AdUsername                $AdUsername `
+    -SmtpUsername              $SmtpUsername `
     -Skip                      $SkipCredentialSetup.IsPresent `
     -Force                     $Force.IsPresent
 if (-not $credentialsOk) {

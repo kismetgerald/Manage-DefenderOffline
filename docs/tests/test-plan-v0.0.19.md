@@ -5,7 +5,7 @@
 `main` at commit `411e1fd` (v0.0.18 release).
 **Feature branch:** `feat/v0.0.19-unified-installer`
 **Branch tip at plan authoring:** `5b64587`
-**Test bundle:** `.dist/dist/manage-defenderoffline-0.0.19d.zip` (16 files, ~184 KB)
+**Test bundle:** `.dist/dist/manage-defenderoffline-0.0.19e.zip` (rebuilt after the credential-prompt UX fix surfaced during scenario `a` on `0.0.19d`).
 
 ## Purpose
 
@@ -17,7 +17,9 @@ v0.0.19 collapses installation into a single entry point and adds end-to-end aut
 4. **STIG V-253289 (Secondary Logon Service) handling** — On STIG-hardened hosts where seclogon is Disabled, the installer enables the service, performs the credential save, then restores `Disabled` in a `finally` block. Pattern lifted from `Get-CiscoTechSupport\Install-GetCiscoTechSupport.ps1`.
 5. **Conf folder pre-grant** — Before credential save runs, the installer pre-grants the service identity `Modify` on `conf/` and `ReadAndExecute` on the script folder. Without this, `Start-Process -Credential` (traditional account) or the one-shot scheduled task (gMSA) writes the cred XML into a folder it cannot access. Surfaced by self-code-review on 2026-06-01; would have bitten gMSA testing first.
 6. **`-RunNowWhatIf` smoke test** — Updates component installer can fire the task once with `-WhatIfMode` to verify wiring before the real schedule fires.
-7. **Config file additions** — `[Install]` section now carries `UpdateTaskName`, `UpdateTaskFolder`, `UpdateFrequency`, and `UpdateStartTime`.
+7. **Config file additions** — `[Install]` section now carries `UpdateTaskName`, `UpdateTaskFolder`, `UpdateFrequency`, and `UpdateStartTime`. `[Credentials]` section now carries `WinRmUsername`, `AdUsername`, `SmtpUsername` (pre-fill the username field of each install-time `Get-Credential` prompt; passwords are never stored here).
+
+8. **Credential prompt pre-population (0.0.19e)** — Each `Get-Credential` prompt during install pre-fills the username field from `-WinRmUsername` / `-AdUsername` / `-SmtpUsername` CLI parameters or, falling back, from the `[Credentials]` *Username keys in config. Operator only types the password in the common case. If both are blank, the prompt opens blank with a format hint (`DOMAIN\username or username@domain.tld`) in the message. Addresses the ambiguous-prompt UX bug found during scenario `a` on `0.0.19d`.
 
 Deliverables validated by this test plan:
 
@@ -100,7 +102,17 @@ Pre-create the credential prompts off-hours if needed — the installer expects 
 
 **Purpose:** Prove the lifted Dashboard install path produces identical state to what the old `Install-DefenderDashboard.ps1` produced in v0.0.18 — same task name, same principal, same action, same triggers, same firewall rule, same ACLs.
 
-**Setup:** Test endpoint with no `DefenderDashboard` task currently registered (uninstall any prior copy with `Unregister-ScheduledTask -TaskName DefenderDashboard -Confirm:$false`). Service account credentials in hand.
+**Setup:** Test endpoint with no `DefenderDashboard` task currently registered (uninstall any prior copy with `Unregister-ScheduledTask -TaskName DefenderDashboard -Confirm:$false`). Service account credentials in hand. **Pre-populate the three Username keys in `[Credentials]` first** so the install-time prompts come up pre-filled (all the same account in this lab):
+
+```powershell
+# In conf/config.conf, set:
+#   [Credentials]
+#   WinRmUsername = HOME\xxSecurityMonitor
+#   AdUsername    = HOME\xxSecurityMonitor
+#   SmtpUsername  = HOME\xxSecurityMonitor   (only if SendEmail = true)
+```
+
+Then run the installer:
 
 ```powershell
 $cred = Get-Credential -UserName "HOME\xxSecurityMonitor" -Message "Service account password"
@@ -113,6 +125,8 @@ $cred = Get-Credential -UserName "HOME\xxSecurityMonitor" -Message "Service acco
     -Force
 ```
 
+(Alternatively, pass `-WinRmUsername 'HOME\xxSecurityMonitor' -AdUsername 'HOME\xxSecurityMonitor'` on the CLI to override config.)
+
 **Steps:**
 
 1. Confirm the banner identifies the unified installer and the chosen component:
@@ -123,14 +137,24 @@ Component(s): Dashboard
 Identity    : HOME\xxSecurityMonitor (traditional)
 ```
 
-2. Confirm the credential-save block runs and lands `WinRmCredential.xml` + `ADCredential.xml` in `conf/`:
+2. Confirm the credential-setup banner shows the pre-fill source for each prompt, then each `Get-Credential` window opens with the username field already populated:
+
+```
+  Prompt username pre-fills (from -*Username CLI / [Credentials] config):
+    WinRM  -> HOME\xxSecurityMonitor
+    AD     -> HOME\xxSecurityMonitor
+```
+
+   The credential window itself should show `HOME\xxSecurityMonitor` in the User field — operator only types the password. Confirm the message line includes the format hint `(format: DOMAIN\username or username@domain.tld)`.
+
+3. Confirm the credential-save block runs and lands `WinRmCredential.xml` + `ADCredential.xml` in `conf/`:
 
 ```powershell
 Get-ChildItem .\conf\*.xml | Select-Object Name, Length
 # Expect: WinRmCredential.xml and ADCredential.xml (and SmtpCredential.xml only if SendEmail=true)
 ```
 
-3. Confirm the dashboard task is registered, identity matches, and `RunLevel=Highest`:
+4. Confirm the dashboard task is registered, identity matches, and `RunLevel=Highest`:
 
 ```powershell
 Get-ScheduledTask -TaskName 'DefenderDashboard' | Select-Object TaskName, State
@@ -138,21 +162,21 @@ Get-ScheduledTask -TaskName 'DefenderDashboard' | Select-Object TaskName, State
 # Expect: UserId=HOME\xxSecurityMonitor, LogonType=Password, RunLevel=Highest
 ```
 
-4. Confirm the dashboard reaches `/health` cleanly:
+5. Confirm the dashboard reaches `/health` cleanly:
 
 ```powershell
 Invoke-WebRequest http://localhost:8080/health -UseBasicParsing | Select-Object StatusCode, Content
 # Expect: 200 / OK
 ```
 
-5. Confirm the firewall rule was created:
+6. Confirm the firewall rule was created:
 
 ```powershell
 Get-NetFirewallRule -DisplayName 'DefenderDashboard-TCP-8080' | Select-Object Enabled, Direction
 # Expect: Enabled=True, Direction=Inbound
 ```
 
-6. Confirm conf ACL has the service identity with `Modify`:
+7. Confirm conf ACL has the service identity with `Modify`:
 
 ```powershell
 (Get-Acl .\conf).Access | Where-Object { $_.IdentityReference -match 'xxSecurityMonitor' } |
@@ -160,7 +184,7 @@ Get-NetFirewallRule -DisplayName 'DefenderDashboard-TCP-8080' | Select-Object En
 # Expect: at least one Modify entry; not duplicated
 ```
 
-7. Compare the registered action against what the v0.0.18 installer would have produced — should be the same `pwsh.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "...\Start-DefenderDashboard.ps1"` invocation:
+8. Compare the registered action against what the v0.0.18 installer would have produced — should be the same `pwsh.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "...\Start-DefenderDashboard.ps1"` invocation:
 
 ```powershell
 (Get-ScheduledTask -TaskName 'DefenderDashboard').Actions | Format-List
@@ -168,6 +192,8 @@ Get-NetFirewallRule -DisplayName 'DefenderDashboard-TCP-8080' | Select-Object En
 
 **Expected result:**
 - [ ] Banner names `Install-ManageDefender v0.0.19` and `Component(s): Dashboard`
+- [ ] Pre-fill banner lists `WinRM` and `AD` with `HOME\xxSecurityMonitor`; both `Get-Credential` windows open with that username already populated
+- [ ] Format hint visible in each prompt's message line
 - [ ] `WinRmCredential.xml` and `ADCredential.xml` written under `conf/` and readable as the service identity
 - [ ] Dashboard task registered; `Get-ScheduledTask` returns it with correct identity and `RunLevel=Highest`
 - [ ] `/health` returns 200 OK within the installer's probe window
