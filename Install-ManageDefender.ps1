@@ -490,6 +490,9 @@ function New-CredentialPayloadFile {
 function Invoke-AsServiceIdentity {
     # Runs the credential-save helper script in the service identity's
     # context, abstracting traditional-vs-gMSA. Returns $true on success.
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'CredentialName',
+        Justification = '$CredentialName is a tag ("WinRm"/"AD"/"Smtp"), not credential material; the analyzer false-positives on the substring match.')]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [ValidateSet('WinRm','AD','Smtp')] [string]$CredentialName,
         [Parameter(Mandatory)] [string]$SourcePayloadPath,
@@ -611,6 +614,9 @@ function Invoke-AsServiceIdentity {
 
 function Save-ServiceCredential {
     # Coordinates: payload file → run as service identity → cleanup → verify.
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'CredentialName',
+        Justification = '$CredentialName is a tag ("WinRm"/"AD"/"Smtp"), not credential material; the analyzer false-positives on the substring match.')]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [ValidateSet('WinRm','AD','Smtp')] [string]$CredentialName,
         [Parameter(Mandatory)] [pscredential]$Credential,
@@ -1599,11 +1605,26 @@ $identityOk = Test-ServiceIdentityForInstall `
 if (-not $identityOk) { exit 1 }
 
 # ===================================================================
-# Ensure the conf folder exists before credential setup writes to it
+# Ensure the conf folder exists AND the service identity can write to it
+# BEFORE credential setup runs. Components grant ACLs later for their own
+# needs, but the credential-save helper runs as the service identity and
+# needs Modify on conf/ to land the .xml files. Without this pre-grant the
+# save would fail for both traditional accounts (Start-Process -Credential
+# creates a non-elevated logon) and gMSA (one-shot task runs as gMSA).
 # ===================================================================
 $confFolder = Join-Path $ScriptDir 'conf'
 if (-not (Test-Path $confFolder)) {
     New-Item -Path $confFolder -ItemType Directory -Force | Out-Null
+}
+if (-not $SkipCredentialSetup) {
+    Write-Step "Pre-granting conf folder access to the service identity (needed for credential save)…"
+    Grant-FolderAccess -Path $confFolder -Identity $identityLabel -Rights 'Modify'
+    # Also pre-grant ReadAndExecute on the script folder so the gMSA one-shot
+    # task can load lib\Save-ServiceCredential.ps1. Traditional accounts
+    # could rely on Start-Process inheriting the helper path, but the gMSA
+    # path is a Task Scheduler action so the process needs filesystem read
+    # rights on its working directory.
+    Grant-FolderAccess -Path $ScriptDir -Identity $identityLabel -Rights 'ReadAndExecute'
 }
 
 # ===================================================================
