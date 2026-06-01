@@ -813,16 +813,27 @@ function ConvertTo-UpdateTaskTrigger {
         'Monthly' {
             # New-ScheduledTaskTrigger has no -Monthly; build the CIM
             # MSFT_TaskMonthlyTrigger directly. Day-of-month 1, all 12 months
-            # (DaysOfMonth bitmask: bit 0 = day 1; MonthsOfYear bitmask 4095
-            # = January..December inclusive).
+            # (DaysOfMonth bit 0 = day 1; months bitmask 4095 = Jan..Dec).
+            #
+            # Property naming varies across Windows builds:
+            #   - Historical: MonthsOfYear (plural)
+            #   - Windows 11 26200+: MonthOfYear (singular)
+            # Detect the actual name from the CIM schema at runtime rather
+            # than hardcoding either.
             $class = Get-CimClass -Namespace ROOT/Microsoft/Windows/TaskScheduler `
                                   -ClassName MSFT_TaskMonthlyTrigger -ErrorAction Stop
-            $trig = New-CimInstance -CimClass $class -ClientOnly -Property @{
+            $propNames = $class.CimClassProperties.Name
+            $monthsKey = if     ($propNames -contains 'MonthsOfYear') { 'MonthsOfYear' }
+                         elseif ($propNames -contains 'MonthOfYear')  { 'MonthOfYear'  }
+                         else { throw "MSFT_TaskMonthlyTrigger on this host has neither MonthsOfYear nor MonthOfYear. Properties: $($propNames -join ', ')" }
+
+            $properties = @{
                 Enabled       = $true
                 StartBoundary = $today.ToString('s')
-                DaysOfMonth   = 1
-                MonthsOfYear  = 4095
+                DaysOfMonth   = [uint16]1
             }
+            $properties[$monthsKey] = [uint16]4095
+            $trig = New-CimInstance -CimClass $class -ClientOnly -Property $properties
             return @($trig)
         }
     }
