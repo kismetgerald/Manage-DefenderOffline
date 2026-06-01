@@ -1578,9 +1578,12 @@ function Install-UpdatesComponent {
     }
 
     # ----- Optional WhatIf smoke test -----
-    # MUST run as the service identity so DPAPI decrypt of conf\*Credential.xml
-    # succeeds — the XMLs are sealed under the service identity's user-scope
-    # master key, not the installer's interactive identity.
+    # MUST run as the service identity (for DPAPI decrypt) AND elevated
+    # (for the Update script's admin check). Start-Process -Credential
+    # cannot satisfy both: it launches as the service identity but with
+    # the standard token (UAC token-splitting). The actual scheduled task
+    # at 02:00 uses -RunLevel Highest so Task Scheduler auto-elevates;
+    # we use the same mechanism here via a one-shot scheduled task.
     if ($RunNowWhatIf) {
         Write-Step "Running Update-DefenderOffline.ps1 -WhatIfMode as $IdentityLabel (smoke test)…"
         $whatifArgs = @(
@@ -1590,111 +1593,94 @@ function Install-UpdatesComponent {
             '-WhatIfMode'
         )
         $scriptFolder = Split-Path $UpdateScriptPath -Parent
+        $smokeName    = "Manage-DefenderOffline-WhatIfSmoke-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $smokeStart   = Get-Date
 
-        if (-not $IsGmsa) {
-            # Traditional service account path — Start-Process -Credential.
-            # -Credential forces a new logon session so -NoNewWindow is ignored
-            # (security boundary). Must redirect stdio to capture output.
-            $stdoutLog = Join-Path $scriptFolder ('.whatif.{0}.out.log' -f [guid]::NewGuid().ToString('N'))
-            $stderrLog = Join-Path $scriptFolder ('.whatif.{0}.err.log' -f [guid]::NewGuid().ToString('N'))
-            try {
-                $proc = Start-Process -FilePath $PwshPath `
-                    -ArgumentList ($whatifArgs -join ' ') `
-                    -Credential $ServiceAccountCredential `
-                    -WorkingDirectory $scriptFolder `
-                    -WindowStyle Hidden `
-                    -Wait `
-                    -PassThru `
-                    -RedirectStandardOutput $stdoutLog `
-                    -RedirectStandardError  $stderrLog `
-                    -ErrorAction Stop
+        try {
+            $smokeAction = New-ScheduledTaskAction `
+                -Execute $PwshPath `
+                -Argument ($whatifArgs -join ' ') `
+                -WorkingDirectory $scriptFolder
+            # Trigger is in the future as a fallback; we call Start-ScheduledTask
+            # to fire immediately.
+            $smokeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(15)
+            $smokeSettings = New-ScheduledTaskSettingsSet `
+                -ExecutionTimeLimit ([timespan]::FromMinutes(10)) `
+                -DeleteExpiredTaskAfter ([timespan]::FromMinutes(15)) `
+                -StartWhenAvailable `
+                -DontStopIfGoingOnBatteries `
+                -AllowStartIfOnBatteries
 
-                # Get-Content -Raw returns $null (not '') for empty files —
-                # naive .TrimEnd() would throw "cannot call method on null."
-                $outText = ''
-                $errText = ''
-                if (Test-Path -LiteralPath $stdoutLog) {
-                    $raw = Get-Content -LiteralPath $stdoutLog -Raw -ErrorAction SilentlyContinue
-                    if ($raw) { $outText = $raw.TrimEnd() }
-                }
-                if (Test-Path -LiteralPath $stderrLog) {
-                    $raw = Get-Content -LiteralPath $stderrLog -Raw -ErrorAction SilentlyContinue
-                    if ($raw) { $errText = $raw.TrimEnd() }
-                }
-
-                if ($outText) {
-                    Write-Host ''
-                    Write-Host '  --- WhatIf smoke test output ---' -ForegroundColor DarkGray
-                    Write-Host $outText -ForegroundColor Gray
-                    Write-Host '  --- end smoke test output ---' -ForegroundColor DarkGray
-                    Write-Host ''
-                }
-                if ($errText) { Write-Info ('Smoke test stderr: ' + $errText) }
-
-                if ($proc.ExitCode -eq 0) {
-                    Write-Ok "WhatIf smoke test exited cleanly (code 0)."
-                    if (-not $outText) {
-                        Write-Info 'No captured output. Update script log: C:\Logs\Update-DefenderOffline_*.log'
-                    }
-                } else {
-                    Write-Warn "WhatIf smoke test exited with code $($proc.ExitCode). Inspect the Update logs."
-                    if (-not $outText -and -not $errText) {
-                        Write-Info 'No captured stdout/stderr. Check C:\Logs\Update-DefenderOffline_*.log for the failure reason.'
-                    }
-                }
-            } catch {
-                Write-Warn "Could not run WhatIf smoke test: $($_.Exception.Message)"
-            } finally {
-                foreach ($p in @($stdoutLog, $stderrLog)) {
-                    if ($p -and (Test-Path -LiteralPath $p)) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
-                }
+            $registerParams = @{
+                TaskName    = $smokeName
+                TaskPath    = '\Manage-DefenderOffline\'
+                Action      = $smokeAction
+                Trigger     = $smokeTrigger
+                Settings    = $smokeSettings
+                Description = "WhatIf smoke test for Updates component"
+                Force       = $true
             }
-        } else {
-            # gMSA path — Start-Process -Credential won't work (no password to
-            # supply). Register a one-shot scheduled task as the gMSA, trigger
-            # it, poll for completion, and delete it.
-            $smokeName = "Manage-DefenderOffline-WhatIfSmoke-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-            try {
-                $smokeAction  = New-ScheduledTaskAction `
-                    -Execute $PwshPath `
-                    -Argument ($whatifArgs -join ' ') `
-                    -WorkingDirectory $scriptFolder
-                $smokeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(30)
-                $smokeSettings = New-ScheduledTaskSettingsSet `
-                    -ExecutionTimeLimit ([timespan]::FromMinutes(10)) `
-                    -DeleteExpiredTaskAfter ([timespan]::FromMinutes(15)) `
-                    -StartWhenAvailable `
-                    -DontStopIfGoingOnBatteries `
-                    -AllowStartIfOnBatteries
-                $smokePrincipal = New-ScheduledTaskPrincipal `
+            if ($IsGmsa) {
+                $registerParams.Principal = New-ScheduledTaskPrincipal `
                     -UserId $GmsaAccountName -LogonType Password -RunLevel Highest
-                Register-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' `
-                    -Action $smokeAction -Trigger $smokeTrigger -Settings $smokeSettings `
-                    -Principal $smokePrincipal -Description "WhatIf smoke test for Updates component" -Force | Out-Null
-                Start-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\'
-
-                $deadline = (Get-Date).AddMinutes(10)
-                do {
-                    Start-Sleep -Seconds 2
-                    $info = Get-ScheduledTaskInfo -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
-                    if ($info) {
-                        $task = Get-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
-                        if ($task -and $task.State -ne 'Running' -and $info.LastTaskResult -ne 267009 -and $null -ne $info.LastRunTime) {
-                            if ($info.LastTaskResult -eq 0) {
-                                Write-Ok "WhatIf smoke test exited cleanly (code 0)."
-                            } else {
-                                Write-Warn "WhatIf smoke test exited with code $($info.LastTaskResult). Inspect the Update logs."
-                            }
-                            break
-                        }
-                    }
-                } while ((Get-Date) -lt $deadline)
-                Write-Info 'Smoke test output is in C:\Logs\Update-DefenderOffline_*.log (gMSA path does not capture stdio).'
-            } catch {
-                Write-Warn "Could not run WhatIf smoke test (gMSA): $($_.Exception.Message)"
-            } finally {
-                Unregister-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -Confirm:$false -ErrorAction SilentlyContinue
+            } else {
+                # Traditional account: pass User+Password+RunLevel so the task
+                # principal is built with token elevation enabled.
+                $registerParams.User     = $ServiceAccountName
+                $registerParams.Password = $ServiceAccountCredential.GetNetworkCredential().Password
+                $registerParams.RunLevel = 'Highest'
             }
+            Register-ScheduledTask @registerParams | Out-Null
+            Start-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\'
+
+            $deadline    = (Get-Date).AddMinutes(10)
+            $finalResult = $null
+            do {
+                Start-Sleep -Seconds 2
+                $info = Get-ScheduledTaskInfo -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
+                $task = Get-ScheduledTask     -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
+                if ($info -and $task -and $task.State -ne 'Running' `
+                        -and $info.LastTaskResult -ne 267009 `
+                        -and $null -ne $info.LastRunTime `
+                        -and $info.LastRunTime -gt $smokeStart) {
+                    $finalResult = $info.LastTaskResult
+                    break
+                }
+            } while ((Get-Date) -lt $deadline)
+
+            # Surface the Update script's own log (it writes to C:\Logs\
+            # regardless of how it was launched). Find the newest log created
+            # during the smoke test window.
+            Start-Sleep -Milliseconds 500   # let any final log flush complete
+            $logFile = Get-ChildItem 'C:\Logs\Update-DefenderOffline_*.log' -ErrorAction SilentlyContinue |
+                       Where-Object { $_.LastWriteTime -gt $smokeStart } |
+                       Sort-Object LastWriteTime -Descending |
+                       Select-Object -First 1
+            if ($logFile) {
+                $logRaw = Get-Content -LiteralPath $logFile.FullName -Raw -ErrorAction SilentlyContinue
+                if ($logRaw) {
+                    Write-Host ''
+                    Write-Host "  --- WhatIf smoke test log ($($logFile.Name)) ---" -ForegroundColor DarkGray
+                    Write-Host $logRaw.TrimEnd() -ForegroundColor Gray
+                    Write-Host '  --- end smoke test log ---' -ForegroundColor DarkGray
+                    Write-Host ''
+                }
+            }
+
+            if ($finalResult -eq 0) {
+                Write-Ok "WhatIf smoke test exited cleanly (code 0)."
+            } elseif ($null -ne $finalResult) {
+                Write-Warn "WhatIf smoke test exited with code $finalResult. Inspect the log above."
+            } else {
+                Write-Warn 'WhatIf smoke test did not complete within 10 minutes.'
+            }
+            if (-not $logFile) {
+                Write-Info 'No Update script log found under C:\Logs\Update-DefenderOffline_*.log. Task may have failed before reaching the script entry point.'
+            }
+        } catch {
+            Write-Warn "Could not run WhatIf smoke test: $($_.Exception.Message)"
+        } finally {
+            Unregister-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
 
