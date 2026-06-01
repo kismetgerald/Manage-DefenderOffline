@@ -603,9 +603,11 @@ function Invoke-AsServiceIdentity {
         # Trigger 30s from now to give Set-ScheduledTask + Register time to settle.
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(30)
 
+        # No -DeleteExpiredTaskAfter: it requires an EndBoundary on the trigger
+        # and modern Windows rejects the task XML if absent. The finally block
+        # unregisters the task regardless of outcome.
         $settings = New-ScheduledTaskSettingsSet `
             -ExecutionTimeLimit ([timespan]::FromMinutes(5)) `
-            -DeleteExpiredTaskAfter ([timespan]::FromMinutes(10)) `
             -StartWhenAvailable `
             -DontStopIfGoingOnBatteries `
             -AllowStartIfOnBatteries
@@ -1602,11 +1604,13 @@ function Install-UpdatesComponent {
                 -Argument ($whatifArgs -join ' ') `
                 -WorkingDirectory $scriptFolder
             # Trigger is in the future as a fallback; we call Start-ScheduledTask
-            # to fire immediately.
+            # to fire immediately. NO -DeleteExpiredTaskAfter on settings: that
+            # requires an EndBoundary on the trigger, and modern Windows rejects
+            # the task XML if the boundary is missing. The finally block
+            # unregisters the task anyway.
             $smokeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(15)
             $smokeSettings = New-ScheduledTaskSettingsSet `
                 -ExecutionTimeLimit ([timespan]::FromMinutes(10)) `
-                -DeleteExpiredTaskAfter ([timespan]::FromMinutes(15)) `
                 -StartWhenAvailable `
                 -DontStopIfGoingOnBatteries `
                 -AllowStartIfOnBatteries
@@ -1619,6 +1623,7 @@ function Install-UpdatesComponent {
                 Settings    = $smokeSettings
                 Description = "WhatIf smoke test for Updates component"
                 Force       = $true
+                ErrorAction = 'Stop'
             }
             if ($IsGmsa) {
                 $registerParams.Principal = New-ScheduledTaskPrincipal `
@@ -1631,7 +1636,7 @@ function Install-UpdatesComponent {
                 $registerParams.RunLevel = 'Highest'
             }
             Register-ScheduledTask @registerParams | Out-Null
-            Start-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\'
+            Start-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction Stop
 
             $deadline    = (Get-Date).AddMinutes(10)
             $finalResult = $null
