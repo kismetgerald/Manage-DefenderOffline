@@ -424,19 +424,30 @@ function Set-SecondaryLogonService {
 }
 
 function Restore-SecondaryLogonService {
-    # Always-attempt restore — called in finally blocks. Prints explicit
-    # manual cleanup commands if it can't bring the service back to
-    # Stopped+Disabled (STIG-compliant).
+    # Always-attempt restore — called in finally blocks. Returns the service
+    # to the state we observed at the start of the dance (not a hardcoded
+    # STIG state). If we found it Running, we leave it Running. If we found
+    # it Stopped+Disabled, we put it back to Stopped+Disabled. Prints
+    # explicit manual cleanup commands if the restore can't complete.
     [CmdletBinding()]
-    param()
-    Write-Step 'Restoring STIG V-253289-compliant Secondary Logon state…'
-    if (Set-SecondaryLogonService -StartType Disabled -StopService) {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Manual', 'Disabled', 'Automatic', 'AutomaticDelayedStart', 'Boot', 'System')]
+        [string]$OriginalStartType,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Running', 'Stopped', 'Paused', 'StartPending', 'StopPending', 'ContinuePending', 'PausePending')]
+        [string]$OriginalStatus
+    )
+    Write-Step "Restoring Secondary Logon to original state (Status=$OriginalStatus, StartType=$OriginalStartType)…"
+    $stopFirst = $OriginalStatus -ne 'Running'
+    if (Set-SecondaryLogonService -StartType $OriginalStartType -StopService:$stopFirst) {
         $final = Get-Service -Name 'seclogon'
         Write-Ok "Secondary Logon service restored (Status=$($final.Status), StartType=$($final.StartType))"
     } else {
-        Write-Fail 'Could not restore Secondary Logon to Disabled. Manual cleanup required:'
-        Write-Host '             Stop-Service -Name seclogon -Force' -ForegroundColor Yellow
-        Write-Host '             Set-Service  -Name seclogon -StartupType Disabled' -ForegroundColor Yellow
+        Write-Fail "Could not restore Secondary Logon. Manual cleanup required:"
+        if ($stopFirst) { Write-Host '             Stop-Service -Name seclogon -Force' -ForegroundColor Yellow }
+        Write-Host "             Set-Service  -Name seclogon -StartupType $OriginalStartType" -ForegroundColor Yellow
     }
 }
 
@@ -938,6 +949,8 @@ function Initialize-ServiceCredentials {
     # ----- STIG V-253289 seclogon dance -----
     $seclogonInfo = Test-SecondaryLogonService
     $needsRestore = $false
+    $originalSeclogonStatus    = $null
+    $originalSeclogonStartType = $null
 
     if (-not $seclogonInfo.Exists) {
         Write-Fail 'Secondary Logon service (seclogon) not found on this host. Cannot save credentials automatically.'
@@ -946,28 +959,55 @@ function Initialize-ServiceCredentials {
     }
 
     # Only traditional service accounts use seclogon (via Start-Process -Credential).
-    # gMSA path goes through a scheduled task which doesn't need seclogon. So skip
+    # gMSA path goes through a scheduled task which doesn't need seclogon, so skip
     # the dance entirely for gMSA.
-    if (-not $IsGmsa -and $seclogonInfo.StartType -eq 'Disabled') {
-        Write-Step 'STIG V-253289 — Secondary Logon Service is currently Disabled.'
-        Write-Info 'To save DPAPI-encrypted credentials as the service identity, Secondary Logon needs to be Manual + Started briefly.'
-        Write-Info 'The installer will restore it to Stopped + Disabled afterward, regardless of save outcome.'
-        if (-not $Force) {
-            $answer = Read-Host '    Continue? [Y/N]'
-            if ($answer -notmatch '^[Yy]') {
-                Write-Warn 'Credential setup cancelled. Re-run with -Force or -SkipCredentialSetup.'
+    #
+    # For traditional accounts, the question is: can Start-Process -Credential
+    # launch processes right now? It can iff seclogon is Running — independent
+    # of StartType. So we use Status as the primary signal:
+    #   - Status = Running                       → leverage as-is, no dance
+    #   - Status = Stopped, StartType = Disabled → flip Manual, Start, save,
+    #                                              restore to Stopped+Disabled
+    #   - Status = Stopped, StartType = Manual/Auto → Start, save, restore to
+    #                                                 Stopped (StartType unchanged)
+    if (-not $IsGmsa) {
+        $originalSeclogonStatus    = "$($seclogonInfo.Status)"
+        $originalSeclogonStartType = "$($seclogonInfo.StartType)"
+
+        if ($seclogonInfo.Status -eq 'Running') {
+            Write-Info "Secondary Logon service: StartupType=$($seclogonInfo.StartType), Status=Running. No state change needed."
+        } else {
+            Write-Step "Secondary Logon Service needs to be started for credential save (current: Status=$($seclogonInfo.Status), StartType=$($seclogonInfo.StartType))."
+            Write-Info "After save, the installer will restore the service to its original state (Status=$originalSeclogonStatus, StartType=$originalSeclogonStartType)."
+            if (-not $Force) {
+                $answer = Read-Host '    Continue? [Y/N]'
+                if ($answer -notmatch '^[Yy]') {
+                    Write-Warn 'Credential setup cancelled. Re-run with -Force or -SkipCredentialSetup.'
+                    return $false
+                }
+            }
+            # Flip StartType to Manual only if it's currently Disabled
+            # (otherwise the service is already startable as-is).
+            if ($seclogonInfo.StartType -eq 'Disabled') {
+                Write-Info 'Enabling Secondary Logon (StartupType=Manual)…'
+                if (-not (Set-SecondaryLogonService -StartType Manual)) {
+                    Write-Fail 'Could not enable Secondary Logon service. Aborting credential save.'
+                    return $false
+                }
+            }
+            try {
+                Start-Service -Name seclogon -ErrorAction Stop
+            } catch {
+                Write-Fail "Could not start Secondary Logon service: $($_.Exception.Message)"
+                # Revert the StartType change we just made if applicable
+                if ($seclogonInfo.StartType -eq 'Disabled') {
+                    Set-SecondaryLogonService -StartType Disabled | Out-Null
+                }
                 return $false
             }
+            $needsRestore = $true
+            Write-Ok 'Secondary Logon service is now Running (temporary)'
         }
-        Write-Info 'Enabling Secondary Logon (StartupType=Manual, Start)…'
-        if (-not (Set-SecondaryLogonService -StartType Manual)) {
-            Write-Fail 'Could not enable Secondary Logon service. Aborting credential save.'
-            return $false
-        }
-        $needsRestore = $true
-        Write-Ok 'Secondary Logon service enabled (temporary)'
-    } elseif (-not $IsGmsa) {
-        Write-Info "Secondary Logon service: StartupType=$($seclogonInfo.StartType), Status=$($seclogonInfo.Status). No state change needed."
     }
 
     # ----- Save each credential -----
@@ -988,7 +1028,9 @@ function Initialize-ServiceCredentials {
         }
     } finally {
         if ($needsRestore) {
-            Restore-SecondaryLogonService
+            Restore-SecondaryLogonService `
+                -OriginalStartType $originalSeclogonStartType `
+                -OriginalStatus    $originalSeclogonStatus
         }
     }
     return $allOk
