@@ -1565,23 +1565,107 @@ function Install-UpdatesComponent {
     }
 
     try {
-        $registerParams = @{
-            TaskName    = $TaskName
-            TaskPath    = $TaskFolder
-            Action      = $action
-            Trigger     = $triggers
-            Settings    = $settings
-            Principal   = $principal
-            Description = "Periodic Defender definition push – Update-DefenderOffline.ps1 v$ScriptVersion ($Frequency $UpdateStartTime)"
-            Force       = $true
+        if ($Frequency -eq 'Monthly') {
+            # The MSFT_TaskMonthlyTrigger CIM schema differs across Windows
+            # builds — property name (MonthsOfYear vs MonthOfYear) and
+            # semantics (bitmask vs single-month index) vary. The Task
+            # Scheduler XML schema is stable and documented, so use it
+            # directly for the Monthly path instead.
+            $description    = "Periodic Defender definition push - Update-DefenderOffline.ps1 v$ScriptVersion ($Frequency $UpdateStartTime)"
+            $startBoundary  = (Get-Date $UpdateStartTime).ToString('yyyy-MM-ddTHH:mm:ss')
+            $descXml        = [System.Security.SecurityElement]::Escape($description)
+            $execXml        = [System.Security.SecurityElement]::Escape($PwshPath)
+            $argXml         = [System.Security.SecurityElement]::Escape($taskArguments)
+            $identityForXml = if ($IsGmsa) { $GmsaAccountName } else { $ServiceAccountName }
+            $userXml        = [System.Security.SecurityElement]::Escape($identityForXml)
+
+            $taskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>$descXml</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>$startBoundary</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByMonth>
+        <DaysOfMonth><Day>1</Day></DaysOfMonth>
+        <Months>
+          <January /><February /><March /><April /><May /><June />
+          <July /><August /><September /><October /><November /><December />
+        </Months>
+      </ScheduleByMonth>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$userXml</UserId>
+      <LogonType>Password</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT4H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT15M</Interval>
+      <Count>2</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>$execXml</Command>
+      <Arguments>$argXml</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+            $regXmlParams = @{
+                TaskName    = $TaskName
+                TaskPath    = $TaskFolder
+                Xml         = $taskXml
+                Force       = $true
+                ErrorAction = 'Stop'
+            }
+            if ($IsGmsa) {
+                $regXmlParams.User = $GmsaAccountName
+            } else {
+                $regXmlParams.User     = $ServiceAccountName
+                $regXmlParams.Password = $ServiceAccountCredential.GetNetworkCredential().Password
+            }
+            Register-ScheduledTask @regXmlParams | Out-Null
+        } else {
+            $registerParams = @{
+                TaskName    = $TaskName
+                TaskPath    = $TaskFolder
+                Action      = $action
+                Trigger     = $triggers
+                Settings    = $settings
+                Principal   = $principal
+                Description = "Periodic Defender definition push - Update-DefenderOffline.ps1 v$ScriptVersion ($Frequency $UpdateStartTime)"
+                Force       = $true
+                ErrorAction = 'Stop'
+            }
+            if (-not $IsGmsa) {
+                $registerParams.Password = $ServiceAccountCredential.GetNetworkCredential().Password
+                $registerParams.User     = $ServiceAccountName
+                $registerParams.Remove('Principal') | Out-Null
+                $registerParams.RunLevel = 'Highest'
+            }
+            Register-ScheduledTask @registerParams | Out-Null
         }
-        if (-not $IsGmsa) {
-            $registerParams.Password = $ServiceAccountCredential.GetNetworkCredential().Password
-            $registerParams.User     = $ServiceAccountName
-            $registerParams.Remove('Principal') | Out-Null
-            $registerParams.RunLevel = 'Highest'
-        }
-        Register-ScheduledTask @registerParams | Out-Null
         $fullTaskPath = if ($TaskFolder.EndsWith('\')) { "$TaskFolder$TaskName" } else { "$TaskFolder\$TaskName" }
         Write-Ok "Task registered: $fullTaskPath"
         Write-Info "Schedule: $Frequency at $UpdateStartTime$(if ($Frequency -eq 'TwiceDaily') { " + 12h" })"
