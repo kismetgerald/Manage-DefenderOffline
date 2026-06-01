@@ -1608,8 +1608,20 @@ function Install-UpdatesComponent {
                     -RedirectStandardOutput $stdoutLog `
                     -RedirectStandardError  $stderrLog `
                     -ErrorAction Stop
-                $outText = if (Test-Path -LiteralPath $stdoutLog) { (Get-Content -LiteralPath $stdoutLog -Raw).TrimEnd() } else { '' }
-                $errText = if (Test-Path -LiteralPath $stderrLog) { (Get-Content -LiteralPath $stderrLog -Raw).TrimEnd() } else { '' }
+
+                # Get-Content -Raw returns $null (not '') for empty files —
+                # naive .TrimEnd() would throw "cannot call method on null."
+                $outText = ''
+                $errText = ''
+                if (Test-Path -LiteralPath $stdoutLog) {
+                    $raw = Get-Content -LiteralPath $stdoutLog -Raw -ErrorAction SilentlyContinue
+                    if ($raw) { $outText = $raw.TrimEnd() }
+                }
+                if (Test-Path -LiteralPath $stderrLog) {
+                    $raw = Get-Content -LiteralPath $stderrLog -Raw -ErrorAction SilentlyContinue
+                    if ($raw) { $errText = $raw.TrimEnd() }
+                }
+
                 if ($outText) {
                     Write-Host ''
                     Write-Host '  --- WhatIf smoke test output ---' -ForegroundColor DarkGray
@@ -1618,10 +1630,17 @@ function Install-UpdatesComponent {
                     Write-Host ''
                 }
                 if ($errText) { Write-Info ('Smoke test stderr: ' + $errText) }
+
                 if ($proc.ExitCode -eq 0) {
                     Write-Ok "WhatIf smoke test exited cleanly (code 0)."
+                    if (-not $outText) {
+                        Write-Info 'No captured output. Update script log: C:\Logs\Update-DefenderOffline_*.log'
+                    }
                 } else {
                     Write-Warn "WhatIf smoke test exited with code $($proc.ExitCode). Inspect the Update logs."
+                    if (-not $outText -and -not $errText) {
+                        Write-Info 'No captured stdout/stderr. Check C:\Logs\Update-DefenderOffline_*.log for the failure reason.'
+                    }
                 }
             } catch {
                 Write-Warn "Could not run WhatIf smoke test: $($_.Exception.Message)"
@@ -1655,12 +1674,10 @@ function Install-UpdatesComponent {
                 Start-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\'
 
                 $deadline = (Get-Date).AddMinutes(10)
-                $lastInfo = $null
                 do {
                     Start-Sleep -Seconds 2
                     $info = Get-ScheduledTaskInfo -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
                     if ($info) {
-                        $lastInfo = $info
                         $task = Get-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
                         if ($task -and $task.State -ne 'Running' -and $info.LastTaskResult -ne 267009 -and $null -ne $info.LastRunTime) {
                             if ($info.LastTaskResult -eq 0) {
