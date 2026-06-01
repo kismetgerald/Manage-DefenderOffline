@@ -482,12 +482,23 @@ function Initialize-CredentialSaveHelper {
 }
 
 function New-CredentialPayloadFile {
-    # Writes a PSCredential to a temp file in a format the helper can
-    # consume: <username>`n<base64 LocalMachine-DPAPI-encrypted UTF-16
-    # password>. Returns the temp path. Caller deletes after use.
+    # Writes a PSCredential to a short-lived file in conf/ in a format the
+    # helper can consume: <username>`n<base64 LocalMachine-DPAPI-encrypted
+    # UTF-16 password>. Returns the path. Caller deletes after use.
+    #
+    # WHY conf/ AND NOT THE SYSTEM TEMP FOLDER:
+    # The helper runs in the SERVICE IDENTITY'S context (Start-Process
+    # -Credential or one-shot gMSA scheduled task). The caller's per-user
+    # temp folder (%LOCALAPPDATA%\Temp) is owner-only by default, so the
+    # service identity gets ACCESS DENIED when it tries to read the
+    # handoff. conf/ is already pre-granted Modify to the service identity
+    # earlier in main flow, guaranteeing cross-identity readability.
+    # Payload contains only the LocalMachine-DPAPI-encrypted password
+    # blob (anyone on this box can decrypt it — that's intentional and is
+    # why the file is deleted within seconds in the caller's finally).
     param(
-        [Parameter(Mandatory)]
-        [pscredential]$Credential
+        [Parameter(Mandatory)] [pscredential]$Credential,
+        [Parameter(Mandatory)] [string]$ConfFolder
     )
     Add-Type -AssemblyName System.Security
 
@@ -504,7 +515,7 @@ function New-CredentialPayloadFile {
         $plainPwd = $null
     }
 
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    $tmp = Join-Path $ConfFolder (".credpayload." + [guid]::NewGuid().ToString('N') + '.tmp')
     Set-Content -Path $tmp -Value @($Credential.UserName, $b64) -Encoding UTF8 -Force
     return $tmp
 }
@@ -542,6 +553,11 @@ function Invoke-AsServiceIdentity {
 
     if (-not $IsGmsa) {
         # Traditional service account: Start-Process -Credential synchronously.
+        # Redirect stdout/stderr so we can surface the helper's failure reason
+        # instead of just "exit code 1". Logs land next to the helper and are
+        # deleted in finally regardless of outcome.
+        $stdoutLog = Join-Path $ScriptDir ('.credhelper.{0}.out.log' -f [guid]::NewGuid().ToString('N'))
+        $stderrLog = Join-Path $ScriptDir ('.credhelper.{0}.err.log' -f [guid]::NewGuid().ToString('N'))
         try {
             $proc = Start-Process -FilePath $pwshPath `
                 -ArgumentList ($argList -join ' ') `
@@ -550,15 +566,28 @@ function Invoke-AsServiceIdentity {
                 -WindowStyle Hidden `
                 -Wait `
                 -PassThru `
+                -RedirectStandardOutput $stdoutLog `
+                -RedirectStandardError  $stderrLog `
                 -ErrorAction Stop
             if ($proc.ExitCode -ne 0) {
                 Write-Fail "Credential helper exited with code $($proc.ExitCode)."
+                $errText = if (Test-Path -LiteralPath $stderrLog) { (Get-Content -LiteralPath $stderrLog -Raw).Trim() } else { '' }
+                $outText = if (Test-Path -LiteralPath $stdoutLog) { (Get-Content -LiteralPath $stdoutLog -Raw).Trim() } else { '' }
+                $sideLog = $DestinationPath + '.err'
+                $sideText = if (Test-Path -LiteralPath $sideLog) { (Get-Content -LiteralPath $sideLog -Raw).Trim() } else { '' }
+                if ($errText)  { Write-Info ('Helper stderr: ' + $errText) }
+                if ($outText)  { Write-Info ('Helper stdout: ' + $outText) }
+                if ($sideText) { Write-Info ('Helper sidelog: ' + $sideText) }
                 return $false
             }
             return $true
         } catch {
             Write-Fail "Start-Process -Credential failed: $($_.Exception.Message)"
             return $false
+        } finally {
+            foreach ($p in @($stdoutLog, $stderrLog, ($DestinationPath + '.err'))) {
+                if ($p -and (Test-Path -LiteralPath $p)) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+            }
         }
     }
 
@@ -614,6 +643,12 @@ function Invoke-AsServiceIdentity {
                 $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
                 if ($task -and $task.State -ne 'Running' -and $info.LastTaskResult -ne 0 -and $info.LastTaskResult -ne 267009) {
                     Write-Fail "gMSA credential save task exited with code $($info.LastTaskResult)."
+                    $sideLog = $DestinationPath + '.err'
+                    if (Test-Path -LiteralPath $sideLog) {
+                        $errText = (Get-Content -LiteralPath $sideLog -Raw).Trim()
+                        if ($errText) { Write-Info ('Helper error: ' + $errText) }
+                        Remove-Item -LiteralPath $sideLog -Force -ErrorAction SilentlyContinue
+                    }
                     return $false
                 }
             }
@@ -646,12 +681,13 @@ function Save-ServiceCredential {
         [Parameter(Mandatory)] [bool]$IsGmsa,
         [string]$ServiceAccountName,
         [pscredential]$ServiceAccountCredential,
-        [string]$GmsaAccountName
+        [string]$GmsaAccountName,
+        [Parameter(Mandatory)] [string]$ConfFolder
     )
 
     $payload = $null
     try {
-        $payload = New-CredentialPayloadFile -Credential $Credential
+        $payload = New-CredentialPayloadFile -Credential $Credential -ConfFolder $ConfFolder
         $ok = Invoke-AsServiceIdentity `
             -CredentialName            $CredentialName `
             -SourcePayloadPath         $payload `
@@ -933,7 +969,8 @@ function Initialize-ServiceCredentials {
                 -IsGmsa                    $IsGmsa `
                 -ServiceAccountName        $ServiceAccountName `
                 -ServiceAccountCredential  $ServiceAccountCredential `
-                -GmsaAccountName           $GmsaAccountName
+                -GmsaAccountName           $GmsaAccountName `
+                -ConfFolder                $ConfFolder
             if (-not $ok) { $allOk = $false }
         }
     } finally {

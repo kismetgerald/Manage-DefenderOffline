@@ -19,6 +19,9 @@
 #      under the CURRENT user's DPAPI master key (so the encryption is now
 #      tied to the service identity, not the admin who launched the install)
 #   5. Exits 0 on success, 1 on failure
+[System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'CredentialName',
+    Justification = '$CredentialName is a tag ("WinRm"/"AD"/"Smtp"), not credential material; the analyzer false-positives on the substring match.')]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [ValidateSet('WinRm','AD','Smtp')]
@@ -32,6 +35,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Side-log alongside the destination: any caught exception is written here
+# before exit 1. The caller (Install-ManageDefender.ps1) reads + surfaces +
+# deletes this in its finally block. Works regardless of whether the helper
+# was launched via Start-Process (stdio captured) or Task Scheduler (gMSA,
+# stdio not captured).
+$errLog = $DestinationPath + '.err'
+
 try {
     $lines = Get-Content -Path $SourcePath -ErrorAction Stop
     if ($lines.Count -lt 2) { throw "Source credential payload at $SourcePath is malformed." }
@@ -60,6 +71,14 @@ try {
     }
     exit 0
 } catch {
+    $msg = "[{0}] {1}`r`n  Helper invoked as: {2}`r`n  SourcePath:        {3}`r`n  DestinationPath:   {4}`r`n  Exception type:    {5}" -f `
+        (Get-Date -Format 'o'),
+        $_.Exception.Message,
+        ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name),
+        $SourcePath,
+        $DestinationPath,
+        $_.Exception.GetType().FullName
+    try { Set-Content -Path $errLog -Value $msg -Encoding UTF8 -Force -ErrorAction SilentlyContinue } catch {}
     Write-Error $_.Exception.Message
     exit 1
 }
