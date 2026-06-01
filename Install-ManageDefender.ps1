@@ -89,7 +89,7 @@
     .\Install-ManageDefender.ps1 -GmsaName 'CONTOSO\svc-defender$' -StartImmediately
 
 .EXAMPLE
-    # Dashboard only (matches the legacy Install-DefenderDashboard.ps1 behaviour)
+    # Dashboard only (skip the Updates task)
     .\Install-ManageDefender.ps1 -Component Dashboard -GmsaName 'CONTOSO\svc-defender$' `
                                  -UseHttps -AddFirewallRule -StartImmediately
 
@@ -967,7 +967,7 @@ function Register-DashboardEventLogSource {
 
 # ===================================================================
 # Dashboard component install
-# Lifted from Install-DefenderDashboard.ps1 with modest tweaks:
+# Encapsulates the Dashboard scheduled-task install logic:
 #   - identity already validated by caller
 #   - directory creation/ACL deduped against the shared script folder
 #   - no embedded credential helper (handled by Initialize-ServiceCredentials)

@@ -32,10 +32,10 @@
 | Script | Purpose | Run by |
 |---|---|---|
 | `Get-DefenderDefinitions.ps1` | Downloads mpam-fe.exe (x64 / x86 / arm64) from Microsoft for transfer into the air-gapped share | Admin, on an internet-connected staging machine |
-| `Update-DefenderOffline.ps1` | Deploys definition updates to all endpoints | Admin (manual or scheduled task) |
+| `Update-DefenderOffline.ps1` | Deploys definition updates to all endpoints | Scheduled task (service account / gMSA) |
 | `Show-DefenderStatus.ps1` | Interactive Windows Forms fleet health monitor | Admin, interactively |
 | `Start-DefenderDashboard.ps1` | Headless HTTP dashboard service | Scheduled task (service account / gMSA) |
-| `Install-DefenderDashboard.ps1` | One-time installer for the dashboard service | Admin, once |
+| `Install-ManageDefender.ps1` | Unified installer for the Dashboard and/or Updates scheduled tasks (`-Component Dashboard \| Updates \| All`) | Admin, once |
 
 ## Prerequisites Checklist
 
@@ -422,7 +422,7 @@ Opens a live Windows Forms dashboard showing the Defender health status of all e
 
 ## Start-DefenderDashboard.ps1 — Reference
 
-Headless HTTP server that serves a self-refreshing browser dashboard. Designed to run continuously as a Windows Scheduled Task under a service account or gMSA. Use `Install-DefenderDashboard.ps1` to register it as a service.
+Headless HTTP server that serves a self-refreshing browser dashboard. Designed to run continuously as a Windows Scheduled Task under a service account or gMSA. Use `Install-ManageDefender.ps1 -Component Dashboard` to register it as a service.
 
 **Endpoints:**
 
@@ -464,37 +464,58 @@ Headless HTTP server that serves a self-refreshing browser dashboard. Designed t
 
 ---
 
-## Install-DefenderDashboard.ps1 — Reference
+## Install-ManageDefender.ps1 — Reference
 
-One-time installer. Run as Administrator.
+Unified one-time installer for the toolkit's scheduled tasks. Run as Administrator. Pick `-Component` to install:
+
+| `-Component` | What it installs | Target host |
+|---|---|---|
+| `Dashboard` | Headless HTTP dashboard scheduled task only | Air-gapped management host |
+| `Updates` | Periodic definition-push scheduled task only | Air-gapped management host |
+| `All` *(default)* | Dashboard **and** Updates on the same host | Air-gapped management host |
+| `Downloader` *(reserved, v0.0.20)* | Wrapper for `Get-DefenderDefinitions.ps1` | Internet-connected staging host |
 
 **What it does:**
-1. Validates prerequisites (pwsh.exe, Task Scheduler)
+1. Validates prerequisites (pwsh.exe, Task Scheduler, script paths)
 2. Validates the service account or gMSA in Active Directory
-3. Registers the `Manage-DefenderOffline` Windows Event Log source
+3. Saves DPAPI-encrypted credentials (`WinRmCredential.xml`, `ADCredential.xml`, `SmtpCredential.xml`) under the service identity. On STIG-hardened hosts (V-253289) handles the Secondary Logon Service enable→save→restore-Disabled dance automatically. Skip with `-SkipCredentialSetup` to print follow-up instructions instead.
 4. Creates directories and grants filesystem permissions to the service identity
-5. Checks port availability; selects fallback automatically if needed
-6. Registers a Windows Scheduled Task (AtStartup, no time limit, restart-on-failure)
-7. Optionally creates an inbound Windows Firewall rule
-8. Optionally starts the task immediately and reads `conf\dashboard.status` to confirm the actual port
+5. Registers the `Manage-DefenderOffline` Windows Event Log source (Dashboard)
+6. Checks port availability; selects fallback automatically if needed (Dashboard, HTTP only)
+7. Registers Windows Scheduled Task(s):
+   - **Dashboard** — AtStartup, no time limit, restart-on-failure, battery-aware
+   - **Updates** — frequency-based trigger (`-Frequency TwiceDaily|Daily|Weekly|Monthly`, default Daily), `-UpdateStartTime '02:00'` for trigger time
+8. Optionally creates an inbound Windows Firewall rule (Dashboard)
+9. Optionally starts the Dashboard task immediately and probes `/health`
+10. Optionally runs the Updates task once with `-RunNowWhatIf` for a connectivity smoke test
 
 **gMSA installation (recommended):**
 ```powershell
-.\Install-DefenderDashboard.ps1 `
+.\Install-ManageDefender.ps1 `
     -GmsaName "CONTOSO\svc-defender$" `
     -SourceSharePath "\\NAS01\DataShare\...\Microsoft_Defender" `
     -AddFirewallRule `
     -StartImmediately
 ```
 
-**Traditional service account:**
+**Traditional service account, Dashboard only:**
 ```powershell
 $cred = Get-Credential -UserName "CONTOSO\svc-defender" -Message "Service account password"
-.\Install-DefenderDashboard.ps1 `
+.\Install-ManageDefender.ps1 `
+    -Component Dashboard `
     -ServiceAccount "CONTOSO\svc-defender" `
     -Credential $cred `
     -AddFirewallRule `
     -StartImmediately
+```
+
+**Updates only, weekly Sunday at 03:30:**
+```powershell
+.\Install-ManageDefender.ps1 `
+    -Component Updates `
+    -GmsaName 'CONTOSO\svc-defender$' `
+    -Frequency Weekly -UpdateStartTime '03:30' `
+    -RunNowWhatIf
 ```
 
 | Parameter | Default | Description |

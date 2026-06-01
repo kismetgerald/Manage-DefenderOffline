@@ -20,7 +20,7 @@
     Visitors always receive the most recently cached data; they are never blocked waiting
     for a live query.
 
-    Use Install-DefenderDashboard.ps1 to register this script as a scheduled task.
+    Use Install-ManageDefender.ps1 to register this script as a scheduled task.
 
 .PARAMETER Port
     TCP port the HTTP listener binds to. Default: 8080.
@@ -333,13 +333,13 @@ function Resolve-DashboardCertificate {
     $cert = Get-Item -LiteralPath $certPath -ErrorAction SilentlyContinue
     if (-not $cert) {
         throw "Certificate with thumbprint $clean not found in Cert:\LocalMachine\My. " +
-              "Use Install-DefenderDashboard.ps1 -UseHttps to generate one, or import a PKI-issued cert into LocalMachine\My."
+              "Use Install-ManageDefender.ps1 -Component Dashboard -UseHttps to generate one, or import a PKI-issued cert into LocalMachine\My."
     }
     $now             = Get-Date
     $daysUntilExpiry = [int]($cert.NotAfter - $now).TotalDays
     if ($daysUntilExpiry -lt 0) {
         throw "Certificate $clean expired $(-$daysUntilExpiry) day(s) ago (NotAfter: $($cert.NotAfter)). " +
-              "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate."
+              "Re-run Install-ManageDefender.ps1 -Component Dashboard -RenewCertificate to regenerate."
     }
     [pscustomobject]@{
         Certificate     = $cert
@@ -2420,7 +2420,7 @@ if ($UseHttps) {
     }
     if ($dashboardCert.DaysUntilExpiry -lt 30) {
         $expiryMsg = "Dashboard TLS certificate $($dashboardCert.Thumbprint) expires in $($dashboardCert.DaysUntilExpiry) day(s) (on $($dashboardCert.NotAfter.ToString('yyyy-MM-dd'))). " +
-                     "Re-run Install-DefenderDashboard.ps1 -RenewCertificate to regenerate, or replace with a PKI-issued cert."
+                     "Re-run Install-ManageDefender.ps1 -Component Dashboard -RenewCertificate to regenerate, or replace with a PKI-issued cert."
         Write-DashLog $expiryMsg 'WARN'
         try {
             if ([System.Diagnostics.EventLog]::SourceExists('Manage-DefenderOffline')) {
@@ -2484,7 +2484,7 @@ if ($UseHttps) {
         Write-DashLog "TLS handshake would fail at first request. Bind the cert with:" 'ERROR'
         Write-DashLog "  netsh http add sslcert ipport=0.0.0.0:$Port certhash=$CertificateThumbprint appid='{12345678-DB90-4B66-8B01-88F7AF2A1234}'" 'ERROR'
         Write-DashLog "Or re-run the installer to bind automatically:" 'ERROR'
-        Write-DashLog "  .\Install-DefenderDashboard.ps1 -UseHttps" 'ERROR'
+        Write-DashLog "  .\Install-ManageDefender.ps1 -Component Dashboard -UseHttps" 'ERROR'
         exit 1
     }
     Write-DashLog "HTTPS pre-flight: $($bindingCheck.Reason)" 'SUCCESS'
@@ -2543,7 +2543,7 @@ try {
     Write-DashLog "Failed to bind to port $Port (${scheme}): $($_.Exception.Message)" 'ERROR'
     if ($UseHttps) {
         Write-DashLog "For HTTPS, the cert must also be bound to the port via:  netsh http add sslcert ipport=0.0.0.0:$Port certhash=$($dashboardCert.Thumbprint) appid={GUID}" 'ERROR'
-        Write-DashLog 'The installer (Install-DefenderDashboard.ps1 -UseHttps) handles this binding automatically.' 'ERROR'
+        Write-DashLog 'The installer (Install-ManageDefender.ps1 -Component Dashboard -UseHttps) handles this binding automatically.' 'ERROR'
     } else {
         Write-DashLog 'Ensure no other process owns this port and that the account has permission to register HTTP prefixes.' 'ERROR'
     }

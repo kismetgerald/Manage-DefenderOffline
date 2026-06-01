@@ -124,7 +124,6 @@ $includeFiles = @(
     "Show-DefenderStatus.ps1",
     "Start-DefenderDashboard.ps1",
     "Install-ManageDefender.ps1",      # v0.0.19: unified installer entry point
-    "Install-DefenderDashboard.ps1",   # v0.0.19: backward-compat shim
     "Get-DefenderDefinitions.ps1",
     "README.md",
     "LICENSE.txt"
