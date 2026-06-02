@@ -242,6 +242,7 @@ $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path
 # Shared helper modules (dot-sourced; same chokepoint pattern as the other scripts).
 . (Join-Path $ScriptDir 'lib\Update-ConfigValue.ps1')
 . (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
+. (Join-Path $ScriptDir 'lib\Get-PortBusyDiagnostic.ps1')
 
 # Schema versions this script was built against. Bump when shipping a breaking
 # config or hosts layout change. Test-SchemaVersion warns on mismatch but does
@@ -1210,6 +1211,56 @@ function Install-DashboardComponent {
 
     Register-DashboardEventLogSource
 
+    # ----- Stop existing instance + port check (BEFORE any netsh setup) -----
+    # The port check runs first so that a port-in-use failure aborts BEFORE
+    # we touch netsh sslcert / urlacl. Otherwise a half-configured binding
+    # would be left behind for the operator to clean up manually with
+    # 'netsh http delete sslcert' / 'netsh http delete urlacl'.
+    $existingTaskPre = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
+    if ($existingTaskPre -and $existingTaskPre.State -eq 'Running') {
+        Write-Step "Stopping previously installed dashboard task…"
+        try {
+            Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction Stop
+            for ($wait = 0; $wait -lt 10; $wait++) {
+                if (Test-PortFree $Port) { break }
+                Start-Sleep -Milliseconds 500
+            }
+            Write-Ok "Previous instance stopped"
+        } catch {
+            Write-Warn "Could not stop existing task: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Step "Checking port availability…"
+    if ($UseHttps) {
+        if (-not (Test-PortFree $Port)) {
+            Write-Fail "Port $Port is in use and HTTPS does not support fallback (cert binding is per-port)."
+            $diag = Get-PortBusyDiagnostic -BusyPort $Port
+            if ($diag) { Write-Info $diag }
+            return $false
+        }
+        $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
+        Write-Ok "Port $Port is available (HTTPS)"
+    } else {
+        try {
+            $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
+        } catch {
+            Write-Fail $_.Exception.Message
+            $diag = Get-PortBusyDiagnostic -BusyPort $Port
+            if ($diag) { Write-Info $diag }
+            return $false
+        }
+        if ($portResult.IsFallback) {
+            Write-Warn "Port $($portResult.PrimaryPort) is already in use on this host."
+            $diag = Get-PortBusyDiagnostic -BusyPort $portResult.PrimaryPort
+            if ($diag) { Write-Info $diag }
+            Write-Ok   "Using fallback port $($portResult.Port) instead."
+            $Port = $portResult.Port
+        } else {
+            Write-Ok "Port $Port is available"
+        }
+    }
+
     # ----- HTTPS setup -----
     if ($UseHttps) {
         Write-Step "Configuring HTTPS…"
@@ -1344,41 +1395,6 @@ function Install-DashboardComponent {
         if ($AuthMethod -eq 'Basic' -and -not $UseHttps) {
             Write-Fail "AuthMethod=Basic without -UseHttps would send credentials in cleartext on every request."
             return $false
-        }
-    }
-
-    # ----- Stop existing instance + port check -----
-    $existingTaskPre = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
-    if ($existingTaskPre -and $existingTaskPre.State -eq 'Running') {
-        Write-Step "Stopping previously installed dashboard task…"
-        try {
-            Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction Stop
-            for ($wait = 0; $wait -lt 10; $wait++) {
-                if (Test-PortFree $Port) { break }
-                Start-Sleep -Milliseconds 500
-            }
-            Write-Ok "Previous instance stopped"
-        } catch {
-            Write-Warn "Could not stop existing task: $($_.Exception.Message)"
-        }
-    }
-
-    Write-Step "Checking port availability…"
-    if ($UseHttps) {
-        if (-not (Test-PortFree $Port)) {
-            Write-Fail "Port $Port is in use and HTTPS does not support fallback (cert binding is per-port)."
-            return $false
-        }
-        $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
-        Write-Ok "Port $Port is available (HTTPS)"
-    } else {
-        $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
-        if ($portResult.IsFallback) {
-            Write-Warn "Port $($portResult.PrimaryPort) is already in use on this host."
-            Write-Ok   "Using fallback port $($portResult.Port) instead."
-            $Port = $portResult.Port
-        } else {
-            Write-Ok "Port $Port is available"
         }
     }
 
