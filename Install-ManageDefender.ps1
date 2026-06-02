@@ -199,11 +199,11 @@ param(
     [string]$AuthToken,
 
     # ----- Dashboard task naming -----
-    [string]$TaskName   = 'DefenderDashboard',
+    [string]$TaskName   = 'Microsoft-Defender-Dashboard',
     [string]$TaskFolder = '\',
 
     # ----- Updates task naming -----
-    [string]$UpdateTaskName   = 'DefenderUpdate',
+    [string]$UpdateTaskName   = 'Microsoft-Defender-Update',
     [string]$UpdateTaskFolder,    # blank = use $TaskFolder
 
     # ----- Updates-specific config -----

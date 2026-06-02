@@ -253,7 +253,7 @@ RefreshInterval = 300                   ← seconds
 DashboardTheme  = Dark                  ← Dark | Light (per-browser toggle overrides this default)
 
 [Install]
-TaskName   = DefenderDashboard
+TaskName   = Microsoft-Defender-Dashboard
 TaskFolder = \                          ← e.g. \Security to keep tasks organised
 
 [Credentials]
@@ -526,7 +526,7 @@ $cred = Get-Credential -UserName "CONTOSO\svc-defender" -Message "Service accoun
 | `-Port` | `8080` | Primary port (checked for availability at install time) |
 | `-FallbackPort` | `8443` | Fallback if primary is in use |
 | `-RefreshInterval` | `300` | Passed to Start-DefenderDashboard.ps1 |
-| `-TaskName` | `DefenderDashboard` | Scheduled task name |
+| `-TaskName` | `Microsoft-Defender-Dashboard` | Scheduled task name |
 | `-TaskFolder` | `\` | Task Scheduler folder |
 | `-AddFirewallRule` | — | Create inbound TCP rule for the dashboard port |
 | `-StartImmediately` | — | Start task after registration and verify via status file |
@@ -539,13 +539,13 @@ The installer prints a tailored "Useful commands" block at the end of every run.
 **Manage the installed service** (substitute the `-TaskPath` value the installer printed):
 ```powershell
 # Root folder (TaskFolder = '\') — no -TaskPath required
-Start-ScheduledTask  -TaskName 'DefenderDashboard'
-Stop-ScheduledTask   -TaskName 'DefenderDashboard'
-Get-ScheduledTask    -TaskName 'DefenderDashboard' | Select-Object State, LastRunTime, LastTaskResult
-Unregister-ScheduledTask -TaskName 'DefenderDashboard' -Confirm:$false
+Start-ScheduledTask  -TaskName 'Microsoft-Defender-Dashboard'
+Stop-ScheduledTask   -TaskName 'Microsoft-Defender-Dashboard'
+Get-ScheduledTask    -TaskName 'Microsoft-Defender-Dashboard' | Select-Object State, LastRunTime, LastTaskResult
+Unregister-ScheduledTask -TaskName 'Microsoft-Defender-Dashboard' -Confirm:$false
 
 # Non-root folder (e.g. TaskFolder = '\Security') — trailing backslash required
-Get-ScheduledTask -TaskName 'DefenderDashboard' -TaskPath '\Security\' |
+Get-ScheduledTask -TaskName 'Microsoft-Defender-Dashboard' -TaskPath '\Security\' |
     Select-Object State, LastRunTime, LastTaskResult
 ```
 

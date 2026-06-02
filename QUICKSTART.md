@@ -171,8 +171,8 @@ the new grant won't take effect until the session expires (~10 min) or the
 connection is recycled.
 
 ```powershell
-Stop-ScheduledTask  -TaskName DefenderDashboard
-Start-ScheduledTask -TaskName DefenderDashboard
+Stop-ScheduledTask  -TaskName Microsoft-Defender-Dashboard
+Start-ScheduledTask -TaskName Microsoft-Defender-Dashboard
 ```
 
 ---
