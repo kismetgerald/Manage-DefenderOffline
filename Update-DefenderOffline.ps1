@@ -1096,7 +1096,15 @@ function Invoke-DefenderUpdate {
 function New-HtmlReport {
     param(
         [System.Collections.Generic.List[pscustomobject]]$Data,
-        [timespan]$RunTime
+        [timespan]$RunTime,
+        # 'Standalone' — full HTML for the file-on-disk path; includes the
+        #                click-to-filter affordance and JS that powers it.
+        # 'Email'      — same content, but with affordances that depend on
+        #                JavaScript suppressed so they don't appear as
+        #                misleading instructions in email clients (which
+        #                strip JS). v0.0.20.
+        [ValidateSet('Standalone','Email')]
+        [string]$Mode = 'Standalone'
     )
 
     $successCount  = @($Data | Where-Object Status -eq 'Success').Count
@@ -1231,7 +1239,7 @@ function New-HtmlReport {
     <span class="stat-card sc-fail"  data-filter="Failed"         onclick="filterByStatus(this)">Failed<br>$failCount</span>
     <span class="stat-card sc-skip"  data-filter="No Update Needed" onclick="filterByStatus(this)">Skipped<br>$skipCount</span>$(if ($whatifCount   -gt 0) { "`n    <span class='stat-card sc-info'  data-filter='WhatIf'   onclick='filterByStatus(this)'>WhatIf<br>$whatifCount</span>" })$(if ($excludedCount -gt 0) { "`n    <span class='stat-card' style='background:#6b7280' data-filter='Excluded'  onclick='filterByStatus(this)'>Excluded<br>$excludedCount</span>" })$(if ($gateHaltCount -gt 0) { "`n    <span class='stat-card' style='background:#6b21a8' data-filter='Skipped' onclick='filterByStatus(this)'>Gate Halt<br>$gateHaltCount</span>" })
   </div>
-  <p style="font-size:.8em; color:#888; margin-top:4px;">Click a badge to filter the results table. Click again to clear.</p>
+$(if ($Mode -eq 'Standalone') { '  <p style="font-size:.8em; color:#888; margin-top:4px;">Click a badge to filter the results table. Click again to clear.</p>' })
 
   <h2>Fleet Version Summary</h2>
   <table class="version-table" role="presentation">
@@ -1872,7 +1880,11 @@ if ($SendEmail -and $To -and $SmtpServer -and -not $WhatIfMode) {
         $msg.BodyEncoding    = [System.Text.Encoding]::UTF8
         $msg.HeadersEncoding = [System.Text.Encoding]::UTF8
         $msg.Subject     = $subject
-        $msg.Body        = (Get-Content -LiteralPath $reportFull -Raw -Encoding UTF8)
+        # Email body uses Mode=Email — the file on disk (attached below) keeps
+        # the click-to-filter affordance because it works when opened in a
+        # browser. Email clients strip JS, so the affordance would render as a
+        # misleading instruction. v0.0.20 fix.
+        $msg.Body        = New-HtmlReport -Data $Results -RunTime $TotalDuration -Mode Email
         $msg.IsBodyHtml  = $true
         foreach ($a in @($reportFull, $csvFull)) {
             [void]$msg.Attachments.Add([System.Net.Mail.Attachment]::new($a))
