@@ -129,7 +129,17 @@
 [CmdletBinding(DefaultParameterSetName = 'gMSA', SupportsShouldProcess)]
 param(
     # ----- Component selection -----
+    # The ValidateScript fires during parameter binding (before the gMSA/
+    # ServiceAccount Mandatory prompts), so it can short-circuit a
+    # `-Component Downloader` invocation with a clear message instead of
+    # the operator getting prompted for an identity they shouldn't need.
     [ValidateSet('Dashboard', 'Updates', 'All', 'Downloader')]
+    [ValidateScript({
+        if ($_ -eq 'Downloader') {
+            throw "Component 'Downloader' is reserved for v0.0.20 and not yet implemented. It will be installed on a separate internet-connected staging host."
+        }
+        $true
+    })]
     [string]$Component = 'All',
 
     # ----- Updates-task frequency -----
