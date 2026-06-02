@@ -122,6 +122,26 @@ function Update-ConfigValue {
     }
 
     if ($PSCmdlet.ShouldProcess($Path, "Update $Section/$Key = $Value")) {
-        Set-Content -LiteralPath $Path -Value $newLines -Encoding UTF8
+        # Retry briefly to ride out transient locks (editor save-in-progress,
+        # AV scanner, etc.). If the file is held exclusively (typically by an
+        # editor like notepad), fail-fast with an actionable message instead
+        # of the generic IO sharing-violation that the operator usually
+        # can't decode.
+        $delaysMs  = @(0, 250, 750, 1500)  # cumulative ~2.5s before giving up
+        $lastError = $null
+        foreach ($delay in $delaysMs) {
+            if ($delay -gt 0) { Start-Sleep -Milliseconds $delay }
+            try {
+                Set-Content -LiteralPath $Path -Value $newLines -Encoding UTF8 -ErrorAction Stop
+                $lastError = $null
+                break
+            } catch [System.IO.IOException] {
+                $lastError = $_
+                continue
+            }
+        }
+        if ($lastError) {
+            throw "Could not write to '$Path' after $($delaysMs.Count) attempts (~2.5s). Close any editor (Notepad, VS Code, Word) that has the file open, then retry. Underlying error: $($lastError.Exception.Message)"
+        }
     }
 }
