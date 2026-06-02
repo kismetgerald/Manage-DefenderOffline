@@ -131,6 +131,11 @@ $LibInvokeDefenderRemote = Join-Path $ScriptDir 'lib\Invoke-DefenderRemote.ps1'
 # state.
 $LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.ps1'
 . $LibGetDefenderHealthProbe
+. (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
+
+# Schema versions this script was built against.
+$Script:ExpectedConfigSchemaVersion = 1
+$Script:ExpectedHostsSchemaVersion  = 1
 
 # ===================================================================
 # Credential Helper Mode  (exits after completion)
@@ -234,6 +239,15 @@ $ExcludeList = @()
 if ($cfg['ExcludeComputers']) {
     $ExcludeList = $cfg['ExcludeComputers'] -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
 }
+
+# Schema version checks. Warnings surface via Write-Warning so they appear
+# in the operator's console before the WinForms UI loads.
+$cfgSchema = Test-SchemaVersion -ConfigData $cfg `
+    -ExpectedVersion $Script:ExpectedConfigSchemaVersion -ArtifactName 'config.conf'
+if ($cfgSchema.Warning) { Write-Warning $cfgSchema.Warning }
+$hostsSchema = Test-SchemaVersion -HostsFilePath $HostsFile `
+    -ExpectedVersion $Script:ExpectedHostsSchemaVersion -ArtifactName 'hosts.conf'
+if ($hostsSchema.Warning) { Write-Warning $hostsSchema.Warning }
 
 # ===================================================================
 # WinRM Credential Auto-Load

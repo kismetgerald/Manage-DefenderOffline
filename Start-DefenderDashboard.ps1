@@ -160,7 +160,12 @@ $LibTestHttpsCertBinding   = Join-Path $ScriptDir 'lib\Test-HttpsCertBinding.ps1
 . $LibTestHttpsCertBinding
 $LibTestUrlAclCollision    = Join-Path $ScriptDir 'lib\Test-UrlAclCollision.ps1'
 . $LibTestUrlAclCollision
+. (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# Schema versions this script was built against.
+$Script:ExpectedConfigSchemaVersion = 1
+$Script:ExpectedHostsSchemaVersion  = 1
 
 # ===================================================================
 # Credential Helper Mode  (exits after completion)
@@ -2293,6 +2298,17 @@ Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 Write-DashLog "Source share    : $(if ($SourceSharePath) { $SourceSharePath } else { '(none configured)' })"
+
+# Schema version checks (config.conf + hosts.conf). Warnings go through
+# Write-DashLog so they land in both the dashboard log file and the host
+# console — operators inspecting startup behavior see them either way.
+$cfgSchema = Test-SchemaVersion -ConfigData $cfg `
+    -ExpectedVersion $Script:ExpectedConfigSchemaVersion -ArtifactName 'config.conf'
+if ($cfgSchema.Warning) { Write-DashLog $cfgSchema.Warning 'WARN' }
+$hostsSchema = Test-SchemaVersion -HostsFilePath $HostsFile `
+    -ExpectedVersion $Script:ExpectedHostsSchemaVersion -ArtifactName 'hosts.conf'
+if ($hostsSchema.Warning) { Write-DashLog $hostsSchema.Warning 'WARN' }
+
 Write-StartupPhase 'banner'
 
 # ===================================================================

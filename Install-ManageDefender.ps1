@@ -241,6 +241,13 @@ $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path
 
 # Shared helper modules (dot-sourced; same chokepoint pattern as the other scripts).
 . (Join-Path $ScriptDir 'lib\Update-ConfigValue.ps1')
+. (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
+
+# Schema versions this script was built against. Bump when shipping a breaking
+# config or hosts layout change. Test-SchemaVersion warns on mismatch but does
+# not block startup — operators may be running mixed-release scripts during
+# a rolling upgrade.
+$Script:ExpectedConfigSchemaVersion = 1
 
 # Stable application GUID used for netsh sslcert binding (Dashboard component).
 # Reusing this lets the installer find and delete its own previous bindings idempotently.
@@ -309,6 +316,14 @@ function Write-Section ([string]$Msg) {
     Write-Host "   $Msg" -ForegroundColor Magenta
     Write-Host '  ============================================================' -ForegroundColor Magenta
 }
+
+# ===================================================================
+# Schema version check (config.conf only — installer does not read hosts.conf)
+# ===================================================================
+$schemaCheck = Test-SchemaVersion -ConfigData $cfg `
+    -ExpectedVersion $Script:ExpectedConfigSchemaVersion `
+    -ArtifactName 'config.conf'
+if ($schemaCheck.Warning) { Write-Warn $schemaCheck.Warning }
 
 # ===================================================================
 # Common helpers
