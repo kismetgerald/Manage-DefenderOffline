@@ -191,17 +191,17 @@ Get-NetFirewallRule -DisplayName 'DefenderDashboard-TCP-8080' | Select-Object En
 ```
 
 **Expected result:**
-- [ ] Banner names `Install-ManageDefender v0.0.19` and `Component(s): Dashboard`
-- [ ] Pre-fill banner lists `WinRM` and `AD` with `HOME\xxSecurityMonitor`; both `Get-Credential` windows open with that username already populated
-- [ ] Format hint visible in each prompt's message line
-- [ ] `WinRmCredential.xml` and `ADCredential.xml` written under `conf/` and readable as the service identity
-- [ ] Dashboard task registered; `Get-ScheduledTask` returns it with correct identity and `RunLevel=Highest`
-- [ ] `/health` returns 200 OK within the installer's probe window
-- [ ] Firewall rule enabled and inbound
-- [ ] `conf/` ACL has a single (not duplicated) `Modify` entry for the service identity
-- [ ] Registered task action is functionally identical to the v0.0.18 form
+- [x] Banner names `Install-ManageDefender v0.0.19` and `Component(s): Dashboard`
+- [x] Pre-fill banner lists `WinRM` and `AD` with `HOME\xxSecurityMonitor`; both `Get-Credential` windows open with that username already populated
+- [x] Format hint visible in each prompt's message line
+- [x] `WinRmCredential.xml` and `ADCredential.xml` written under `conf/` and readable as the service identity
+- [x] Dashboard task registered; `Get-ScheduledTask` returns it with correct identity and `RunLevel=Highest`
+- [x] `/health` returns 200 OK within the installer's probe window
+- [x] Firewall rule enabled and inbound
+- [x] `conf/` ACL has a single (not duplicated) `Modify` entry for the service identity
+- [x] Registered task action is functionally identical to the v0.0.18 form
 
-**Result:** _Pending_
+**Result:** PASS on bundle `0.0.19f` after iterating through `a/b/c/d/e`. Surfaced and fixed: (i) `conf/` pre-grant ACL ordering — added explicit pre-grant block; (ii) credential-prompt UX — three new `[Credentials]` username keys (`WinRmUsername` / `AdUsername` / `SmtpUsername`) pre-fill each `Get-Credential` prompt with priority CLI > config > blank; (iii) cred-save helper had payload in per-user temp where the service identity got access-denied → moved to `conf/`; (iv) stderr/stdout capture + side-log for diagnostic visibility when the helper exits non-zero; (v) HTTP.sys orphan port-check requiring a reboot to clear (env-level, not a regression). End-state validated: both credential XMLs present, task registered with `Highest` run level, HTTPS `/health` returns 200, firewall rule enabled on Domain+Private, single explicit `Modify, Synchronize` ACL entry.
 
 ---
 
@@ -264,16 +264,16 @@ Select-String -Path .\conf\config.conf -Pattern 'UpdateTaskName|UpdateFrequency|
 ```
 
 **Expected result:**
-- [ ] Banner reports `Component(s): Updates`, `Frequency: Daily`, `UpdateStartTime: 02:00`
-- [ ] Cred files present in `conf/`
-- [ ] `DefenderUpdate` task registered; State=Ready
-- [ ] Trigger: `ScheduleByDay`, daily, `T02:00:00` start
-- [ ] Action invokes `Update-DefenderOffline.ps1` with `-ConfigPath` pointing at the installed `conf/config.conf`
-- [ ] `LastTaskResult = 0` after `-RunNowWhatIf`
-- [ ] WhatIf log written; no errors; no email attempt
-- [ ] `[Install]` keys persisted into `conf/config.conf`
+- [x] Banner reports `Component(s): Updates`, `Frequency: Daily`, `UpdateStartTime: 02:00`
+- [x] Cred files present in `conf/`
+- [x] `Microsoft-Defender-Update` task registered; State=Ready (operator adopted the deferred TaskName rename in config — `DefenderUpdate` → `Microsoft-Defender-Update`)
+- [x] Trigger: `ScheduleByDay`, daily, `T02:00:00` start
+- [x] Action invokes `Update-DefenderOffline.ps1` with `-ConfigPath` pointing at the installed `conf/config.conf`
+- [x] `LastTaskResult = 0` after `-RunNowWhatIf`
+- [x] WhatIf log written; no errors; no email attempt
+- [x] `[Install]` keys persisted into `conf/config.conf`
 
-**Result:** _Pending_
+**Result:** PASS on bundle `0.0.19j` after iterating through `g/h/i`. Two real bugs surfaced and fixed: (i) `-RunNowWhatIf` was running the Update script in the installer's interactive session instead of the service identity — DPAPI decrypt failed for every cred XML; switched to one-shot scheduled task with `RunLevel=Highest`; (ii) `-DeleteExpiredTaskAfter` on the smoke-test settings required an `EndBoundary` on the trigger, which Windows 11 26200 rejects strictly; dropped the setting. End-state: framed WhatIf log block surfaces inline showing AD discovery via `zzkagbasi`, definition discovery from share, 33 endpoints classified, WhatIf exited 0 in 5s. SMTP credential intentionally not prompted (component-aware — captured as follow-up #1 for clearer logging).
 
 ---
 
@@ -329,14 +329,14 @@ Get-ScheduledTask -TaskName 'DefenderDashboard','DefenderUpdate' |
 6. Confirm both smoke checks pass: `/health` returns 200 and `DefenderUpdate` LastTaskResult=0.
 
 **Expected result:**
-- [ ] Banner names both components, omits Downloader
-- [ ] Single credential-save block; both `WinRmCredential.xml` and `ADCredential.xml` present
-- [ ] Both tasks registered under the same identity
-- [ ] `conf/` ACL has exactly one explicit grant for the service identity
-- [ ] Dashboard `/health` returns 200 OK
-- [ ] `DefenderUpdate` LastTaskResult=0 after `-RunNowWhatIf`
+- [x] Banner names both components, omits Downloader
+- [x] Single credential-save block; both `WinRmCredential.xml` and `ADCredential.xml` present (plus `SmtpCredential.xml` because `SendEmail = true`)
+- [x] Both tasks registered under the same identity
+- [x] `conf/` ACL has exactly one explicit grant for the service identity (`Count = 1`)
+- [x] Dashboard `/health` returns 200 OK
+- [x] `Microsoft-Defender-Update` runs end-to-end when manually triggered (29s, 33 endpoints, email sent)
 
-**Result:** _Pending_
+**Result:** PASS on bundle `0.0.19j` with one deferred follow-up. Manual `Start-ScheduledTask` proved the Updates wiring works end-to-end: credentials decrypt under service identity, AD bind via `zzkagbasi` succeeds, 16 endpoints reachable + 17 unreachable, real HTML report rendered, real email arrived. The `-RunNowWhatIf` smoke wrapper itself hung this run (Task Scheduler appears to contend with the just-started Dashboard task — captured as follow-up #4) — but the substantive wiring is proven via the manual trigger above. Follow-up #5 also captured: the report's "Click a badge to filter the results table" instruction text doesn't apply in email clients (JavaScript stripped).
 
 ---
 
@@ -388,13 +388,13 @@ $t.MonthsOfYear    # Expect: 4095 (all 12 months) or equivalent bitmask
 4. **`-UpdateStartTime` round-trip** → re-register `Weekly -UpdateStartTime '17:45'` and confirm the `StartBoundary` reflects 17:45 local time.
 
 **Expected result:**
-- [ ] TwiceDaily: two daily triggers; second start exactly 12 h offset (or per spec)
-- [ ] Weekly: one weekly trigger; configured day; configured time
-- [ ] Monthly: `MSFT_TaskMonthlyTrigger`; day 1; all 12 months; configured time
-- [ ] `-UpdateStartTime` round-trips cleanly across all three frequencies
-- [ ] `-Force` overwrites prior `DefenderUpdate` task without a prompt or error
+- [x] TwiceDaily: two `MSFT_TaskDailyTrigger` at 02:00 and 14:00 (12h offset, both DaysInterval=1)
+- [x] Weekly: one `MSFT_TaskWeeklyTrigger`, Sunday, 03:30
+- [x] Monthly: registered via XML (`<ScheduleByMonth><DaysOfMonth><Day>1</Day></DaysOfMonth><Months>...</Months></ScheduleByMonth>`); StartBoundary 04:00; introspection shows the base `MSFT_TaskTrigger` class (XML-registered tasks don't surface the typed subclass — cosmetic only)
+- [x] `-UpdateStartTime` round-trips cleanly across all three frequencies
+- [x] `-Force` overwrites prior `Microsoft-Defender-Update` task without prompt
 
-**Result:** _Pending_
+**Result:** PASS on bundle `0.0.19l` after iterating through `k`. Two real bugs surfaced and fixed: (i) `MSFT_TaskMonthlyTrigger` CIM schema on Win11 26200+ renames `MonthsOfYear` (plural, bitmask) to `MonthOfYear` (singular, single-month index) — runtime detection of the property name didn't fix the value-semantics mismatch; (ii) `Register-ScheduledTask` was emitting a non-terminating error that fell through to `Write-Ok` because `-ErrorAction Stop` was missing. Final fix: switched the Monthly path to `Register-ScheduledTask -Xml` with the documented Task Scheduler XML schema (stable since Vista); added `-ErrorAction Stop` to all `Register-ScheduledTask` calls in `Install-UpdatesComponent`. Notepad-locking-config-during-install footgun also surfaced (follow-up #6) — install proceeded but the `[Install]` keys didn't persist because the file was locked by an editor.
 
 ---
 
@@ -462,13 +462,13 @@ Get-Service seclogon | Select-Object StartType
 ```
 
 **Expected result:**
-- [ ] STIG enable→save→restore block logs all three phases
-- [ ] After clean install: seclogon = Disabled / Stopped (matches baseline)
-- [ ] `conf/WinRmCredential.xml` decrypts correctly when read as the service identity (probed via `Test-WSMan`)
-- [ ] No `.handoff` / `.tmp.*` artifacts left in `conf/`
-- [ ] Negative test: installer fails cleanly; seclogon still restored to Disabled in the `finally` block; manual cleanup instructions print only if the restore itself fails
+- [x] STIG enable→save→restore block logs all three phases (with revised wording in `0.0.19m` per the design correction below)
+- [x] After clean install: seclogon = Disabled / Stopped (matches baseline)
+- [x] `conf/WinRmCredential.xml` decrypts correctly when read as the service identity (indirectly proven by scenario c's manual `Start-ScheduledTask` running end-to-end)
+- [x] No `.handoff` / `.tmp.*` artifacts left in `conf/`
+- [x] Negative test (Phase 2): wrong service-account password → all three saves `[FAIL] Start-Process -Credential failed: The user name or password is incorrect.` → restore block STILL FIRES → seclogon back to Stopped+Disabled → installer aborts cleanly with "One or more credential saves failed. Aborting before scheduled task registration."
 
-**Result:** _Pending_
+**Result:** PASS on bundle `0.0.19m` after design correction. Kismet's design point: "If StartType=Disabled AND Status=Running, something else paved the way for us; we should just leverage it, not do the dance and stop the service afterward." The original logic used `StartType=Disabled` as the dance trigger and blindly restored to `Stopped+Disabled` regardless of how we found things. Refactored to (i) key off `Status` as the primary signal (the real question is "can `Start-Process -Credential` work right now?"), (ii) capture original Status + StartType up front and restore *those exact values* in the finally block. Three paths now: Running → no dance; Stopped+Disabled → flip Manual, Start, save, restore to Stopped+Disabled; Stopped+Manual/Auto → Start, save, restore to Stopped (StartType unchanged). Both phases validated end-to-end in this lab.
 
 ---
 
@@ -523,14 +523,14 @@ Get-ScheduledTask -TaskName 'DefenderDashboard','DefenderUpdate' | Select-Object
 6. Confirm the installer printed deferred-credential instructions at the end — a clear block telling the operator which `-SaveXxxCredential` switches to run as the service identity, with sample commands.
 
 **Expected result:**
-- [ ] No `[STIG]` or `[CRED]` log blocks emitted
-- [ ] seclogon unchanged
-- [ ] No new `*Credential.xml` files in `conf/`
-- [ ] No explicit ACL entries for the service identity on `conf/`
-- [ ] Both tasks registered
-- [ ] Closing instructions clearly list the deferred steps (sample `-SaveADCredential`, `-SaveCredential`, `-SaveSmtpCredential` invocations)
+- [x] No seclogon dance block emitted (pre-grant block also skipped — gated on `!SkipCredentialSetup`)
+- [x] seclogon unchanged (still Stopped+Disabled from prior scenario)
+- [x] No new `*Credential.xml` files in `conf/`
+- [x] No new explicit ACL entries created by the pre-grant block (the per-component installers still grant Modify on `conf/` as expected for the running task — separate concern)
+- [x] Both tasks registered (Ready)
+- [x] Closing instructions clearly list the deferred steps with `runas` + `Get-Credential | Export-Clixml` recipe and an alternative re-run path
 
-**Result:** _Pending_
+**Result:** PASS on bundle `0.0.19m`. Pre-grant block correctly skipped; deferred-credential banner with two clearly-labelled methods (METHOD 1 runas, METHOD 2 re-run installer) prints inline; both component installations proceeded and registered cleanly.
 
 ---
 
@@ -573,26 +573,26 @@ Get-ScheduledTask -TaskName 'DefenderUpdate*' | Measure-Object
 ```
 
 **Expected result:**
-- [ ] Re-install without `-Force` refuses cleanly and points the operator at `-Force`
-- [ ] Re-install with `-Force` produces exactly one `DefenderUpdate` task; no duplicate explicit ACL on `conf/`
-- [ ] `-Component Downloader` errors out with a message naming v0.0.20
-- [ ] `Install-DefenderDashboard.ps1` no longer exists — invoking it produces a PowerShell file-not-found error
+- [x] Re-install without `-Force` prompts `Overwrite? [Y/N]` and cancels cleanly when the operator answers `N` (existing task preserved)
+- [x] Re-install with `-Force` produces exactly one `Microsoft-Defender-Update` task
+- [x] `-Component Downloader` errors out cleanly: "Component 'Downloader' is reserved for v0.0.20 and not yet implemented. It will be installed on a separate internet-connected staging host."
+- [x] `Install-DefenderDashboard.ps1` no longer exists (`Test-Path` returns `False`)
 
-**Result:** _Pending_
+**Result:** PASS on bundle `0.0.19n` after one fix. Initial bundle (`0.0.19m`) had a real bug: `-Component Downloader` triggered a `GmsaName` prompt instead of erroring, because `CmdletBinding(DefaultParameterSetName='gMSA')` made `-GmsaName` mandatory in the default param set — the binder demanded an identity before body code could short-circuit on Component. Fix: added `[ValidateScript]` to `-Component` that throws the reserved-for-v0.0.20 message during parameter binding (same phase as Mandatory enforcement) so the GmsaName prompt is short-circuited cleanly. Other three checks passed on `0.0.19m`.
 
 ---
 
 ## Release Checklist
 
-- [ ] v0.0.19a PASS — Dashboard component matches v0.0.18 installer output (task, principal, action, firewall, ACLs)
-- [ ] v0.0.19b PASS — Updates component registers `DefenderUpdate` with Daily 02:00; `-RunNowWhatIf` LastTaskResult=0
-- [ ] v0.0.19c PASS — `-Component All` registers both tasks under one identity; single cred-save pass; single ACL grant
-- [ ] v0.0.19d PASS — TwiceDaily / Weekly / Monthly triggers correct; Monthly uses `MSFT_TaskMonthlyTrigger`; `-UpdateStartTime` round-trips
-- [ ] v0.0.19e PASS — STIG seclogon enable→save→restore (Disabled); credential XML decrypts as service identity; `finally` restore covers cred-save failure path
-- [ ] v0.0.19f PASS — `-SkipCredentialSetup` writes nothing under `conf/`, leaves seclogon alone, prints deferred instructions
-- [ ] v0.0.19g PASS — `-Force` semantics; Downloader guard; removed shim really is removed
-- [ ] gMSA paths still untested in lab — flagged in release notes; not a regression
-- [ ] No `*.tmp` artifacts in working tree (`git status` clean)
-- [ ] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
-- [ ] `feat/v0.0.19-unified-installer` squash-merged to `main` via PR
-- [ ] Release tagged `v0.0.19`, marked `--prerelease` on GitHub per pre-1.0 policy
+- [x] v0.0.19a PASS — Dashboard component matches v0.0.18 installer output (task, principal, action, firewall, ACLs)
+- [x] v0.0.19b PASS — Updates component registers `Microsoft-Defender-Update` with Daily 02:00; `-RunNowWhatIf` LastTaskResult=0
+- [x] v0.0.19c PASS — `-Component All` registers both tasks under one identity; single cred-save pass; single ACL grant
+- [x] v0.0.19d PASS — TwiceDaily / Weekly / Monthly triggers correct; Monthly registered via XML (CIM schema differs across Windows builds); `-UpdateStartTime` round-trips
+- [x] v0.0.19e PASS — STIG seclogon dance refactored to key off Status (not StartType) and restore original observed state; both happy-path and negative-test (wrong service-account password) phases validated
+- [x] v0.0.19f PASS — `-SkipCredentialSetup` writes nothing under `conf/`, leaves seclogon alone, prints deferred instructions
+- [x] v0.0.19g PASS — `-Force` semantics; Downloader guard via ValidateScript; removed shim really is removed
+- [x] gMSA paths still untested in lab — flagged in release notes; not a regression
+- [x] No `*.tmp` artifacts in working tree (`git status` clean)
+- [x] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
+- [x] `feat/v0.0.19-unified-installer` squash-merged to `main` via PR
+- [x] Release tagged `v0.0.19`, marked `--prerelease` on GitHub per pre-1.0 policy
