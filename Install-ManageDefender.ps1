@@ -885,6 +885,18 @@ function Initialize-ServiceCredentials {
 
     $plan = Get-CredentialPlanForComponent -Component $Component -Config $Config
 
+    # If SendEmail=true is set in config but the chosen Component doesn't
+    # install the Updates task, SMTP setup is silently skipped. Surface a
+    # breadcrumb so the operator isn't left wondering why no SMTP prompt
+    # appeared (especially after a Dashboard-only install on a host that
+    # was previously expected to email reports).
+    if (-not $plan.Smtp -and $Component -notin @('Updates','All')) {
+        $sendEmail = "$($Config['SendEmail'])".Trim()
+        if ($sendEmail -match '^(?i)true|1|yes$') {
+            Write-Info "SMTP setup skipped: SendEmail=true in config applies to the Updates task, which is not included in -Component $Component. Re-run with -Component Updates or -Component All to configure SMTP."
+        }
+    }
+
     if ($Skip) {
         Show-DeferredCredentialInstructions -CredentialPlan $plan -IdentityLabel $IdentityLabel -ScriptDirectory $ScriptDir
         return $true
