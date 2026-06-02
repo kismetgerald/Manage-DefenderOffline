@@ -243,6 +243,7 @@ $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path
 . (Join-Path $ScriptDir 'lib\Update-ConfigValue.ps1')
 . (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
 . (Join-Path $ScriptDir 'lib\Get-PortBusyDiagnostic.ps1')
+. (Join-Path $ScriptDir 'lib\Wait-SmokeTaskStart.ps1')
 
 # Schema versions this script was built against. Bump when shipping a breaking
 # config or hosts layout change. Test-SchemaVersion warns on mismatch but does
@@ -1828,12 +1829,47 @@ function Install-UpdatesComponent {
             Register-ScheduledTask @registerParams | Out-Null
             Start-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction Stop
 
-            $deadline    = (Get-Date).AddMinutes(10)
+            # Confirm the task actually started before entering the long
+            # completion-poll loop. Start-ScheduledTask is fire-and-forget;
+            # in the v0.0.19 lab pass a -Component All scenario produced a
+            # task that Task Scheduler queued but never ran (suspected
+            # same-identity contention with the just-started Dashboard
+            # task). Without this check the completion loop would wait
+            # the full deadline before timing out — operators gave up
+            # and killed the install with no diagnostic.
+            $startCheck = Wait-SmokeTaskStart `
+                -TaskName     $smokeName `
+                -TaskPath     '\Manage-DefenderOffline\' `
+                -StartedAfter $smokeStart `
+                -TimeoutSeconds 20
+            if (-not $startCheck.Started) {
+                Write-Warn "WhatIf smoke task did not start within $($startCheck.ElapsedSeconds)s. Skipping completion poll; the install is otherwise complete."
+                Write-Info '  Likely cause: Task Scheduler queued the task but has not dispatched it (often a same-identity contention with another running task). The registered Updates task is unaffected.'
+                if ($startCheck.Task) { Write-Info "  Smoke task state          : $($startCheck.Task.State)" }
+                if ($startCheck.Info) {
+                    Write-Info "  Smoke task LastRunTime    : $($startCheck.Info.LastRunTime)"
+                    Write-Info "  Smoke task LastTaskResult : $($startCheck.Info.LastTaskResult)"
+                }
+                Write-Info "  To exercise the Updates task manually: Start-ScheduledTask -TaskName '$UpdateTaskName' -TaskPath '$UpdateTaskFolder'"
+                # Skip the completion-poll loop. The finally block below
+                # still runs, so the smoke task is unregistered.
+                return $true
+            }
+
+            # Completion poll. Deadline shortened from 10 min to 5 min: a
+            # real fleet WhatIf typically finishes in 30-90s, so 5 minutes
+            # is generous without making operators wait an unreasonable
+            # time when something is genuinely stuck.
+            $deadline    = (Get-Date).AddMinutes(5)
             $finalResult = $null
+            $lastInfo    = $null
+            $lastTask    = $null
             do {
                 Start-Sleep -Seconds 2
                 $info = Get-ScheduledTaskInfo -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
                 $task = Get-ScheduledTask     -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
+                if ($info) { $lastInfo = $info }
+                if ($task) { $lastTask = $task }
                 if ($info -and $task -and $task.State -ne 'Running' `
                         -and $info.LastTaskResult -ne 267009 `
                         -and $null -ne $info.LastRunTime `
@@ -1867,7 +1903,13 @@ function Install-UpdatesComponent {
             } elseif ($null -ne $finalResult) {
                 Write-Warn "WhatIf smoke test exited with code $finalResult. Inspect the log above."
             } else {
-                Write-Warn 'WhatIf smoke test did not complete within 10 minutes.'
+                Write-Warn 'WhatIf smoke test did not complete within 5 minutes.'
+                if ($lastTask) { Write-Info "  Last observed State       : $($lastTask.State)" }
+                if ($lastInfo) {
+                    Write-Info "  Last observed LastRunTime : $($lastInfo.LastRunTime)"
+                    Write-Info "  Last observed LastTaskResult: $($lastInfo.LastTaskResult)"
+                }
+                Write-Info "  The registered Updates task is unaffected: Start-ScheduledTask -TaskName '$UpdateTaskName' -TaskPath '$UpdateTaskFolder'"
             }
             if (-not $logFile) {
                 Write-Info 'No Update script log found under C:\Logs\Update-DefenderOffline_*.log. Task may have failed before reaching the script entry point.'
