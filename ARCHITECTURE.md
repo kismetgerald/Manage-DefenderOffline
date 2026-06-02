@@ -18,7 +18,7 @@ flowchart LR
     subgraph admin["Admin / Operator workstation"]
         update["Update-DefenderOffline.ps1<br/>(scheduled or manual)"]:::script
         show["Show-DefenderStatus.ps1<br/>(interactive Forms GUI)"]:::script
-        installer["Install-DefenderDashboard.ps1<br/>(one-time, elevated)"]:::script
+        installer["Install-ManageDefender.ps1<br/>(one-time, elevated)"]:::script
     end
 
     subgraph dashHost["Dashboard host (continuous service)"]
@@ -88,7 +88,7 @@ flowchart LR
 | `Update-DefenderOffline.ps1` | Per-host install logs, HTML/CSV reports, email | config, hosts.conf, credentials, share, AD |
 | `Show-DefenderStatus.ps1` | Forms GUI, ad-hoc CSV/HTML export | config, hosts.conf, credentials, AD |
 | `Start-DefenderDashboard.ps1` | `conf/dashboard.status`, dashboard log, event log writes | config, hosts.conf, credentials, AD |
-| `Install-DefenderDashboard.ps1` | Scheduled task, event log source registration, ACLs, firewall rule | config, dashboard.status (read after start) |
+| `Install-ManageDefender.ps1` | Scheduled task, event log source registration, ACLs, firewall rule | config, dashboard.status (read after start) |
 
 ---
 
@@ -162,7 +162,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     actor Admin
-    participant Installer as Install-DefenderDashboard.ps1
+    participant Installer as Install-ManageDefender.ps1
     participant TS as Task Scheduler
     participant FS as Filesystem (script + conf + logs)
     participant FW as Windows Firewall
@@ -170,7 +170,7 @@ sequenceDiagram
     participant Dashboard as Start-DefenderDashboard.ps1
     participant Status as conf/dashboard.status
 
-    Admin->>Installer: .\Install-DefenderDashboard.ps1<br/>-ServiceAccount X -Credential c<br/>-AddFirewallRule -StartImmediately
+    Admin->>Installer: .\Install-ManageDefender.ps1<br/>-ServiceAccount X -Credential c<br/>-AddFirewallRule -StartImmediately
     Installer->>Installer: Prereq checks (admin, pwsh.exe, dashboard script)
     Installer->>EL: Register source 'Manage-DefenderOffline'
     Installer->>Installer: Validate AD account exists
@@ -327,7 +327,7 @@ Source: `Manage-DefenderOffline` · Log: `Application`
 | **101** | **Warning** | Dashboard started on a fallback port (primary was in use) | Ops monitoring (alert: investigate primary port collision) |
 | **102** | Information | Dashboard stopped cleanly | Ops monitoring (uptime tracking) |
 
-The source is registered once by `Install-DefenderDashboard.ps1`. Dashboard runs gracefully degrade if the source is missing — they log to the file log and continue. This is intentional so the dashboard can be run interactively from a non-elevated session for testing without forcing event log registration.
+The source is registered once by `Install-ManageDefender.ps1`. Dashboard runs gracefully degrade if the source is missing — they log to the file log and continue. This is intentional so the dashboard can be run interactively from a non-elevated session for testing without forcing event log registration.
 
 ### Dashboard ↔ installer handshake
 

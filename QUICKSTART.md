@@ -39,10 +39,10 @@ Allow remote server management through WinRM`
 In an **elevated PowerShell 7** window on the dashboard host:
 
 ```powershell
-$Zip = "$env:TEMP\manage-defenderoffline-0.0.18.zip"
+$Zip = "$env:TEMP\manage-defenderoffline-0.0.19.zip"
 
 Invoke-WebRequest `
-    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.18/manage-defenderoffline-0.0.18.zip' `
+    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.19/manage-defenderoffline-0.0.19.zip' `
     -OutFile $Zip
 
 Expand-Archive -Path $Zip -DestinationPath 'C:\Tools' -Force
@@ -82,6 +82,8 @@ Everything else in `config.conf` has sensible defaults. Tune later from the
 
 ## Step 3 — Install (2 min)
 
+This QUICKSTART installs just the **Dashboard** component. To also schedule periodic definition updates on endpoints, drop `-Component Dashboard` (default is `-Component All`, which installs both Dashboard and Updates) and supply `-Frequency Daily -UpdateStartTime '02:00'`.
+
 ### Option A — Traditional service account
 
 ```powershell
@@ -89,7 +91,8 @@ $cred = Get-Credential `
     -UserName 'CONTOSO\svc-defender' `
     -Message 'Password for the dashboard service account'
 
-.\Install-DefenderDashboard.ps1 `
+.\Install-ManageDefender.ps1 `
+    -Component      Dashboard `
     -ServiceAccount 'CONTOSO\svc-defender' `
     -Credential     $cred `
     -UseHttps `
@@ -102,7 +105,8 @@ $cred = Get-Credential `
 ### Option B — gMSA (no password needed)
 
 ```powershell
-.\Install-DefenderDashboard.ps1 `
+.\Install-ManageDefender.ps1 `
+    -Component      Dashboard `
     -GmsaName       'CONTOSO\svc-defender$' `
     -UseHttps `
     -Port           8444 `
@@ -251,7 +255,7 @@ Hitting by IP works *only* because v0.0.13+ auto-includes the primary IPv4 — b
 If you need to access via an alias, CNAME, or load balancer VIP that isn't in the auto-included list, pass `-AdditionalSans` when running the installer:
 
 ```powershell
-.\Install-DefenderDashboard.ps1 ... -AdditionalSans 'dashboard.contoso.com,my-alias,10.0.0.50' -RenewCertificate -Force
+.\Install-ManageDefender.ps1 -Component Dashboard ... -AdditionalSans 'dashboard.contoso.com,my-alias,10.0.0.50' -RenewCertificate -Force
 ```
 
 (`-RenewCertificate` is required when adding SANs to an existing install — otherwise the installer reuses the previously-generated cert and ignores the new SAN list.)
@@ -274,7 +278,8 @@ If you need to access via an alias, CNAME, or load balancer VIP that isn't in th
 3. **Replace with a PKI-issued cert** (cleanest for production):
    ```powershell
    # On the dashboard host, after importing your PKI cert into Cert:\LocalMachine\My
-   .\Install-DefenderDashboard.ps1 `
+   .\Install-ManageDefender.ps1 `
+       -Component              Dashboard `
        -ServiceAccount         'CONTOSO\svc-defender' `
        -Credential             $cred `
        -UseHttps `

@@ -123,7 +123,7 @@ $includeFiles = @(
     "Update-DefenderOffline.ps1",
     "Show-DefenderStatus.ps1",
     "Start-DefenderDashboard.ps1",
-    "Install-DefenderDashboard.ps1",
+    "Install-ManageDefender.ps1",      # v0.0.19: unified installer entry point
     "Get-DefenderDefinitions.ps1",
     "README.md",
     "LICENSE.txt"

@@ -11,7 +11,7 @@
     and export to CSV or HTML.
 
     For a headless, service-based dashboard that runs continuously in the background,
-    use Start-DefenderDashboard.ps1 (installed via Install-DefenderDashboard.ps1).
+    use Start-DefenderDashboard.ps1 (installed via Install-ManageDefender.ps1 -Component Dashboard).
 
 .PARAMETER ComputerName
     Manual list of computers to query. Bypasses hosts.conf and AD auto-discovery.
@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.18'
+$ScriptVersion = '0.0.19'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 

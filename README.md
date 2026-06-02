@@ -32,10 +32,10 @@
 | Script | Purpose | Run by |
 |---|---|---|
 | `Get-DefenderDefinitions.ps1` | Downloads mpam-fe.exe (x64 / x86 / arm64) from Microsoft for transfer into the air-gapped share | Admin, on an internet-connected staging machine |
-| `Update-DefenderOffline.ps1` | Deploys definition updates to all endpoints | Admin (manual or scheduled task) |
+| `Update-DefenderOffline.ps1` | Deploys definition updates to all endpoints | Scheduled task (service account / gMSA) |
 | `Show-DefenderStatus.ps1` | Interactive Windows Forms fleet health monitor | Admin, interactively |
 | `Start-DefenderDashboard.ps1` | Headless HTTP dashboard service | Scheduled task (service account / gMSA) |
-| `Install-DefenderDashboard.ps1` | One-time installer for the dashboard service | Admin, once |
+| `Install-ManageDefender.ps1` | Unified installer for the Dashboard and/or Updates scheduled tasks (`-Component Dashboard \| Updates \| All`) | Admin, once |
 
 ## Prerequisites Checklist
 
@@ -422,7 +422,7 @@ Opens a live Windows Forms dashboard showing the Defender health status of all e
 
 ## Start-DefenderDashboard.ps1 — Reference
 
-Headless HTTP server that serves a self-refreshing browser dashboard. Designed to run continuously as a Windows Scheduled Task under a service account or gMSA. Use `Install-DefenderDashboard.ps1` to register it as a service.
+Headless HTTP server that serves a self-refreshing browser dashboard. Designed to run continuously as a Windows Scheduled Task under a service account or gMSA. Use `Install-ManageDefender.ps1 -Component Dashboard` to register it as a service.
 
 **Endpoints:**
 
@@ -464,37 +464,58 @@ Headless HTTP server that serves a self-refreshing browser dashboard. Designed t
 
 ---
 
-## Install-DefenderDashboard.ps1 — Reference
+## Install-ManageDefender.ps1 — Reference
 
-One-time installer. Run as Administrator.
+Unified one-time installer for the toolkit's scheduled tasks. Run as Administrator. Pick `-Component` to install:
+
+| `-Component` | What it installs | Target host |
+|---|---|---|
+| `Dashboard` | Headless HTTP dashboard scheduled task only | Air-gapped management host |
+| `Updates` | Periodic definition-push scheduled task only | Air-gapped management host |
+| `All` *(default)* | Dashboard **and** Updates on the same host | Air-gapped management host |
+| `Downloader` *(reserved, v0.0.20)* | Wrapper for `Get-DefenderDefinitions.ps1` | Internet-connected staging host |
 
 **What it does:**
-1. Validates prerequisites (pwsh.exe, Task Scheduler)
+1. Validates prerequisites (pwsh.exe, Task Scheduler, script paths)
 2. Validates the service account or gMSA in Active Directory
-3. Registers the `Manage-DefenderOffline` Windows Event Log source
+3. Saves DPAPI-encrypted credentials (`WinRmCredential.xml`, `ADCredential.xml`, `SmtpCredential.xml`) under the service identity. On STIG-hardened hosts (V-253289) handles the Secondary Logon Service enable→save→restore-Disabled dance automatically. Skip with `-SkipCredentialSetup` to print follow-up instructions instead.
 4. Creates directories and grants filesystem permissions to the service identity
-5. Checks port availability; selects fallback automatically if needed
-6. Registers a Windows Scheduled Task (AtStartup, no time limit, restart-on-failure)
-7. Optionally creates an inbound Windows Firewall rule
-8. Optionally starts the task immediately and reads `conf\dashboard.status` to confirm the actual port
+5. Registers the `Manage-DefenderOffline` Windows Event Log source (Dashboard)
+6. Checks port availability; selects fallback automatically if needed (Dashboard, HTTP only)
+7. Registers Windows Scheduled Task(s):
+   - **Dashboard** — AtStartup, no time limit, restart-on-failure, battery-aware
+   - **Updates** — frequency-based trigger (`-Frequency TwiceDaily|Daily|Weekly|Monthly`, default Daily), `-UpdateStartTime '02:00'` for trigger time
+8. Optionally creates an inbound Windows Firewall rule (Dashboard)
+9. Optionally starts the Dashboard task immediately and probes `/health`
+10. Optionally runs the Updates task once with `-RunNowWhatIf` for a connectivity smoke test
 
 **gMSA installation (recommended):**
 ```powershell
-.\Install-DefenderDashboard.ps1 `
+.\Install-ManageDefender.ps1 `
     -GmsaName "CONTOSO\svc-defender$" `
     -SourceSharePath "\\NAS01\DataShare\...\Microsoft_Defender" `
     -AddFirewallRule `
     -StartImmediately
 ```
 
-**Traditional service account:**
+**Traditional service account, Dashboard only:**
 ```powershell
 $cred = Get-Credential -UserName "CONTOSO\svc-defender" -Message "Service account password"
-.\Install-DefenderDashboard.ps1 `
+.\Install-ManageDefender.ps1 `
+    -Component Dashboard `
     -ServiceAccount "CONTOSO\svc-defender" `
     -Credential $cred `
     -AddFirewallRule `
     -StartImmediately
+```
+
+**Updates only, weekly Sunday at 03:30:**
+```powershell
+.\Install-ManageDefender.ps1 `
+    -Component Updates `
+    -GmsaName 'CONTOSO\svc-defender$' `
+    -Frequency Weekly -UpdateStartTime '03:30' `
+    -RunNowWhatIf
 ```
 
 | Parameter | Default | Description |
@@ -699,7 +720,41 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.18 (2026-05-31) — Current
+### v0.0.19 (2026-06-01) — Current
+
+Unified installer with full credential automation. The Updates component — periodic Defender definition push to endpoints, the original use case the project was built for — is now a first-class scheduled task you can install alongside the dashboard in one command. Validated end-to-end on a STIG-segmented home lab via a seven-scenario test plan ([docs/tests/test-plan-v0.0.19.md](docs/tests/test-plan-v0.0.19.md)).
+
+**`Install-ManageDefender.ps1` — single entry point:**
+- ✨ `-Component <Dashboard|Updates|All|Downloader>` (default `All` = Dashboard + Updates; Downloader is reserved for v0.0.20, validated by an early-binding `[ValidateScript]` so the operator gets a clear "reserved" error instead of an inappropriate identity prompt).
+- ✨ **Updates component** registers a `DefenderUpdate` scheduled task that runs `Update-DefenderOffline.ps1` on a schedule. `-Frequency TwiceDaily | Daily | Weekly | Monthly` and `-UpdateStartTime 'HH:mm'` (default `02:00`). Monthly path uses the documented Task Scheduler XML schema (stable across all Windows versions back to Vista) because the CIM `MSFT_TaskMonthlyTrigger` schema differs across Windows builds — property names (`MonthsOfYear` vs `MonthOfYear`), types (UInt16 single value vs UInt32 array), and semantics (single-month index vs all-months bitmask) vary.
+- ✨ **`-RunNowWhatIf`** smoke test runs the Update script in WhatIf mode once after task registration, via a one-shot scheduled task with `RunLevel=Highest` — so it runs under the same identity and elevation as the real 02:00 task and proves DPAPI decrypt + AD bind + WinRM auth + share access in one shot. The Update script's own log file gets surfaced inline in a framed block.
+- ✨ **STIG V-253289 (Secondary Logon Service) handling.** On STIG hosts where seclogon is Disabled, the installer temporarily enables it (Manual + Started), saves credentials, then restores to the **original observed state** in a `finally` block — even if a credential save throws. The dance keys off `Status` (the actual question is "can `Start-Process -Credential` work right now?") rather than `StartType` (which was a misleading proxy). If we found seclogon `Disabled+Running`, we leverage as-is; if `Stopped+Disabled` (canonical STIG), we do the full enable/use/restore-Disabled-Stopped cycle.
+- ✨ **Full credential automation.** The installer saves `WinRmCredential.xml`, `ADCredential.xml`, and (when `[Email] SendEmail = true`) `SmtpCredential.xml` under the **service identity's** DPAPI master key — so the unattended task can decrypt them at runtime. Traditional accounts use `Start-Process -Credential` to launch a helper as the service identity; gMSA uses a one-shot scheduled task pattern. A two-line UTF-8 handoff file (username + base64 of LocalMachine-DPAPI-encrypted UTF-16 password) lands briefly in `conf/` (which we pre-grant Modify to the service identity), gets consumed by the helper, and is deleted in the caller's `finally` — no plaintext password ever lands on disk.
+- ✨ **Prompt pre-population** from a new `[Credentials]` section. Three keys (`WinRmUsername`, `AdUsername`, `SmtpUsername`) pre-fill the username field of each `Get-Credential` prompt with priority CLI > config > blank. In segmented environments (separate accounts for Workstation Admin / Domain Admin / Service Account / SMTP relay) the operator only types the password. Format hints in each prompt's message: `DOMAIN\username` or `username@domain.tld`.
+- ✨ **`-SkipCredentialSetup`** opts out of all credential prompts and the seclogon dance, prints clear follow-up instructions with both a `runas` recipe and an "re-run without the switch" alternative, but still registers the scheduled tasks. For operators who handle credentials out of band.
+- ✨ **Diagnostic visibility.** Every helper invocation captures stderr/stdout via `-RedirectStandardError`/`-RedirectStandardOutput` AND writes a side-log to `$DestinationPath.err` on failure (the side-log path works for both `Start-Process` and the gMSA one-shot scheduled task, where stdio capture isn't available). On non-zero exit the installer surfaces the helper's actual error message inline instead of just "exit code 1."
+
+**Breaking change — `Install-DefenderDashboard.ps1` removed:**
+- 💥 The dashboard installer is gone — the project's pre-1.0 status means no backward-compat shim. Operators should use `Install-ManageDefender.ps1 -Component Dashboard` with the same parameter shape (all `-Use*` / `-Auth*` / `-Add*` / `-TaskName` switches still work).
+
+**Updates to `Update-DefenderOffline.ps1`:**
+- No source changes; verified as the target of the registered `DefenderUpdate` task. The script's existing log rotation, parallel mode, version skip logic, AD discovery, and HTML/CSV/email reports all carry through unchanged.
+
+**`conf/config.conf` — new sections:**
+- `[Install] UpdateTaskName`, `UpdateTaskFolder`, `UpdateFrequency`, `UpdateStartTime` — Updates task settings inherit when omitted.
+- `[Credentials] WinRmUsername`, `AdUsername`, `SmtpUsername` — username pre-fills (passwords NEVER stored here).
+
+**Docs:**
+- 📝 README installer section rewritten around the unified entry point (`-Component` table, ten-step "What it does" list, three install examples covering gMSA-default, traditional Dashboard-only, and traditional Updates-only).
+- 📝 QUICKSTART examples switched to `Install-ManageDefender.ps1 -Component Dashboard`.
+- 📝 `ARCHITECTURE.md` updated; all operator-facing snippets across the source tree now point at the unified installer.
+- 📝 `docs/tests/test-plan-v0.0.19.md` (this release's test plan, committed in-tree) documents seven scenarios with their setup, validation steps, expected results, and final outcomes — including the design corrections that landed during the lab pass.
+
+**Known gaps carried forward:**
+- gMSA paths are spec-built but **field-untested** in either lab — neither home nor work environment has provisioned a gMSA yet. The credential-save and smoke-test code paths handle gMSA symmetrically (via one-shot scheduled tasks instead of `Start-Process -Credential`) but a gMSA-specific bug, if one exists, would be a first-encounter rather than a regression. Traditional service accounts are fully validated.
+- A handful of small UX polish items (smoke-test ordering when `-Component All`, HTTP.sys orphan port detection, HTTPS port-check ordering, in-email report filter-affordance text, `notepad`-locked-config detection) deferred to v0.0.19.1 or v0.0.20.
+
+### v0.0.18 (2026-05-31)
 
 First-demo-feedback batch from an operator review of v0.0.17 on the work lab. Six core feature items, plus a Print path that went through several rounds of refinement based on observed output.
 
