@@ -1860,6 +1860,22 @@ function Install-UpdatesComponent {
             # real fleet WhatIf typically finishes in 30-90s, so 5 minutes
             # is generous without making operators wait an unreasonable
             # time when something is genuinely stuck.
+            #
+            # Completion is detected via:
+            #   State != Running  (the task isn't currently executing)
+            #   LastTaskResult != 267009 (SCHED_S_TASK_HAS_NOT_RUN — the
+            #     sentinel Task Scheduler reports when the task has never
+            #     actually executed).
+            #
+            # We deliberately do NOT compare LastRunTime against $smokeStart.
+            # The smoke task is freshly registered with a random GUID
+            # name — there is no previous run whose results could be
+            # confused with this one. An earlier version did include that
+            # comparison defensively; in the v0.0.20d lab pass it caused
+            # the loop to wait the full 5-minute deadline even after the
+            # task completed in 5 seconds (suspected DateTime-kind /
+            # clock-skew quirk between Get-Date and Task Scheduler's
+            # stored LastRunTime). Drop the check.
             $deadline    = (Get-Date).AddMinutes(5)
             $finalResult = $null
             $lastInfo    = $null
@@ -1871,9 +1887,7 @@ function Install-UpdatesComponent {
                 if ($info) { $lastInfo = $info }
                 if ($task) { $lastTask = $task }
                 if ($info -and $task -and $task.State -ne 'Running' `
-                        -and $info.LastTaskResult -ne 267009 `
-                        -and $null -ne $info.LastRunTime `
-                        -and $info.LastRunTime -gt $smokeStart) {
+                        -and $info.LastTaskResult -ne 267009) {
                     $finalResult = $info.LastTaskResult
                     break
                 }
