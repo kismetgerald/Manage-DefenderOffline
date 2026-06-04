@@ -84,8 +84,8 @@
     Author         : Kismet Agbasi (GitHub: kismetgerald | Email: KismetG17@gmail.com)
     AI Contributors: Claude AI, Grok
     Requires       : PowerShell 5.1+; internet access to go.microsoft.com
-    Version        : 0.0.9
-    Last Updated   : 2026-05-26
+    Version        : 0.0.21
+    Last Updated   : 2026-06-04
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -110,7 +110,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.20.1'
+$ScriptVersion = '0.0.21'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 . (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')

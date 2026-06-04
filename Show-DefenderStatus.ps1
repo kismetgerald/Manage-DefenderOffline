@@ -70,8 +70,8 @@
     Author         : Kismet Agbasi (GitHub: kismetgerald | Email: KismetG17@gmail.com)
     AI Contributors: Claude AI, Grok
     Requires       : PowerShell 5.1+ (7+ for parallel queries), WinRM on targets (TCP 5985)
-    Version        : 0.0.6
-    Last Updated   : 2026-05-19
+    Version        : 0.0.21
+    Last Updated   : 2026-06-04
 #>
 
 [CmdletBinding()]
@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.20.1'
+$ScriptVersion = '0.0.21'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
