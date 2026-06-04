@@ -720,7 +720,42 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.19 (2026-06-01) — Current
+### v0.0.20 (2026-06-04) — Current
+
+Polish release: demo feedback from the v0.0.19 operator review (2026-06-02) plus the seven installer / report UX follow-ups carried over from the v0.0.19 lab pass. No new components, no breaking config schema, no migration path needed. Validated end-to-end on a STIG-segmented home lab via a nine-scenario test plan ([docs/tests/test-plan-v0.0.20.md](docs/tests/test-plan-v0.0.20.md)).
+
+**Dashboard hardening — `/status` and `/refresh` lock-down:**
+- ✨ When `AuthMethod=None` (the default), `/status` and `/refresh` now return **403** with reason `status-locked-no-auth`. `/defender` stays open so the UI works; `/health` is always anonymous. Rationale: `/status` returns fleet inventory in machine-readable JSON — a higher-value scraping target than `/defender`'s HTML, and one that should be gated independently from the UI's auth.
+- ✨ Opt-in via new `-AllowAnonymousStatus` switch (and `[Dashboard] AllowAnonymousStatus = false` config key). Intended for deployments where a Prometheus/Grafana scraper inside the trust boundary needs anonymous JSON. No effect in Token/Basic/ADIntegrated modes — `/status` follows the same auth as `/defender` there.
+- ✨ Startup log emits an `INFO` line when locked (safe default) and a `WARN` when opted-open (so SIEM filters can flag the open state). The existing per-request audit log picks up the new denial reason automatically: `event=auth_denied path=/status reason=status-locked-no-auth`.
+
+**Config-schema versioning:**
+- ✨ `conf/config.conf` gains an `[Meta] SchemaVersion = 1` section as its first block. `hosts.conf` gets a `# SchemaVersion: 1` comment-pragma in its auto-generated header. Pre-v0.0.20 files without these markers are still loaded — absent pragma is treated as v1 (backward compat).
+- ✨ New `lib/Test-SchemaVersion.ps1` helper. All five reader scripts (installer, dashboard, update, status GUI, downloader) declare an expected schema version as a script constant and emit a startup WARN if the on-disk schema is newer. Mismatch is warn-only, not blocking — operators may legitimately run mixed-release scripts during a rolling upgrade. Credential XML versioning was considered and deferred (no concrete migration scenario yet).
+
+**TaskName rename — `Microsoft-Defender-*`:**
+- ✨ Default `-TaskName` is now `Microsoft-Defender-Dashboard`; `-UpdateTaskName` is `Microsoft-Defender-Update`. The old `DefenderDashboard`/`DefenderUpdate` defaults were too generic for a scheduled-task surface that sits next to `Microsoft-Photos`, `Microsoft-Windows-*` etc. Operators on existing v0.0.19 installs who want the new names need to unregister the old task and re-run the installer; existing installs are otherwise unaffected.
+
+**Installer UX polish (carried over from v0.0.19 lab):**
+- ✨ **Silent SMTP-skip breadcrumb.** When `SendEmail=true` in config but `-Component` doesn't install Updates (e.g. `-Component Dashboard`), the installer now emits a `Write-Info` line explaining the skip — instead of silently omitting the SMTP prompt and leaving the operator wondering whether SMTP was forgotten.
+- ✨ **HTTP.sys orphan diagnostic.** When the port check fails with `OwningProcess=4` (the System / kernel process), the installer now surfaces a specific remediation: `Stop-Service http -Force; Start-Service http; reboot if the Stop hangs longer than 5 minutes`. Lab-validated empirically — the reboot guidance was needed once during the v0.0.20 test pass. Falls back to PID + process name for userland holders. Helper at `lib/Get-PortBusyDiagnostic.ps1`.
+- ✨ **HTTPS port-check ordering.** The port-availability check now runs **before** `netsh http add sslcert` and `netsh http add urlacl`, so a port-in-use failure aborts cleanly without leaving a half-configured cert binding behind for the operator to clean up manually with `netsh http delete sslcert`.
+- ✨ **`-RunNowWhatIf` smoke-test reliability.** Two fixes: (a) added a 20-second "task started" check via `lib/Wait-SmokeTaskStart.ps1` — when Task Scheduler queues the task but never dispatches it (the v0.0.19 hang scenario), the installer now bails cleanly with a diagnostic; and (b) dropped a spurious `LastRunTime -gt smokeStart` check from the completion-poll loop — that comparison was failing under a DateTime-kind quirk and causing the loop to wait the full 5-minute deadline even when the task had succeeded. Completion now lands within seconds of the actual task finishing.
+- ✨ **Config-lock retry/fail-fast.** `lib/Update-ConfigValue.ps1` now retries an `IOException` write up to 4 attempts (~2.5s cumulative) — so transient editor-save races don't fail the install — then throws an actionable message naming the likely culprit (Notepad / VS Code / Word) if the lock persists, instead of the generic IO sharing-violation that operators couldn't decode.
+- 🐛 **Stale `Install-DefenderDashboard.ps1` reference** in `tests/HttpsCert.Tests.ps1` (left over from the v0.0.19 unified-installer rewrite) now points at the unified-installer error string. Pester suite is fully green for the first time since the rewrite.
+
+**Report polish:**
+- 🐛 **"Click a badge to filter the results table"** instruction was rendering in emailed HTML reports as a misleading affordance (email clients strip JavaScript, so clicking did nothing). `New-HtmlReport` now takes a `-Mode Standalone|Email` parameter — the on-disk attachment keeps the affordance (works in a browser), and the email body suppresses just the instruction text while keeping all badges, host rows, and the version summary intact.
+
+**Test posture:**
+- 📝 `docs/tests/test-plan-v0.0.20.md` (committed in-tree) documents nine scenarios — five for the v0.0.20 changes, three for the carried-over UX work, one regression check for the Downloader `[ValidateScript]` guard. Several scenarios were validated organically during the lab pass (HTTP.sys orphan diagnostic in particular — a real reproduction was cleaner than the synthetic test plan).
+- ✅ Pester suite: 297 passed, 0 failed across 18 spec files. Three new lib helpers (`Test-SchemaVersion`, `Get-PortBusyDiagnostic`, `Wait-SmokeTaskStart`) and one new function-mode parameter (`New-HtmlReport -Mode`) have dedicated coverage.
+
+**Known gaps carried forward:**
+- gMSA paths remain **field-untested**. No regression — same status as v0.0.19. The work-lab pivot to gMSA during v0.0.19 validated the SPN cutover pattern (added to QUICKSTART) but the gMSA-specific install code path itself is still spec-built only.
+- `Get-DefenderDefinitions.ps1` doesn't declare `[CmdletBinding(SupportsShouldProcess)]` so `-WhatIf` doesn't work. Minor DX gap, deferred to v0.0.20.1.
+
+### v0.0.19 (2026-06-01)
 
 Unified installer with full credential automation. The Updates component — periodic Defender definition push to endpoints, the original use case the project was built for — is now a first-class scheduled task you can install alongside the dashboard in one command. Validated end-to-end on a STIG-segmented home lab via a seven-scenario test plan ([docs/tests/test-plan-v0.0.19.md](docs/tests/test-plan-v0.0.19.md)).
 

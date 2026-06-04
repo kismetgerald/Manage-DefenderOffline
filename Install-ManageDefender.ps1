@@ -34,7 +34,7 @@
       Dashboard  — headless HTTP dashboard scheduled task only.
       Updates    — periodic definition-push scheduled task only.
       All        — Dashboard + Updates (DEFAULT; does NOT include Downloader).
-      Downloader — reserved for v0.0.20.
+      Downloader — reserved for a future release.
     Default: All.
 
 .PARAMETER Frequency
@@ -136,7 +136,7 @@ param(
     [ValidateSet('Dashboard', 'Updates', 'All', 'Downloader')]
     [ValidateScript({
         if ($_ -eq 'Downloader') {
-            throw "Component 'Downloader' is reserved for v0.0.20 and not yet implemented. It will be installed on a separate internet-connected staging host."
+            throw "Component 'Downloader' is reserved for a future release and not yet implemented. It will be installed on a separate internet-connected staging host (Get-DefenderDefinitions.ps1 is available standalone in the meantime)."
         }
         $true
     })]
@@ -1959,7 +1959,7 @@ if (-not $isAdmin) {
 Write-Section "Manage-DefenderOffline Installer v$ScriptVersion"
 
 if ($Component -eq 'Downloader') {
-    Write-Fail "Component 'Downloader' is reserved for v0.0.20 (internet-connected staging machine install of Get-DefenderDefinitions.ps1)."
+    Write-Fail "Component 'Downloader' is reserved for a future release (internet-connected staging machine install of Get-DefenderDefinitions.ps1)."
     Write-Info  "Pick one of: Dashboard | Updates | All."
     exit 1
 }

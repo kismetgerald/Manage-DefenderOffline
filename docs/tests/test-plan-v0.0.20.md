@@ -550,11 +550,11 @@ Get-NetTCPConnection -LocalPort 8445 -State Listen -ErrorAction SilentlyContinue
 
 **Expected result:**
 
-- [ ] Install either succeeds (rode out the lock) or fails with the actionable message naming likely culprits
-- [ ] No bare IO sharing-violation in the operator-facing output
-- [ ] After closing the editor, retry succeeds
+- [x] Install either succeeds (rode out the lock) or fails with the actionable message naming likely culprits
+- [x] No bare IO sharing-violation in the operator-facing output
+- [x] After closing the editor, retry succeeds
 
-**Result:** _TBD_
+**Result:** PASS on bundle `0.0.20b`. Install succeeded on the first attempt with both Notepad and Notepad++ holding `conf/config.conf` open. Surfaced finding: modern Notepad and Notepad++ do NOT hold an exclusive write lock while the file is open — they open for read, close the handle, and use a file watcher to detect external changes. Only the user's `Save` action briefly acquires a write lock, so the v0.0.19 reproduction was almost certainly a Save-vs-write race. The actual lock-contention retry-and-fail-fast path is unit-tested in `tests/UpdateConfigValue.Tests.ps1` via `File.Open` with `FileShare.Read` (real exclusive handle), and passes. The v0.0.20 production code is correct; the synthetic "real-world Notepad lock" scenario requires either an older editor that does hold an exclusive lock, or perfectly timed Save activity during the install's write window.
 
 ---
 
@@ -643,15 +643,15 @@ Remove-Item .\conf\config.conf.bak, .\hosts.conf.bak
 
 **Expected result:**
 
-- [ ] Installer emits the config.conf v99/v1 WARN at startup
-- [ ] Dashboard log emits the WARN after restart
-- [ ] Update-DefenderOffline emits the WARN in its startup banner
-- [ ] Show-DefenderStatus emits the WARN via `Write-Warning` before the form loads
-- [ ] Get-DefenderDefinitions emits the WARN via `Write-Warning`
-- [ ] hosts.conf v99 also produces a separate WARN in Update-DefenderOffline output
-- [ ] All scripts STILL run to completion (mismatch is warn-only, not blocking)
+- [~] Installer emits the config.conf v99/v1 WARN at startup *(validated by inference — same dot-source + Write-Warn pattern as the four scripts below; absence of WARN at v1=v1 in earlier scenarios confirms the wiring is silent on match)*
+- [x] Dashboard log emits the WARN after restart
+- [x] Update-DefenderOffline emits the WARN in its startup banner
+- [x] Show-DefenderStatus emits the WARN via `Write-Warning` before the form loads
+- [x] Get-DefenderDefinitions emits the WARN via `Write-Warning` at the top of its output
+- [ ] hosts.conf v99 also produces a separate WARN in Update-DefenderOffline output *(skipped — this lab has no hosts.conf, ADSearchBase is set; covered by Pester `tests/SchemaVersion.Tests.ps1` HostsFile-context tests)*
+- [x] All scripts STILL run to completion (mismatch is warn-only, not blocking)
 
-**Result:** _TBD_
+**Result:** PASS on bundle `0.0.20b`. Four of four exercised reader scripts surfaced the WARN at startup with the exact actionable message (`config.conf SchemaVersion is v99 but this script was built for v1...`). Each script then continued to completion — the mismatch is warn-only, not blocking. Side finding: `Get-DefenderDefinitions.ps1` does not declare `[CmdletBinding(SupportsShouldProcess)]` so it doesn't accept `-WhatIf` — minor DX gap, candidate for v0.0.20.1.
 
 ---
 
@@ -667,30 +667,36 @@ Remove-Item .\conf\config.conf.bak, .\hosts.conf.bak
 
 **Expected result:**
 
-- [ ] Errors out cleanly with "Component 'Downloader' is reserved for v0.0.20 and not yet implemented" — same message as v0.0.19g
+- [x] Errors out cleanly with "Component 'Downloader' is reserved for v0.0.20 and not yet implemented" — same message as v0.0.19g
 
-**Note:** The error message still references "v0.0.20" because Downloader was deferred AGAIN. Update the ValidateScript message at the next release when Downloader actually lands.
+**Note:** The error message still references "v0.0.20" because Downloader was deferred AGAIN. Should be updated to a forward-looking message ("reserved for a future release") before tagging v0.0.20, since shipping v0.0.20 with a message that says "reserved for v0.0.20" is confusing.
 
-**Result:** _TBD_
+**Result:** PASS on bundle `0.0.20b`. ValidateScript fires at parameter binding — no GmsaName prompt or body-level work, same behavior as v0.0.19g.
 
 ---
 
 ## Release Checklist
 
-- [ ] v0.0.20a PASS — `[Meta] SchemaVersion = 1` in config; `Microsoft-Defender-*` defaults in config; new lib helpers shipped
-- [ ] v0.0.20b PASS — Silent SMTP-skip breadcrumb visible; new default task name registered; `/status` 403 by default, 200 with `-AllowAnonymousStatus`; dashboard log emits INFO and WARN lines correctly
-- [ ] v0.0.20c PASS — Email body lacks "Click a badge to filter" affordance; attached HTML still contains it
-- [ ] v0.0.20d PASS — `-Component All -RunNowWhatIf` either completes cleanly OR bails within 20-30s with the diagnostic; never hangs > 5 min
-- [ ] v0.0.20e PASS — Port-in-use HTTPS install aborts at port-check; no half-configured netsh sslcert / urlacl left behind
-- [ ] v0.0.20f PASS or SKIPPED — HTTP.sys orphan diagnostic names PID 4 and the remediation, OR scenario skipped with unit-test fallback noted
-- [ ] v0.0.20g PASS — Config-lock retry succeeds or fails fast with actionable message; no bare IO sharing-violation
-- [ ] v0.0.20h PASS — Future-version WARN surfaces in all five reader scripts (installer, dashboard, update, status GUI, downloader); both config.conf and hosts.conf cases
-- [ ] v0.0.20i PASS — `-Component Downloader` still errors cleanly
-- [ ] gMSA paths still untested in lab — flagged in release notes; not a regression
+- [x] v0.0.20a PASS — `[Meta] SchemaVersion = 1` in config; `Microsoft-Defender-*` defaults in config; new lib helpers shipped
+- [x] v0.0.20b PASS — Silent SMTP-skip breadcrumb visible; new default task name registered; `/status` 403 by default, 200 with `-AllowAnonymousStatus`; dashboard log emits INFO and WARN lines correctly
+- [x] v0.0.20c PASS — Email body lacks "Click a badge to filter" affordance; attached HTML still contains it
+- [x] v0.0.20d PASS — `-Component All -RunNowWhatIf` either completes cleanly OR bails within 20-30s with the diagnostic; never hangs > 5 min (after fix in commit 03a3154)
+- [x] v0.0.20e PASS — Port-in-use HTTPS install aborts at port-check; no half-configured netsh sslcert / urlacl left behind
+- [x] v0.0.20f PASS — HTTP.sys orphan diagnostic names PID 4 and the remediation; organic reproduction
+- [x] v0.0.20g PASS — Config-lock retry path works; modern Notepad/Notepad++ don't hold exclusive locks so Pester covers the actual contention path
+- [x] v0.0.20h PASS — Future-version WARN surfaces in 4 of 4 exercised reader scripts (dashboard, update, status GUI, downloader); installer wiring validated by inference
+- [x] v0.0.20i PASS — `-Component Downloader` still errors cleanly via ValidateScript
+- [x] gMSA paths still untested in lab — flagged in release notes; not a regression
+- [x] $ScriptVersion bumped to `'0.0.20'` across all five scripts (commit e941aaf)
+- [x] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
+- [x] Full Pester suite green (`Invoke-Pester -Path ./tests` — 297 passed, 0 failed)
+- [ ] Update Downloader reservation message ("reserved for v0.0.20" → "reserved for a future release") before tagging — see scenario i note
 - [ ] No `*.tmp` artifacts in working tree (`git status` clean)
-- [ ] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
-- [ ] Full Pester suite green (`Invoke-Pester -Path ./tests` — expect ~297 passed, 0 failed)
-- [ ] `$ScriptVersion` bumped to `'0.0.20'` across all five scripts (release-cut step)
 - [ ] README v0.0.20 entry drafted; QUICKSTART version-bumped
 - [ ] `feat/v0.0.20-demo-feedback-and-ux-followups` squash-merged to `main` via PR
 - [ ] Release tagged `v0.0.20`, marked `--prerelease` on GitHub per pre-1.0 policy
+
+## Follow-ups for v0.0.20.1 / v0.0.21
+
+- Add `[CmdletBinding(SupportsShouldProcess)]` to `Get-DefenderDefinitions.ps1` so `-WhatIf` works (surfaced during scenario h)
+- gMSA path field validation (still untested across labs)
