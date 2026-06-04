@@ -139,9 +139,9 @@
                      Local administrator privileges on the machine running this script
                      Administrative rights on all target computers
                      Read access to SourceSharePath share
-    Version        : 0.0.6
+    Version        : 0.0.21
     Created        : 2025-11-27
-    Last Updated   : 2026-05-19
+    Last Updated   : 2026-06-04
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -235,7 +235,7 @@ param(
 # ===================================================================
 # Constants
 # ===================================================================
-$ScriptVersion   = '0.0.20.1'
+$ScriptVersion   = '0.0.21'
 $ScriptStartTime = Get-Date
 $ScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile       = Join-Path $ScriptDir 'hosts.conf'

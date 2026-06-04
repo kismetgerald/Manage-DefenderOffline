@@ -720,7 +720,29 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.20.1 (2026-06-04) — Current
+### v0.0.21 (2026-06-04) — Current
+
+Polish release: cold-start performance + auth-preflight forensics. Closes three queued startup items from the v0.0.14 phase-profiling work plus a long-standing `.NOTES` block staleness across the script set. No new components, no config changes, no migration path needed.
+
+**Dashboard cold-start performance:**
+- ✨ **Pre-timer gap measurement.** New `event=startup_gap pwsh_load_and_parse_ms=N` emitted right after `Start-StartupTimer`. Reads `(Get-Process -Id $PID).StartTime` to surface the time spent before the first script line ran (pwsh process load + script parse + lib dot-sources) — the gap that the v0.0.14 phase timer couldn't see and which has been suspected as the reason the installer's status-file wait sometimes fires even when the in-script timer says startup completed in 20s.
+- ✨ **Async `Write-EventLog` at startup.** EventId 100/101 writes are now dispatched via `Start-ThreadJob` instead of called inline. v0.0.14 profiling showed `event_log` phase running 1.3–1.8s cold, dominated by `Write-EventLog`'s first-call .NET init — that cost no longer blocks the listener from accepting connections. Same file-log breadcrumb is still written synchronously, so the operator still has a startup record if the dashboard crashes between dispatch and the actual event-log write.
+
+**Auth-preflight sub-instrumentation:**
+- ✨ **`Resolve-DashboardAllowedGroups` now records per-entry resolution duration** in a new `DurationMs` property on each `Resolutions[]` entry. The existing per-entry `event=auth_resolve` startup line now includes `duration_ms=<N>`, so the v0.0.14 finding that `auth_preflight` is the most cold-sensitive phase (14× warm/cold ratio) can be attributed to specific allow-list entries instead of an opaque phase total. SIEM queries can now flag "any single allow-list entry over 500ms" as a degraded-DC signal.
+
+**Docs hygiene:**
+- 🐛 **Stale `.NOTES` blocks** in `Update-DefenderOffline.ps1`, `Show-DefenderStatus.ps1`, `Start-DefenderDashboard.ps1`, and `Get-DefenderDefinitions.ps1` bumped from `0.0.6` / `0.0.9` to `0.0.21`; `Last Updated` dates aligned. The runtime banner has been printing the current `$ScriptVersion` all along — this only affects the comment-based help (`Get-Help <script>` output).
+
+**Testing:**
+- ✅ 3 new tests in `tests/Auth.Tests.ps1` covering `DurationMs` population for resolved, unresolved, and mixed entries.
+- ✅ Pester suite: 303 passed, 0 failed, 13 skipped (was 300 in v0.0.20.1; +3 new).
+
+**Backward compat:**
+- The new `DurationMs` property is purely additive on `Resolutions[]`. Existing callers that ignore unknown properties (every caller in the tree) keep working unchanged.
+- The `event=auth_resolve` log line gains a `duration_ms=` field at the end. SIEM consumers that parse by-key (the documented contract) are unaffected; positional parsers would need to handle the extra key.
+
+### v0.0.20.1 (2026-06-04)
 
 Patch release: closes the one known DX gap carried forward from v0.0.20. No new components, no config changes, no migration path needed.
 

@@ -66,8 +66,8 @@
     AI Contributors: Claude AI, Grok
     Requires       : PowerShell 7+ (recommended), WinRM on targets (TCP 5985)
                      Administrator privileges or delegated WinRM access on targets
-    Version        : 0.0.6
-    Last Updated   : 2026-05-19
+    Version        : 0.0.21
+    Last Updated   : 2026-06-04
 #>
 
 [CmdletBinding()]
@@ -162,7 +162,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.20.1'
+$ScriptVersion = '0.0.21'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -596,11 +596,16 @@ function Resolve-DashboardAllowedGroups {
             $sidObj     = $null
             $accountStr = $null
             $errorMsg   = $null
+            # Per-entry timing — the v0.0.14 phase timings showed auth_preflight
+            # as the most cold-sensitive phase (14× warm/cold ratio). Surfacing
+            # per-entry duration tells the operator whether the spike is one slow
+            # trust traversal or N entries each adding their share.
+            $entrySw = [System.Diagnostics.Stopwatch]::StartNew()
             try {
                 $sidObj = ([System.Security.Principal.NTAccount]::new($name)).Translate(
                     [System.Security.Principal.SecurityIdentifier])
                 # Reverse-translate so we can log the canonical DOMAIN\Group form.
-                # This is what makes 'Helpdesk' vs 'WGSDAC\Helpdesk' debuggable —
+                # This is what makes 'Helpdesk' vs 'HOME\Helpdesk' debuggable —
                 # operators can see whether their unqualified entry resolved to
                 # the domain they expected.
                 try {
@@ -613,14 +618,16 @@ function Resolve-DashboardAllowedGroups {
                 [void]$unresolved.Add($e)
                 $errorMsg = $_.Exception.Message
             }
+            $entrySw.Stop()
 
             [void]$resolutions.Add([pscustomobject]@{
-                Input   = $name
-                IsDeny  = $isDeny
-                Status  = if ($sidObj) { 'ok' } else { 'unresolved' }
-                Account = $accountStr
-                Sid     = if ($sidObj) { $sidObj.Value } else { $null }
-                Error   = $errorMsg
+                Input      = $name
+                IsDeny     = $isDeny
+                Status     = if ($sidObj) { 'ok' } else { 'unresolved' }
+                Account    = $accountStr
+                Sid        = if ($sidObj) { $sidObj.Value } else { $null }
+                Error      = $errorMsg
+                DurationMs = [int]$entrySw.Elapsed.TotalMilliseconds
             })
         }
     }
@@ -2324,6 +2331,20 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 # Startup
 # ===================================================================
 Start-StartupTimer
+
+# Pre-timer gap: time spent before the first script line ran (pwsh process
+# load + script parse + lib dot-sources). The v0.0.14 phase timer measures
+# from this point forward but couldn't see what came before. Reading the
+# pwsh.exe StartTime lets us surface that gap as a structured event the
+# same SIEM ingest can chart alongside the phase timings.
+try {
+    $procStart = (Get-Process -Id $PID -ErrorAction Stop).StartTime
+    $gapMs     = [int]((Get-Date) - $procStart).TotalMilliseconds
+    Write-DashLog ("event=startup_gap pwsh_load_and_parse_ms={0}" -f $gapMs) 'INFO'
+} catch {
+    Write-DashLog "Could not measure pwsh load/parse gap: $($_.Exception.Message)" 'WARN'
+}
+
 Write-DashLog "=== Defender Dashboard v$ScriptVersion starting ===" 'SUCCESS'
 Write-DashLog "Port            : $Port"
 Write-DashLog "Refresh interval: ${RefreshInterval}s"
@@ -2430,15 +2451,17 @@ switch ($AuthMethod) {
         # Per-entry structured log (key=value) so operators can see exactly
         # which input resolved to which DOMAIN\Group + SID — and which entries
         # failed. v0.0.12 only logged a count, which made AuthAllowedGroups
-        # format mistakes (unqualified 'Helpdesk' vs 'WGSDAC\Helpdesk') hard
-        # to diagnose remotely.
+        # format mistakes (unqualified 'Helpdesk' vs 'HOME\Helpdesk') hard
+        # to diagnose remotely. v0.0.21 adds duration_ms so the auth_preflight
+        # cold-spike (14× warm/cold from v0.0.14 profiling) can be attributed
+        # to specific allow-list entries instead of an opaque phase total.
         foreach ($r in $script:AdGroupResolution.Resolutions) {
             $type = if ($r.IsDeny) { 'deny' } else { 'allow' }
             if ($r.Status -eq 'ok') {
-                Write-DashLog ("event=auth_resolve input='{0}' type={1} status=ok account='{2}' sid={3}" -f $r.Input, $type, $r.Account, $r.Sid) 'INFO'
+                Write-DashLog ("event=auth_resolve input='{0}' type={1} status=ok account='{2}' sid={3} duration_ms={4}" -f $r.Input, $type, $r.Account, $r.Sid, $r.DurationMs) 'INFO'
             } else {
                 $errClean = ($r.Error -replace "'", "''" -replace "[\r\n]+", ' ').Trim()
-                Write-DashLog ("event=auth_resolve input='{0}' type={1} status=unresolved error='{2}'" -f $r.Input, $type, $errClean) 'WARN'
+                Write-DashLog ("event=auth_resolve input='{0}' type={1} status=unresolved error='{2}' duration_ms={3}" -f $r.Input, $type, $errClean, $r.DurationMs) 'WARN'
             }
         }
 
@@ -2709,24 +2732,40 @@ Write-StartupPhase 'status_file'
 # EventId 100 = normal start on primary port
 # EventId 101 = started on fallback port  (Warning — admin action may be needed)
 # EventId 102 = service stopped
+#
+# Dispatched via Start-ThreadJob because Write-EventLog's first-call .NET
+# init costs ~1.5s cold (measured in v0.0.14 phase timings). Backgrounding
+# it lets the listener start accepting connections that much sooner.
+# Trade-off: if the dashboard crashes between dispatch and the actual
+# write, the event might not post. Acceptable because the same start
+# notification is already captured in the file log via Write-DashLog.
+# SourceExists is left synchronous — it's just a registry read.
 $evtSource = 'Manage-DefenderOffline'
 try {
     if ([System.Diagnostics.EventLog]::SourceExists($evtSource)) {
         if ($portResult.IsFallback) {
+            $evtId  = 101
             $evtMsg = "Defender Dashboard started on FALLBACK port $Port. " +
                       "Primary port $($portResult.PrimaryPort) was already in use. " +
                       "Update firewall rules, bookmarks, and monitoring tools to use port $Port."
-            Write-EventLog -LogName Application -Source $evtSource -EventId 101 `
-                -EntryType Warning -Message $evtMsg
-            Write-DashLog "Warning written to Windows Event Log (EventId 101)." 'WARN'
+            $evtType = 'Warning'
         } else {
-            Write-EventLog -LogName Application -Source $evtSource -EventId 100 `
-                -EntryType Information `
-                -Message "Defender Dashboard started on port $Port."
+            $evtId   = 100
+            $evtMsg  = "Defender Dashboard started on port $Port."
+            $evtType = 'Information'
         }
+        Start-ThreadJob -ScriptBlock {
+            param($Source, $Id, $Type, $Msg)
+            try {
+                Write-EventLog -LogName Application -Source $Source `
+                    -EventId $Id -EntryType $Type -Message $Msg
+            } catch { }
+        } -ArgumentList $evtSource, $evtId, $evtType, $evtMsg | Out-Null
+        $levelTag = if ($portResult.IsFallback) { 'WARN' } else { 'INFO' }
+        Write-DashLog "Windows Event Log write dispatched async (EventId $evtId)." $levelTag
     }
 } catch {
-    Write-DashLog "Could not write to Windows Event Log: $($_.Exception.Message)" 'WARN'
+    Write-DashLog "Could not dispatch Windows Event Log write: $($_.Exception.Message)" 'WARN'
 }
 Write-StartupPhase 'event_log'
 

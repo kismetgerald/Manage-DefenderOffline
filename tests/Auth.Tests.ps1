@@ -621,6 +621,33 @@ Describe 'Resolve-DashboardAllowedGroups' {
             ($r.Resolutions | Select-Object -First 1).Account | Should -Be 'BUILTIN\Administrators'
         }
     }
+
+    Context 'DurationMs property (v0.0.21 auth_preflight sub-instrumentation)' {
+
+        It 'populates DurationMs as a non-negative integer for resolved entries' {
+            $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Administrators'
+            $entry = $r.Resolutions | Select-Object -First 1
+            $entry.DurationMs            | Should -BeOfType [int]
+            $entry.DurationMs            | Should -BeGreaterOrEqual 0
+        }
+
+        It 'populates DurationMs even for unresolved entries (so the spike attribution covers failures too)' {
+            $r = Resolve-DashboardAllowedGroups -AllowList 'NOSUCHDOMAIN\NoSuchGroup-NonExistent'
+            $entry = $r.Resolutions | Select-Object -First 1
+            $entry.Status                | Should -Be 'unresolved'
+            $entry.DurationMs            | Should -BeOfType [int]
+            $entry.DurationMs            | Should -BeGreaterOrEqual 0
+        }
+
+        It 'emits a DurationMs per entry (mixed allow + deny + unresolved)' {
+            $r = Resolve-DashboardAllowedGroups -AllowList 'BUILTIN\Administrators,!BUILTIN\Guests,NOSUCHDOMAIN\NoSuchGroup-NonExistent'
+            $r.Resolutions | Should -HaveCount 3
+            foreach ($entry in $r.Resolutions) {
+                $entry.DurationMs        | Should -BeOfType [int]
+                $entry.DurationMs        | Should -BeGreaterOrEqual 0
+            }
+        }
+    }
 }
 
 Describe 'Test-IdentityInAllowedGroups' {
