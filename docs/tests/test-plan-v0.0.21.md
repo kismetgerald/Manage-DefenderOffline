@@ -326,16 +326,30 @@ Write-Host "auth_preflight phase total:  $phaseMs ms"
 
 **Expected result:**
 
-- [~] Every `event=auth_resolve` line ends with `duration_ms=<N>` where N is a non-negative integer *(SKIPPED — see below)*
-- [~] BUILTIN entries (cached locally) typically resolve in <10ms *(SKIPPED — see below)*
-- [~] Domain entries hitting a DC may take 50-500ms cold, less when warm *(SKIPPED — see below)*
-- [~] Sum of per-entry durations <= `auth_preflight` phase total *(SKIPPED — see below)*
+- [x] Every `event=auth_resolve` line ends with `duration_ms=<N>` where N is a non-negative integer
+- [x] BUILTIN entries (cached locally) typically resolve in <10 ms
+- [x] Domain entries hitting a DC may take 50-500 ms cold, less when warm
+- [x] Sum of per-entry durations <= `auth_preflight` phase total
 
-**Result:** SKIPPED on home-lab WGSDAC.NET, 2026-06-04 — the lab does not run `AuthMethod = ADIntegrated`. Confirmed by the absence of any `event=auth_resolve` lines in scenario b's dashboard logs (the line is only emitted when `Resolve-DashboardAllowedGroups` runs at startup, which is gated to the ADIntegrated mode). The `DurationMs` code path is not reached at runtime on this lab.
+**Setup discovery (2026-06-04):** lab was found to be running `AuthMethod = None` because a prior test had switched it and it was never restored. Lab's *intended* config is `AuthMethod = ADIntegrated`. Config flipped back to ADIntegrated, dashboard restarted at 18:08:27, scenario d re-run with the corrected config. Original SKIPPED rationale (Pester unit tests cover the helper-level correctness) is preserved here as a permanent coverage statement for any future lab that legitimately runs a non-ADIntegrated mode.
 
-**Coverage rationale:** the `DurationMs` field is validated at the helper level by three dedicated tests in `tests/Auth.Tests.ps1` (Context: `DurationMs property (v0.0.21 auth_preflight sub-instrumentation)`) — covering resolved entries, unresolved entries, and a mixed allow + deny + unresolved set. The change is a `[System.Diagnostics.Stopwatch]` wrapped around the existing `NTAccount.Translate()` call plus an additive property on the returned `[pscustomobject]`; the runtime risk surface is correctness of the timing math (covered by `BeGreaterOrEqual 0` + `BeOfType [int]`) and the log-format string (deterministic `-f` format operator). No runtime risk that the unit tests don't exercise.
+**Result:** PASS — `AuthAllowedGroups` has 3 entries; all three emitted `auth_resolve` lines with `duration_ms=N` per the v0.0.21 spec. `auth_summary` follow-up shows the right counts (2 allows + 1 deny + 0 unresolved).
 
-**Future coverage:** if this lab adopts ADIntegrated auth (or a different lab uses it), re-run this scenario to validate the `duration_ms=` field appears in the per-entry `event=auth_resolve` lines as designed.
+**Measurements:**
+
+| Entry | Type | Status | `duration_ms` |
+|---|---|---|---:|
+| `BUILTIN\Administrators` | allow | ok | 11 |
+| `BUILTIN\Guests` | deny | ok | 1 |
+| `WGSDAC\IT_Workstation_Admins` | allow | ok | 0 |
+| Sum | | | **12** |
+
+**Key findings:**
+
+1. **`duration_ms` field populates correctly** on every `auth_resolve` line — primary v0.0.21 spec validated.
+2. **`WGSDAC\IT_Workstation_Admins` resolved in 0 ms** versus the 50–500 ms predicted. Signal of a healthy warm DC connection on this lab — the DC contact was fast enough to round down to zero. v0.0.14's measurement showing 1 786 ms cold `auth_preflight` was an extreme case; this lab's DC topology is much faster, so the sub-instrumentation will not surface a forensic-grade cold-spike on this particular host.
+3. **`auth_summary` bookkeeping correct:** 2 allows + 1 deny + 0 unresolved = 3 input entries, matching the comma-separated list in `conf/config.conf`.
+4. **Helper-level coverage (Pester) is still load-bearing** for future labs that run a non-ADIntegrated mode — the three `DurationMs property` tests in `tests/Auth.Tests.ps1` cover the resolved / unresolved / mixed branches without needing AD to be reachable.
 
 ---
 
@@ -404,7 +418,7 @@ Select-String -Path .\Install-ManageDefender.ps1 -Pattern 'Get-PortBusyDiagnosti
 - [x] v0.0.21a PASS — `$ScriptVersion`, `.NOTES Version`, `.NOTES Last Updated` all aligned to `0.0.21` / `2026-06-04`; v0.0.20 baseline `startup_complete total_ms=1940` recorded for scenario b comparison
 - [x] v0.0.21b PASS — `startup_gap` populates (964 ms warm / 6 439 ms cold); `event_log` phase 7 ms warm / 34 ms cold (was ~1.5 s); `startup_complete` warm-to-warm 1 940 → 1 482 ms (−23.6 %); EventId 100 lands ~1–2 s after `startup_complete` (warm and cold both verified)
 - [~] v0.0.21c SKIPPED — HTTPS lab (`UseHttps = true`) disables port fallback by design; EventId 101 path structurally unreachable. Coverage by inference from scenario b (same `Start-ThreadJob` dispatch + identical `Write-EventLog` pattern; only differences are `Id`, `Type`, and message string).
-- [~] v0.0.21d SKIPPED — lab is not on `AuthMethod = ADIntegrated` (confirmed by absence of `auth_resolve` lines in scenario b log). Coverage by Pester unit tests in `tests/Auth.Tests.ps1` (Context: `DurationMs property` — 3 tests for resolved / unresolved / mixed).
+- [x] v0.0.21d PASS — all three `auth_resolve` lines emitted `duration_ms=N` (BUILTIN\Administrators=11 ms, BUILTIN\Guests=1 ms, WGSDAC\IT_Workstation_Admins=0 ms). `auth_summary` bookkeeping correct (2 allow + 1 deny + 0 unresolved). Lab had been mis-configured to `AuthMethod = None` after a prior test; restored to ADIntegrated before re-running this scenario.
 - [ ] v0.0.21e PASS — `/status` 403, SchemaVersion v99 WARN surfaces, downloader `-WhatIf` works, `Get-PortBusyDiagnostic` still wired
 - [x] $ScriptVersion bumped to `'0.0.21'` across all five scripts (commit `9673041`)
 - [x] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
