@@ -165,9 +165,69 @@ Describe 'Test-DashboardAuth — AuthMethod=None' {
         $r.Reason     | Should -Be 'auth-disabled'
     }
 
-    It 'allows any caller to /status' {
+    Context '/status lock-down (v0.0.20)' {
+
+        It 'denies /status by default (AuthMethod=None, no -AllowAnonymousStatus)' {
+            $ctx = New-FakeContext -Path '/status'
+            $r   = Test-DashboardAuth -Context $ctx -Method 'None'
+            $r.Authorized | Should -BeFalse
+            $r.StatusCode | Should -Be 403
+            $r.Reason     | Should -Be 'status-locked-no-auth'
+        }
+
+        It 'denies /refresh by default (AuthMethod=None, no -AllowAnonymousStatus)' {
+            $ctx = New-FakeContext -Path '/refresh'
+            $r   = Test-DashboardAuth -Context $ctx -Method 'None'
+            $r.Authorized | Should -BeFalse
+            $r.StatusCode | Should -Be 403
+            $r.Reason     | Should -Be 'status-locked-no-auth'
+        }
+
+        It 'allows /status when -AllowAnonymousStatus is set' {
+            $ctx = New-FakeContext -Path '/status'
+            $r   = Test-DashboardAuth -Context $ctx -Method 'None' -AllowAnonymousStatus
+            $r.Authorized | Should -BeTrue
+            $r.Reason     | Should -Be 'auth-disabled'
+        }
+
+        It 'allows /refresh when -AllowAnonymousStatus is set' {
+            $ctx = New-FakeContext -Path '/refresh'
+            $r   = Test-DashboardAuth -Context $ctx -Method 'None' -AllowAnonymousStatus
+            $r.Authorized | Should -BeTrue
+            $r.Reason     | Should -Be 'auth-disabled'
+        }
+
+        It 'leaves /defender open regardless of -AllowAnonymousStatus' {
+            $ctx = New-FakeContext -Path '/defender'
+            $r   = Test-DashboardAuth -Context $ctx -Method 'None'
+            $r.Authorized | Should -BeTrue
+        }
+
+        It 'leaves /health open even when /status is locked' {
+            $ctx = New-FakeContext -Path '/health'
+            $r   = Test-DashboardAuth -Context $ctx -Method 'None'
+            $r.Authorized | Should -BeTrue
+            $r.Reason     | Should -Be 'health-bypass'
+        }
+    }
+}
+
+Describe 'Test-DashboardAuth — /status lock-down is None-mode-only' {
+
+    # -AllowAnonymousStatus is only meaningful when AuthMethod=None. In other
+    # modes /status follows the same auth as /defender. The switch must not
+    # accidentally weaken those modes.
+
+    It 'AuthMethod=Token + -AllowAnonymousStatus still requires the token on /status' {
         $ctx = New-FakeContext -Path '/status'
-        $r   = Test-DashboardAuth -Context $ctx -Method 'None'
+        $r   = Test-DashboardAuth -Context $ctx -Method 'Token' -Token 'secret' -AllowAnonymousStatus
+        $r.Authorized | Should -BeFalse
+        $r.Reason     | Should -Be 'no-token'
+    }
+
+    It 'AuthMethod=Token + valid token allows /status (baseline)' {
+        $ctx = New-FakeContext -Path '/status' -Headers @{ Authorization = 'Bearer secret' }
+        $r   = Test-DashboardAuth -Context $ctx -Method 'Token' -Token 'secret'
         $r.Authorized | Should -BeTrue
     }
 }

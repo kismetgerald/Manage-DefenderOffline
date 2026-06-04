@@ -110,8 +110,13 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.19'
+$ScriptVersion = '0.0.20'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+. (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
+
+# Schema version this script was built against.
+$Script:ExpectedConfigSchemaVersion = 1
 
 # ===================================================================
 # Configuration File
@@ -219,6 +224,12 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 # ===================================================================
 if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'conf\config.conf' }
 $cfg = Read-ConfigFile $ConfigPath
+
+# Schema version check. Warnings surface via Write-Warning since this script
+# has no dedicated logger and runs interactively / in unattended download jobs.
+$cfgSchema = Test-SchemaVersion -ConfigData $cfg `
+    -ExpectedVersion $Script:ExpectedConfigSchemaVersion -ArtifactName 'config.conf'
+if ($cfgSchema.Warning) { Write-Warning $cfgSchema.Warning }
 
 # Config-merge: parameters provided on the CLI win; config fills in the
 # rest; otherwise defaults apply.

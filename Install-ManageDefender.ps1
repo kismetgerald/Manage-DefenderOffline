@@ -34,7 +34,7 @@
       Dashboard  — headless HTTP dashboard scheduled task only.
       Updates    — periodic definition-push scheduled task only.
       All        — Dashboard + Updates (DEFAULT; does NOT include Downloader).
-      Downloader — reserved for v0.0.20.
+      Downloader — reserved for a future release.
     Default: All.
 
 .PARAMETER Frequency
@@ -136,7 +136,7 @@ param(
     [ValidateSet('Dashboard', 'Updates', 'All', 'Downloader')]
     [ValidateScript({
         if ($_ -eq 'Downloader') {
-            throw "Component 'Downloader' is reserved for v0.0.20 and not yet implemented. It will be installed on a separate internet-connected staging host."
+            throw "Component 'Downloader' is reserved for a future release and not yet implemented. It will be installed on a separate internet-connected staging host (Get-DefenderDefinitions.ps1 is available standalone in the meantime)."
         }
         $true
     })]
@@ -199,11 +199,11 @@ param(
     [string]$AuthToken,
 
     # ----- Dashboard task naming -----
-    [string]$TaskName   = 'DefenderDashboard',
+    [string]$TaskName   = 'Microsoft-Defender-Dashboard',
     [string]$TaskFolder = '\',
 
     # ----- Updates task naming -----
-    [string]$UpdateTaskName   = 'DefenderUpdate',
+    [string]$UpdateTaskName   = 'Microsoft-Defender-Update',
     [string]$UpdateTaskFolder,    # blank = use $TaskFolder
 
     # ----- Updates-specific config -----
@@ -236,11 +236,20 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.19'
+$ScriptVersion = '0.0.20'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Shared helper modules (dot-sourced; same chokepoint pattern as the other scripts).
 . (Join-Path $ScriptDir 'lib\Update-ConfigValue.ps1')
+. (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
+. (Join-Path $ScriptDir 'lib\Get-PortBusyDiagnostic.ps1')
+. (Join-Path $ScriptDir 'lib\Wait-SmokeTaskStart.ps1')
+
+# Schema versions this script was built against. Bump when shipping a breaking
+# config or hosts layout change. Test-SchemaVersion warns on mismatch but does
+# not block startup — operators may be running mixed-release scripts during
+# a rolling upgrade.
+$Script:ExpectedConfigSchemaVersion = 1
 
 # Stable application GUID used for netsh sslcert binding (Dashboard component).
 # Reusing this lets the installer find and delete its own previous bindings idempotently.
@@ -309,6 +318,14 @@ function Write-Section ([string]$Msg) {
     Write-Host "   $Msg" -ForegroundColor Magenta
     Write-Host '  ============================================================' -ForegroundColor Magenta
 }
+
+# ===================================================================
+# Schema version check (config.conf only — installer does not read hosts.conf)
+# ===================================================================
+$schemaCheck = Test-SchemaVersion -ConfigData $cfg `
+    -ExpectedVersion $Script:ExpectedConfigSchemaVersion `
+    -ArtifactName 'config.conf'
+if ($schemaCheck.Warning) { Write-Warn $schemaCheck.Warning }
 
 # ===================================================================
 # Common helpers
@@ -885,6 +902,18 @@ function Initialize-ServiceCredentials {
 
     $plan = Get-CredentialPlanForComponent -Component $Component -Config $Config
 
+    # If SendEmail=true is set in config but the chosen Component doesn't
+    # install the Updates task, SMTP setup is silently skipped. Surface a
+    # breadcrumb so the operator isn't left wondering why no SMTP prompt
+    # appeared (especially after a Dashboard-only install on a host that
+    # was previously expected to email reports).
+    if (-not $plan.Smtp -and $Component -notin @('Updates','All')) {
+        $sendEmail = "$($Config['SendEmail'])".Trim()
+        if ($sendEmail -match '^(?i)true|1|yes$') {
+            Write-Info "SMTP setup skipped: SendEmail=true in config applies to the Updates task, which is not included in -Component $Component. Re-run with -Component Updates or -Component All to configure SMTP."
+        }
+    }
+
     if ($Skip) {
         Show-DeferredCredentialInstructions -CredentialPlan $plan -IdentityLabel $IdentityLabel -ScriptDirectory $ScriptDir
         return $true
@@ -1183,6 +1212,56 @@ function Install-DashboardComponent {
 
     Register-DashboardEventLogSource
 
+    # ----- Stop existing instance + port check (BEFORE any netsh setup) -----
+    # The port check runs first so that a port-in-use failure aborts BEFORE
+    # we touch netsh sslcert / urlacl. Otherwise a half-configured binding
+    # would be left behind for the operator to clean up manually with
+    # 'netsh http delete sslcert' / 'netsh http delete urlacl'.
+    $existingTaskPre = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
+    if ($existingTaskPre -and $existingTaskPre.State -eq 'Running') {
+        Write-Step "Stopping previously installed dashboard task…"
+        try {
+            Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction Stop
+            for ($wait = 0; $wait -lt 10; $wait++) {
+                if (Test-PortFree $Port) { break }
+                Start-Sleep -Milliseconds 500
+            }
+            Write-Ok "Previous instance stopped"
+        } catch {
+            Write-Warn "Could not stop existing task: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Step "Checking port availability…"
+    if ($UseHttps) {
+        if (-not (Test-PortFree $Port)) {
+            Write-Fail "Port $Port is in use and HTTPS does not support fallback (cert binding is per-port)."
+            $diag = Get-PortBusyDiagnostic -BusyPort $Port
+            if ($diag) { Write-Info $diag }
+            return $false
+        }
+        $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
+        Write-Ok "Port $Port is available (HTTPS)"
+    } else {
+        try {
+            $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
+        } catch {
+            Write-Fail $_.Exception.Message
+            $diag = Get-PortBusyDiagnostic -BusyPort $Port
+            if ($diag) { Write-Info $diag }
+            return $false
+        }
+        if ($portResult.IsFallback) {
+            Write-Warn "Port $($portResult.PrimaryPort) is already in use on this host."
+            $diag = Get-PortBusyDiagnostic -BusyPort $portResult.PrimaryPort
+            if ($diag) { Write-Info $diag }
+            Write-Ok   "Using fallback port $($portResult.Port) instead."
+            $Port = $portResult.Port
+        } else {
+            Write-Ok "Port $Port is available"
+        }
+    }
+
     # ----- HTTPS setup -----
     if ($UseHttps) {
         Write-Step "Configuring HTTPS…"
@@ -1317,41 +1396,6 @@ function Install-DashboardComponent {
         if ($AuthMethod -eq 'Basic' -and -not $UseHttps) {
             Write-Fail "AuthMethod=Basic without -UseHttps would send credentials in cleartext on every request."
             return $false
-        }
-    }
-
-    # ----- Stop existing instance + port check -----
-    $existingTaskPre = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
-    if ($existingTaskPre -and $existingTaskPre.State -eq 'Running') {
-        Write-Step "Stopping previously installed dashboard task…"
-        try {
-            Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction Stop
-            for ($wait = 0; $wait -lt 10; $wait++) {
-                if (Test-PortFree $Port) { break }
-                Start-Sleep -Milliseconds 500
-            }
-            Write-Ok "Previous instance stopped"
-        } catch {
-            Write-Warn "Could not stop existing task: $($_.Exception.Message)"
-        }
-    }
-
-    Write-Step "Checking port availability…"
-    if ($UseHttps) {
-        if (-not (Test-PortFree $Port)) {
-            Write-Fail "Port $Port is in use and HTTPS does not support fallback (cert binding is per-port)."
-            return $false
-        }
-        $portResult = [pscustomobject]@{ Port = $Port; IsFallback = $false; PrimaryPort = $Port }
-        Write-Ok "Port $Port is available (HTTPS)"
-    } else {
-        $portResult = Find-AvailablePort -Primary $Port -Fallback $FallbackPort
-        if ($portResult.IsFallback) {
-            Write-Warn "Port $($portResult.PrimaryPort) is already in use on this host."
-            Write-Ok   "Using fallback port $($portResult.Port) instead."
-            $Port = $portResult.Port
-        } else {
-            Write-Ok "Port $Port is available"
         }
     }
 
@@ -1785,16 +1829,65 @@ function Install-UpdatesComponent {
             Register-ScheduledTask @registerParams | Out-Null
             Start-ScheduledTask -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction Stop
 
-            $deadline    = (Get-Date).AddMinutes(10)
+            # Confirm the task actually started before entering the long
+            # completion-poll loop. Start-ScheduledTask is fire-and-forget;
+            # in the v0.0.19 lab pass a -Component All scenario produced a
+            # task that Task Scheduler queued but never ran (suspected
+            # same-identity contention with the just-started Dashboard
+            # task). Without this check the completion loop would wait
+            # the full deadline before timing out — operators gave up
+            # and killed the install with no diagnostic.
+            $startCheck = Wait-SmokeTaskStart `
+                -TaskName     $smokeName `
+                -TaskPath     '\Manage-DefenderOffline\' `
+                -StartedAfter $smokeStart `
+                -TimeoutSeconds 20
+            if (-not $startCheck.Started) {
+                Write-Warn "WhatIf smoke task did not start within $($startCheck.ElapsedSeconds)s. Skipping completion poll; the install is otherwise complete."
+                Write-Info '  Likely cause: Task Scheduler queued the task but has not dispatched it (often a same-identity contention with another running task). The registered Updates task is unaffected.'
+                if ($startCheck.Task) { Write-Info "  Smoke task state          : $($startCheck.Task.State)" }
+                if ($startCheck.Info) {
+                    Write-Info "  Smoke task LastRunTime    : $($startCheck.Info.LastRunTime)"
+                    Write-Info "  Smoke task LastTaskResult : $($startCheck.Info.LastTaskResult)"
+                }
+                Write-Info "  To exercise the Updates task manually: Start-ScheduledTask -TaskName '$UpdateTaskName' -TaskPath '$UpdateTaskFolder'"
+                # Skip the completion-poll loop. The finally block below
+                # still runs, so the smoke task is unregistered.
+                return $true
+            }
+
+            # Completion poll. Deadline shortened from 10 min to 5 min: a
+            # real fleet WhatIf typically finishes in 30-90s, so 5 minutes
+            # is generous without making operators wait an unreasonable
+            # time when something is genuinely stuck.
+            #
+            # Completion is detected via:
+            #   State != Running  (the task isn't currently executing)
+            #   LastTaskResult != 267009 (SCHED_S_TASK_HAS_NOT_RUN — the
+            #     sentinel Task Scheduler reports when the task has never
+            #     actually executed).
+            #
+            # We deliberately do NOT compare LastRunTime against $smokeStart.
+            # The smoke task is freshly registered with a random GUID
+            # name — there is no previous run whose results could be
+            # confused with this one. An earlier version did include that
+            # comparison defensively; in the v0.0.20d lab pass it caused
+            # the loop to wait the full 5-minute deadline even after the
+            # task completed in 5 seconds (suspected DateTime-kind /
+            # clock-skew quirk between Get-Date and Task Scheduler's
+            # stored LastRunTime). Drop the check.
+            $deadline    = (Get-Date).AddMinutes(5)
             $finalResult = $null
+            $lastInfo    = $null
+            $lastTask    = $null
             do {
                 Start-Sleep -Seconds 2
                 $info = Get-ScheduledTaskInfo -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
                 $task = Get-ScheduledTask     -TaskName $smokeName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
+                if ($info) { $lastInfo = $info }
+                if ($task) { $lastTask = $task }
                 if ($info -and $task -and $task.State -ne 'Running' `
-                        -and $info.LastTaskResult -ne 267009 `
-                        -and $null -ne $info.LastRunTime `
-                        -and $info.LastRunTime -gt $smokeStart) {
+                        -and $info.LastTaskResult -ne 267009) {
                     $finalResult = $info.LastTaskResult
                     break
                 }
@@ -1824,7 +1917,13 @@ function Install-UpdatesComponent {
             } elseif ($null -ne $finalResult) {
                 Write-Warn "WhatIf smoke test exited with code $finalResult. Inspect the log above."
             } else {
-                Write-Warn 'WhatIf smoke test did not complete within 10 minutes.'
+                Write-Warn 'WhatIf smoke test did not complete within 5 minutes.'
+                if ($lastTask) { Write-Info "  Last observed State       : $($lastTask.State)" }
+                if ($lastInfo) {
+                    Write-Info "  Last observed LastRunTime : $($lastInfo.LastRunTime)"
+                    Write-Info "  Last observed LastTaskResult: $($lastInfo.LastTaskResult)"
+                }
+                Write-Info "  The registered Updates task is unaffected: Start-ScheduledTask -TaskName '$UpdateTaskName' -TaskPath '$UpdateTaskFolder'"
             }
             if (-not $logFile) {
                 Write-Info 'No Update script log found under C:\Logs\Update-DefenderOffline_*.log. Task may have failed before reaching the script entry point.'
@@ -1860,7 +1959,7 @@ if (-not $isAdmin) {
 Write-Section "Manage-DefenderOffline Installer v$ScriptVersion"
 
 if ($Component -eq 'Downloader') {
-    Write-Fail "Component 'Downloader' is reserved for v0.0.20 (internet-connected staging machine install of Get-DefenderDefinitions.ps1)."
+    Write-Fail "Component 'Downloader' is reserved for a future release (internet-connected staging machine install of Get-DefenderDefinitions.ps1)."
     Write-Info  "Pick one of: Dashboard | Updates | All."
     exit 1
 }

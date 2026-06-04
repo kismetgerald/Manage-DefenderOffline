@@ -39,10 +39,10 @@ Allow remote server management through WinRM`
 In an **elevated PowerShell 7** window on the dashboard host:
 
 ```powershell
-$Zip = "$env:TEMP\manage-defenderoffline-0.0.19.zip"
+$Zip = "$env:TEMP\manage-defenderoffline-0.0.20.zip"
 
 Invoke-WebRequest `
-    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.19/manage-defenderoffline-0.0.19.zip' `
+    -Uri 'https://github.com/kismetgerald/Manage-DefenderOffline/releases/download/v0.0.20/manage-defenderoffline-0.0.20.zip' `
     -OutFile $Zip
 
 Expand-Archive -Path $Zip -DestinationPath 'C:\Tools' -Force
@@ -103,6 +103,37 @@ $cred = Get-Credential `
 ```
 
 ### Option B — gMSA (no password needed)
+
+**Pre-flight (one-time, on the dashboard host):**
+
+```powershell
+# Confirm this host can retrieve the gMSA password. Returns True only if the
+# host (or a security group it's in) is listed in the gMSA's
+# PrincipalsAllowedToRetrieveManagedPassword.
+Test-ADServiceAccount -Identity svc-defender
+```
+
+If `False`, set the retrieval permission from a Domain Admin context — either directly on the host:
+```powershell
+Set-ADServiceAccount -Identity svc-defender `
+    -PrincipalsAllowedToRetrieveManagedPassword $env:COMPUTERNAME$
+```
+…or, better for multi-host deployments, via an AD security group whose `Members` contains the dashboard host(s):
+```powershell
+Set-ADServiceAccount -Identity svc-defender `
+    -PrincipalsAllowedToRetrieveManagedPassword 'CONTOSO\GMSA-DefenderHosts'
+```
+
+Re-run `Test-ADServiceAccount` until it returns True before continuing. Without this, the dashboard scheduled task starts and silently fails with a "Logon failure" entry in Event Viewer — the host has no way to fetch the password.
+
+Then purge cached Kerberos tickets so the install starts from a clean state:
+
+```powershell
+klist purge
+klist purge -li 0x3e7   # System account cache (Task Scheduler runs in System briefly during task startup)
+```
+
+**Install:**
 
 ```powershell
 .\Install-ManageDefender.ps1 `
@@ -171,8 +202,8 @@ the new grant won't take effect until the session expires (~10 min) or the
 connection is recycled.
 
 ```powershell
-Stop-ScheduledTask  -TaskName DefenderDashboard
-Start-ScheduledTask -TaskName DefenderDashboard
+Stop-ScheduledTask  -TaskName Microsoft-Defender-Dashboard
+Start-ScheduledTask -TaskName Microsoft-Defender-Dashboard
 ```
 
 ---
@@ -231,6 +262,41 @@ verify membership directly:
 Get-ADUser CONTOSO\svc-defender -Properties MemberOf |
     Select-Object -ExpandProperty MemberOf
 ```
+
+### Migrating SPNs from a traditional service account to a gMSA
+
+If you previously ran the dashboard under a traditional service account
+and are now cutting over to a gMSA, `setspn -S` on the gMSA will refuse
+with **"Duplicate SPN found"** — SPNs must be unique forest-wide, so the
+same `HTTP/<host>` can't live on two accounts. The cutover is a
+sequential `-D` from the old account, then `-S` to the new — never
+parallel registration.
+
+```powershell
+# 1. Stop the old dashboard task so it can't reissue a session.
+Stop-ScheduledTask -TaskName 'Microsoft-Defender-Dashboard'
+
+# 2. Remove both SPN forms from the old SA.
+setspn -D HTTP/util01                CONTOSO\svc-defender-old
+setspn -D HTTP/util01.contoso.local  CONTOSO\svc-defender-old
+
+# 3. Register on the gMSA (the $ suffix is mandatory).
+setspn -S HTTP/util01                CONTOSO\svc-defender$
+setspn -S HTTP/util01.contoso.local  CONTOSO\svc-defender$
+
+# 4. Verify.
+setspn -L CONTOSO\svc-defender$
+```
+
+Between the `-D` and `-S`, clients hitting the dashboard get a 401 (no
+SPN → no Kerberos ticket). If downtime is unacceptable, do the cutover
+in a maintenance window. After the gMSA-based install starts, browsers
+hit the dashboard via the same FQDN and Negotiate transparently — no
+client-side reconfiguration needed beyond the usual `klist purge` if a
+stale ticket is cached.
+
+If `-S` complains and you're not sure which account holds the conflict,
+`setspn -X` does a forest-wide duplicate scan and names the holder.
 
 ---
 

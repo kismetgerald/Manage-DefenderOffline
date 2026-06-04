@@ -100,7 +100,7 @@ Describe 'Resolve-DashboardCertificate' {
                 Resolve-DashboardCertificate -Thumbprint 'AAAA1111BBBB2222'
                 throw 'expected throw'
             } catch {
-                $_.Exception.Message | Should -Match 'Install-DefenderDashboard.ps1 -UseHttps'
+                $_.Exception.Message | Should -Match 'Install-ManageDefender\.ps1 -Component Dashboard -UseHttps'
             }
         }
     }

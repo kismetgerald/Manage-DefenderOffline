@@ -10,11 +10,20 @@
     or Group Managed Service Account (gMSA). All output is written to a log file;
     no interactive console required.
 
-    Two endpoints are served:
-      /defender   – HTML dashboard (auto-refreshes in the browser)
-      /status     – JSON snapshot of the current data (for scripting / monitoring tools)
-      /health     – Plain-text "OK" liveness probe (for uptime monitors)
-      /refresh    – Forces an immediate background data refresh (GET or POST)
+    Four endpoints are served (auth model in parentheses):
+      /defender   – HTML dashboard, auto-refreshes in the browser (AuthMethod)
+      /status     – JSON snapshot of the current fleet data         (AuthMethod, locked
+                    when AuthMethod=None unless -AllowAnonymousStatus is set)
+      /refresh    – Forces an immediate background data refresh     (same gate as /status)
+      /health     – Plain-text "OK" liveness probe                  (anonymous, always)
+
+    Threat model: /status returns fleet inventory in machine-readable JSON, which
+    is easier for an unauthenticated attacker or curious script to harvest than
+    scraping /defender's HTML. v0.0.20 closes that gap by gating /status and
+    /refresh independently from /defender — when AuthMethod=None they return 403
+    by default. Operators who *want* anonymous /status access (e.g., for a
+    Prometheus or Grafana scraper inside the trust boundary) can opt in with
+    -AllowAnonymousStatus or [Dashboard] AllowAnonymousStatus = true.
 
     Data is cached and refreshed on a background thread every -RefreshInterval seconds.
     Visitors always receive the most recently cached data; they are never blocked waiting
@@ -126,6 +135,14 @@ param(
     [ValidateSet('None', 'ADIntegrated', 'Basic', 'Token')]
     [string]$AuthMethod = 'None',
 
+    # Opt-in to expose /status (and /refresh) without authentication regardless
+    # of -AuthMethod. Default off: when -AuthMethod=None, /status and /refresh
+    # return 403 with a hint pointing to this flag. Set on when a monitoring
+    # scraper (Prometheus, Grafana, custom collector) inside the trust boundary
+    # needs anonymous JSON, and the operator has accepted that anyone on the
+    # network can read fleet state. /health is unaffected (always anonymous).
+    [switch]$AllowAnonymousStatus,
+
     # ADIntegrated only (PR-D2): comma-separated allow list. Prefix entries with
     # '!' to deny (deny wins over allow). Empty allow-list = any authenticated user.
     [string]$AuthAllowedGroups,
@@ -145,7 +162,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.19'
+$ScriptVersion = '0.0.20'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -160,7 +177,12 @@ $LibTestHttpsCertBinding   = Join-Path $ScriptDir 'lib\Test-HttpsCertBinding.ps1
 . $LibTestHttpsCertBinding
 $LibTestUrlAclCollision    = Join-Path $ScriptDir 'lib\Test-UrlAclCollision.ps1'
 . $LibTestUrlAclCollision
+. (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
+
+# Schema versions this script was built against.
+$Script:ExpectedConfigSchemaVersion = 1
+$Script:ExpectedHostsSchemaVersion  = 1
 
 # ===================================================================
 # Credential Helper Mode  (exits after completion)
@@ -272,6 +294,9 @@ if (-not $PSBoundParameters.ContainsKey('AuthAllowedGroups')     -and $cfg['Auth
 if (-not $PSBoundParameters.ContainsKey('AuthBasicUsersFile')    -and $cfg['AuthBasicUsersFile'])    { $AuthBasicUsersFile    = $cfg['AuthBasicUsersFile'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('ADSearchBase')          -and $cfg['ADSearchBase'])          { $ADSearchBase          = $cfg['ADSearchBase'] }
 if (-not $PSBoundParameters.ContainsKey('AuthToken')             -and $cfg['AuthToken'])             { $AuthToken             = $cfg['AuthToken'].Trim() }
+if (-not $PSBoundParameters.ContainsKey('AllowAnonymousStatus')  -and $cfg['AllowAnonymousStatus'])  {
+    if ($cfg['AllowAnonymousStatus'] -match '^(?i)true|1|yes$') { $AllowAnonymousStatus = $true }
+}
 
 # Relative paths in config.conf must resolve against the script directory,
 # not the current working directory — Task Scheduler launches pwsh.exe with
@@ -679,7 +704,12 @@ function Test-DashboardAuth {
         # Resolved allow/deny SID object from Resolve-DashboardAllowedGroups.
         # Optional so Basic/Token/None callers can omit it.
         [pscustomobject]$AllowedGroupSids,
-        [string]$UsersFile
+        [string]$UsersFile,
+
+        # v0.0.20: opt-in to anonymous /status (and /refresh) even when Method=None.
+        # When false (default) and Method=None, those paths return 403 with a
+        # hint pointing to this switch.
+        [switch]$AllowAnonymousStatus
     )
 
     # /health is always anonymous so external monitoring works in every mode.
@@ -690,6 +720,17 @@ function Test-DashboardAuth {
         return [pscustomobject]@{
             Authorized = $true; StatusCode = 200
             User = 'anonymous'; Reason = 'health-bypass'
+        }
+    }
+
+    # v0.0.20 lock-down: /status and /refresh return machine-readable fleet
+    # data (or trigger a fleet poll). When AuthMethod=None they are 403 unless
+    # the operator has explicitly opted in via -AllowAnonymousStatus. /defender
+    # remains open in the same configuration so the UI still works.
+    if ($p -in '/status', '/refresh' -and $Method -eq 'None' -and -not $AllowAnonymousStatus) {
+        return [pscustomobject]@{
+            Authorized = $false; StatusCode = 403
+            User = 'anonymous'; Reason = 'status-locked-no-auth'
         }
     }
 
@@ -2293,6 +2334,17 @@ Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 Write-DashLog "Source share    : $(if ($SourceSharePath) { $SourceSharePath } else { '(none configured)' })"
+
+# Schema version checks (config.conf + hosts.conf). Warnings go through
+# Write-DashLog so they land in both the dashboard log file and the host
+# console — operators inspecting startup behavior see them either way.
+$cfgSchema = Test-SchemaVersion -ConfigData $cfg `
+    -ExpectedVersion $Script:ExpectedConfigSchemaVersion -ArtifactName 'config.conf'
+if ($cfgSchema.Warning) { Write-DashLog $cfgSchema.Warning 'WARN' }
+$hostsSchema = Test-SchemaVersion -HostsFilePath $HostsFile `
+    -ExpectedVersion $Script:ExpectedHostsSchemaVersion -ArtifactName 'hosts.conf'
+if ($hostsSchema.Warning) { Write-DashLog $hostsSchema.Warning 'WARN' }
+
 Write-StartupPhase 'banner'
 
 # ===================================================================
@@ -2401,6 +2453,18 @@ switch ($AuthMethod) {
         Write-DashLog "AuthMethod=None — dashboard is unauthenticated. Anyone with network access to port $Port can view fleet status. Set AuthMethod in conf/config.conf to close this." 'WARN'
     }
 }
+
+# v0.0.20 /status lock-down summary. Logged at INFO when locked (default)
+# and WARN when opted-open via -AllowAnonymousStatus so audit reviewers
+# can grep for the open state.
+if ($AuthMethod -eq 'None') {
+    if ($AllowAnonymousStatus) {
+        Write-DashLog '/status and /refresh are exposed anonymously (-AllowAnonymousStatus is set). Acceptable inside a trust boundary; not safe to expose to untrusted networks.' 'WARN'
+    } else {
+        Write-DashLog '/status and /refresh return 403 because AuthMethod=None. /defender remains open. To expose JSON status to monitoring scrapers, set -AllowAnonymousStatus or [Dashboard] AllowAnonymousStatus = true in conf/config.conf.' 'INFO'
+    }
+}
+
 Write-StartupPhase 'auth_preflight'
 
 # ===================================================================
@@ -2744,11 +2808,12 @@ try {
 
         # ----- Authorization check (before any work) -----
         $authResult = Test-DashboardAuth `
-            -Context           $context `
-            -Method            $AuthMethod `
-            -Token             $AuthToken `
-            -AllowedGroupSids  $script:AdGroupResolution `
-            -UsersFile         $AuthBasicUsersFile
+            -Context              $context `
+            -Method               $AuthMethod `
+            -Token                $AuthToken `
+            -AllowedGroupSids     $script:AdGroupResolution `
+            -UsersFile            $AuthBasicUsersFile `
+            -AllowAnonymousStatus:$AllowAnonymousStatus
 
         # Audit fields. Source IP is captured per-request from the HttpListener
         # context; user identity comes from Test-DashboardAuth (already populated

@@ -96,6 +96,22 @@ SendEmail = false
             { Update-ConfigValue -Path $missing -Section 'X' -Key 'Y' -Value 'Z' } |
                 Should -Throw -ExpectedMessage '*not found*'
         }
+
+        It 'throws a clear actionable message when the file is held exclusively by another process' {
+            # Simulate notepad/editor holding the file open with no shared write access.
+            $fs = [System.IO.File]::Open(
+                $script:TestPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::Read   # blocks the writer
+            )
+            try {
+                { Update-ConfigValue -Path $script:TestPath -Section 'Dashboard' -Key 'Port' -Value '9999' } |
+                    Should -Throw -ExpectedMessage '*Close any editor*'
+            } finally {
+                $fs.Close(); $fs.Dispose()
+            }
+        }
     }
 
     Context 'WhatIf support' {
