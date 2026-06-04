@@ -45,16 +45,13 @@ Same as v0.0.20:
 
 ## Setup
 
-Extract the release bundle on the test endpoint:
+The bundle is extracted at `C:\Temp\MDO-Testing\manage-defenderoffline-0.0.21\`. All scenarios below assume this is the current working directory:
 
 ```powershell
-$bundle = 'C:\Temp\MDO-Testing\manage-defenderoffline-0.0.21.zip'
-$dest   = 'C:\Temp\MDO-Testing\0.0.21'
-Expand-Archive -Path $bundle -DestinationPath $dest -Force
-Set-Location $dest
+Set-Location 'C:\Temp\MDO-Testing\manage-defenderoffline-0.0.21'
 
 # Unblock the extracted files (Mark-of-the-Web from the ZIP download).
-Get-ChildItem $dest -Recurse -File | Unblock-File
+Get-ChildItem -Recurse -File | Unblock-File
 ```
 
 Capture the v0.0.20 cold-start baseline before installing v0.0.21 (only matters if upgrading in place — fresh installs skip this):
