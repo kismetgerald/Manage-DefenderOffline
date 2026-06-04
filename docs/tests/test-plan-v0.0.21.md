@@ -351,6 +351,18 @@ Write-Host "auth_preflight phase total:  $phaseMs ms"
 3. **`auth_summary` bookkeeping correct:** 2 allows + 1 deny + 0 unresolved = 3 input entries, matching the comma-separated list in `conf/config.conf`.
 4. **Helper-level coverage (Pester) is still load-bearing** for future labs that run a non-ADIntegrated mode — the three `DurationMs property` tests in `tests/Auth.Tests.ps1` cover the resolved / unresolved / mixed branches without needing AD to be reachable.
 
+**Phase-total sanity check (sum ≤ phase, with the gap = overhead outside `Translate()`):**
+
+| Restart | `AuthMethod` | `auth_preflight` phase `duration_ms` |
+|---|---|---:|
+| 17:32:50 warm (post-install) | None | 9 |
+| 17:37:16 cold (AtStartup after reboot) | None | 34 |
+| 18:08:27 (post-AuthMethod flip) | ADIntegrated | **118** |
+
+Under ADIntegrated, sum-of-entries = 12 ms (11+1+0); phase total = 118 ms; gap = **106 ms** attributable to (a) `Get-CimInstance Win32_ComputerSystem` domain-join check that runs before allow-list resolution, (b) per-entry overhead (reverse-translate to canonical `DOMAIN\Group`, log emission), and (c) the `auth_summary` log write. The 106 ms gap is consistent with these costs and does not need optimization — `auth_preflight` is no longer a cold-spike phase on this lab. The field-validation memory's "sum ≤ phase total" claim holds.
+
+Operational baseline: enabling `AuthMethod = ADIntegrated` on this lab costs ~110 ms at startup vs `None`. Useful number to cite if anyone asks "what's the cost of switching to ADIntegrated?".
+
 ---
 
 ### v0.0.21e — Regression: v0.0.20 features still work
