@@ -720,7 +720,17 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.20 (2026-06-04) — Current
+### v0.0.20.1 (2026-06-04) — Current
+
+Patch release: closes the one known DX gap carried forward from v0.0.20. No new components, no config changes, no migration path needed.
+
+**Downloader `-WhatIf` support:**
+- 🐛 `Get-DefenderDefinitions.ps1` now declares `[CmdletBinding(SupportsShouldProcess)]` and gates the `Invoke-WebRequest` call with `$PSCmdlet.ShouldProcess(...)`. Operators can now dry-run the downloader (`.\Get-DefenderDefinitions.ps1 -Architecture x64 -WhatIf`) to validate config-merge, proxy resolution, and the existing-folder fast-path without pulling ~200 MB per architecture. WhatIf-mode emits a `[WHATIF] Would download from <url>` breadcrumb per arch, and Out-File / New-Item / Remove-Item operations inherit WhatIf semantics from the cmdlet binding so no manifest, temp folder, or staging file is written.
+- ✅ New `tests/DownloaderWhatIf.Tests.ps1` invokes the script as a child process with `-WhatIf` and asserts (a) `SupportsShouldProcess` is declared in the header, (b) no files land under the output path, (c) the banner + arch list still print so config validation remains useful.
+
+**Why a separate patch:** the v0.0.20 lab pass surfaced this when an operator tried `-WhatIf` to confirm proxy config before a real download. The fix is contained (one cmdlet binding + one ShouldProcess gate + one test) and unblocks a real operator workflow.
+
+### v0.0.20 (2026-06-04)
 
 Polish release: demo feedback from the v0.0.19 operator review (2026-06-02) plus the seven installer / report UX follow-ups carried over from the v0.0.19 lab pass. No new components, no breaking config schema, no migration path needed. Validated end-to-end on a STIG-segmented home lab via a nine-scenario test plan ([docs/tests/test-plan-v0.0.20.md](docs/tests/test-plan-v0.0.20.md)).
 
@@ -753,7 +763,7 @@ Polish release: demo feedback from the v0.0.19 operator review (2026-06-02) plus
 
 **Known gaps carried forward:**
 - gMSA paths remain **field-untested**. No regression — same status as v0.0.19. The work-lab pivot to gMSA during v0.0.19 validated the SPN cutover pattern (added to QUICKSTART) but the gMSA-specific install code path itself is still spec-built only.
-- `Get-DefenderDefinitions.ps1` doesn't declare `[CmdletBinding(SupportsShouldProcess)]` so `-WhatIf` doesn't work. Minor DX gap, deferred to v0.0.20.1.
+- `Get-DefenderDefinitions.ps1` doesn't declare `[CmdletBinding(SupportsShouldProcess)]` so `-WhatIf` doesn't work. Minor DX gap, deferred to v0.0.20.1. *(closed in v0.0.20.1)*
 
 ### v0.0.19 (2026-06-01)
 
