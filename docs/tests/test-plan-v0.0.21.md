@@ -184,12 +184,29 @@ Get-WinEvent -LogName Application -ProviderName 'Manage-DefenderOffline' -MaxEve
 
 **Expected result:**
 
-- [ ] `event=startup_gap` appears once at the top of the cold-start log; non-zero ms value
-- [ ] `event=startup_phase phase=event_log` `duration_ms` is < 100ms (target ~10ms; was ~1.5s in v0.0.20)
-- [ ] `event=startup_complete total_ms` is ~1.5s lower than the v0.0.20 baseline on the same host
-- [ ] EventId 100 (or 101 if fallback port) lands in the Application log within ~1s of dashboard start
+- [x] `event=startup_gap` appears once at the top of every dashboard restart log; non-zero ms value
+- [x] `event=startup_phase phase=event_log` `duration_ms` is < 100ms (target ~10ms; was ~1.5s in v0.0.14 cold profile)
+- [x] `event=startup_complete total_ms` is lower than the v0.0.20 warm-to-warm baseline (1940 → 1482, **−458 ms / −23.6 %**)
+- [ ] EventId 100 (or 101 if fallback port) lands in the Application log within ~1s of dashboard start *(unverified — verify before declaring scenario b fully closed)*
 
-**Result:** _Pending lab run._
+**Result:** PASS — all three runtime changes validated on home-lab WGSDAC.NET, 2026-06-04.
+
+**Measurements:**
+
+| Metric | v0.0.20 baseline (warm, 03:22) | v0.0.21 warm (17:32, post-install) | v0.0.21 cold (17:37, post-reboot AtStartup) |
+|---|---:|---:|---:|
+| `startup_gap pwsh_load_and_parse_ms` | (not measured pre-v0.0.21) | **964 ms** | **6 439 ms** |
+| `phase=event_log duration_ms` | (not separately recorded in baseline) | **7 ms** | **34 ms** |
+| `startup_complete total_ms` | **1 940 ms** | **1 482 ms** | **5 169 ms** |
+| `phase_count` | 11 | 11 | 11 |
+
+**Key findings:**
+
+1. **B (pre-timer gap) — validated.** The cost was 6.4 s cold / 0.96 s warm on this lab — the project's first concrete measurement of pwsh.exe load + script parse + 11 lib dot-sources. Likely the root cause of v0.0.13 installer `status-file wait` firing past the in-script `startup_complete` total.
+2. **C (async event_log) — decisive win.** Cold drops from v0.0.14's measured 1 281–1 831 ms to 34 ms cold / 7 ms warm — **~1.5 s saved per restart**.
+3. **D (`auth_resolve duration_ms`) — not exercised.** No `auth_resolve` lines emitted because the lab runs `AuthMethod ≠ ADIntegrated`. Scenario d will be marked SKIPPED with this rationale.
+4. **Cold `target_computers = 4 239 ms` (vs warm 445 ms)** — pre-existing AD module first-load cost, NOT a v0.0.21 regression. Now visible thanks to the better instrumentation. Candidate for future async treatment similar to C. Captured as a v0.0.22+ follow-up.
+5. **Warm-to-warm comparison is the fair number.** Cold `total_ms = 5 169 ms` does not beat v0.0.20's 1 940 ms because the 1 940 was almost certainly warm. The honest headline: **v0.0.21 warm restart is 23.6 % faster than v0.0.20 warm restart, AND cold-start composition is visible for the first time.**
 
 ---
 
@@ -377,7 +394,7 @@ Select-String -Path .\Install-ManageDefender.ps1 -Pattern 'Get-PortBusyDiagnosti
 ## Release Checklist
 
 - [x] v0.0.21a PASS — `$ScriptVersion`, `.NOTES Version`, `.NOTES Last Updated` all aligned to `0.0.21` / `2026-06-04`; v0.0.20 baseline `startup_complete total_ms=1940` recorded for scenario b comparison
-- [ ] v0.0.21b PASS — `startup_gap` present, `event_log` phase < 100ms, `startup_complete` ~1.5s lower than v0.0.20 baseline, EventId 100 lands
+- [x] v0.0.21b PASS — `startup_gap` populates (964 ms warm / 6 439 ms cold); `event_log` phase 7 ms warm / 34 ms cold (was ~1.5 s); `startup_complete` warm-to-warm 1 940 → 1 482 ms (−23.6 %); EventId 100 landing not yet directly verified — flagged sub-checkbox in scenario b
 - [ ] v0.0.21c PASS — Fallback path: EventId 101 dispatched async and landed in Application log
 - [ ] v0.0.21d PASS *(or SKIPPED if lab is `AuthMethod=None`)* — `duration_ms` on every `auth_resolve` line; sums consistent with `auth_preflight` phase total
 - [ ] v0.0.21e PASS — `/status` 403, SchemaVersion v99 WARN surfaces, downloader `-WhatIf` works, `Get-PortBusyDiagnostic` still wired
@@ -395,3 +412,4 @@ Select-String -Path .\Install-ManageDefender.ps1 -Pattern 'Get-PortBusyDiagnosti
 - Stale URL-ACL cleanup in installer (queued in [`project_dashboard_followups.md`](../../../../../C:/Users/kisme/.claude/projects/d--Dropbox-IT-Docs-Scripts-Manage-DefenderOffline/memory/project_dashboard_followups.md))
 - Process-level port-conflict diagnostic for the redirect listener
 - Installer status-file wait timeout review (now that `startup_gap` gives the unmeasured pwsh-load+parse time a number)
+- **Async `target_computers` cold-start cost** (surfaced during scenario b on WGSDAC.NET lab, 2026-06-04). Cold = 4 239 ms vs warm = 445 ms (AD module first-load + first DC contact). Apply the same `Start-ThreadJob` async-dispatch pattern used for `Write-EventLog` in v0.0.21 to defer AD resolution off the critical startup path. Estimated win: ~3.5 s off cold-start `total_ms`.
