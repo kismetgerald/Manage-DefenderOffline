@@ -78,6 +78,14 @@
     conf/SmtpCredential.xml under the service identity's DPAPI. Only relevant when
     [Email] SendEmail = true in conf/config.conf.
 
+.PARAMETER ForcePromptCredentials
+    Force a fresh credential prompt for every needed credential, even when an
+    existing conf/<Name>Credential.xml validates under the service identity's
+    DPAPI. Default (v0.0.22+): existing XMLs are reused silently — operators
+    are NOT re-prompted on every -Force re-install. Set this switch when
+    rotating credentials so the prompt fires for each one. Has no effect on
+    pre-supplied credentials (-<Name>Credential parameters always win).
+
 .PARAMETER WinRmUsername
     Pre-populates the username field of the WinRM credential prompt (operator just
     types the password). Priority: CLI > [Credentials] WinRmUsername in config > blank.
@@ -227,6 +235,13 @@ param(
     [pscredential]$AdCredential,
     [pscredential]$SmtpCredential,
 
+    # Force a fresh credential prompt even when conf/*Credential.xml already
+    # exists and validates under the service identity's DPAPI. Default
+    # (v0.0.22+): existing XMLs are reused silently — operators are not
+    # re-prompted on every -Force re-install. Set this switch when
+    # rotating credentials so the prompt fires for each one.
+    [switch]$ForcePromptCredentials,
+
     # Pre-population for the username field of each Get-Credential prompt.
     # Priority: CLI > [Credentials] *Username keys in config > blank.
     [string]$WinRmUsername,
@@ -236,7 +251,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.21'
+$ScriptVersion = '0.0.22'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Shared helper modules (dot-sourced; same chokepoint pattern as the other scripts).
@@ -508,12 +523,27 @@ function Get-CredentialSaveHelperPath {
     Join-Path $ScriptDir 'lib\Save-ServiceCredential.ps1'
 }
 
+function Get-CredentialTestHelperPath {
+    Join-Path $ScriptDir 'lib\Test-ServiceCredential.ps1'
+}
+
 function Initialize-CredentialSaveHelper {
     # Verifies the bundled helper script exists. Shipped as a real file at
     # lib\Save-ServiceCredential.ps1 so it's version-controlled and reviewable;
     # this function exists only to fail fast with a clear error if the bundle
     # is incomplete.
     $helperPath = Get-CredentialSaveHelperPath
+    if (-not (Test-Path -LiteralPath $helperPath)) {
+        throw "Missing required helper: $helperPath`nThe install bundle appears incomplete. Re-extract the manage-defenderoffline-X.Y.Z.zip artifact and try again."
+    }
+}
+
+function Initialize-CredentialTestHelper {
+    # Mirror of Initialize-CredentialSaveHelper for the validation path.
+    # Verifies lib\Test-ServiceCredential.ps1 ships in the bundle so the
+    # operator gets a fast, clear error if extraction was incomplete rather
+    # than an opaque Start-Process failure deep inside the validation loop.
+    $helperPath = Get-CredentialTestHelperPath
     if (-not (Test-Path -LiteralPath $helperPath)) {
         throw "Missing required helper: $helperPath`nThe install bundle appears incomplete. Re-extract the manage-defenderoffline-X.Y.Z.zip artifact and try again."
     }
@@ -752,6 +782,168 @@ function Save-ServiceCredential {
     }
 }
 
+# ===================================================================
+# Credential validation (v0.0.22 — credential XML reuse)
+#
+# Mirror of the save infrastructure for the "is this XML still good?"
+# check. Goal: when an operator re-runs the installer with -Force (for
+# a port change, schedule tweak, etc.), don't re-prompt for credentials
+# that already exist and decrypt cleanly under the current service
+# identity's DPAPI master key.
+#
+# Validity = the helper script can Import-Clixml the XML and unwrap its
+# password. That implicitly proves the service identity hasn't changed
+# (DPAPI scoping); no explicit username comparison is needed.
+#
+# The seclogon dance (or one-shot scheduled task for gMSA) wraps both
+# validation and save in the same window — one enable/restore cycle
+# covers all credentials regardless of how many need re-prompting.
+# ===================================================================
+function Invoke-ValidationAsServiceIdentity {
+    # Runs lib\Test-ServiceCredential.ps1 in the service identity's
+    # context. Returns $true if the helper exits 0 (XML decrypted),
+    # $false otherwise. Parallel structure to Invoke-AsServiceIdentity
+    # but with the simpler test-only argument shape.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$XmlPath,
+        [Parameter(Mandatory)] [bool]$IsGmsa,
+        [string]$ServiceAccountName,
+        [pscredential]$ServiceAccountCredential,
+        [string]$GmsaAccountName
+    )
+
+    $helperPath = Get-CredentialTestHelperPath
+    $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
+    if (-not $pwshPath) {
+        Write-Fail 'pwsh.exe not in PATH — cannot launch credential validation helper.'
+        return $false
+    }
+
+    $argList = @(
+        '-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', "`"$helperPath`"",
+        '-SourcePath', "`"$XmlPath`""
+    )
+
+    if (-not $IsGmsa) {
+        # Traditional service account: Start-Process -Credential.
+        # Validation logs are short-lived; the side log only fires on
+        # failure and is read + deleted in finally.
+        $stdoutLog = Join-Path $ScriptDir ('.credtest.{0}.out.log' -f [guid]::NewGuid().ToString('N'))
+        $stderrLog = Join-Path $ScriptDir ('.credtest.{0}.err.log' -f [guid]::NewGuid().ToString('N'))
+        try {
+            $proc = Start-Process -FilePath $pwshPath `
+                -ArgumentList ($argList -join ' ') `
+                -Credential $ServiceAccountCredential `
+                -WorkingDirectory $ScriptDir `
+                -WindowStyle Hidden `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $stdoutLog `
+                -RedirectStandardError  $stderrLog `
+                -ErrorAction Stop
+            return ($proc.ExitCode -eq 0)
+        } catch {
+            # Surface the launch failure as INFO (this is a validation
+            # attempt, not a required save); caller will fall through to
+            # the prompt path.
+            Write-Info "Credential validation helper could not be launched: $($_.Exception.Message)"
+            return $false
+        } finally {
+            foreach ($p in @($stdoutLog, $stderrLog, ($XmlPath + '.err'))) {
+                if ($p -and (Test-Path -LiteralPath $p)) {
+                    Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    # gMSA path: one-shot scheduled task running as the gMSA. Spec-built
+    # for symmetry with Invoke-AsServiceIdentity; field-untested as of
+    # v0.0.22 (gMSA paths broadly remain untested per
+    # memory:project-gmsa-untested). Same pattern: register, trigger,
+    # poll for exit, unregister.
+    $taskName = "Manage-DefenderOffline-CredTest-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    try {
+        $action = New-ScheduledTaskAction `
+            -Execute  $pwshPath `
+            -Argument ($argList -join ' ') `
+            -WorkingDirectory $ScriptDir
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(30)
+        $settings = New-ScheduledTaskSettingsSet `
+            -ExecutionTimeLimit ([timespan]::FromMinutes(2)) `
+            -StartWhenAvailable `
+            -DontStopIfGoingOnBatteries `
+            -AllowStartIfOnBatteries
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId   $GmsaAccountName `
+            -LogonType Password `
+            -RunLevel Highest
+
+        Register-ScheduledTask `
+            -TaskName    $taskName `
+            -TaskPath    '\Manage-DefenderOffline\' `
+            -Action      $action `
+            -Trigger     $trigger `
+            -Settings    $settings `
+            -Principal   $principal `
+            -Description "One-shot helper: validate credential XML under gMSA identity." `
+            -Force | Out-Null
+
+        Start-ScheduledTask -TaskName $taskName -TaskPath '\Manage-DefenderOffline\'
+
+        $deadline = (Get-Date).AddSeconds(30)
+        do {
+            Start-Sleep -Seconds 1
+            $info = Get-ScheduledTaskInfo -TaskName $taskName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
+            if ($info) {
+                $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\Manage-DefenderOffline\' -ErrorAction SilentlyContinue
+                if ($task -and $task.State -ne 'Running' -and $info.LastTaskResult -ne 267009) {
+                    return ($info.LastTaskResult -eq 0)
+                }
+            }
+        } while ((Get-Date) -lt $deadline)
+        return $false
+    } catch {
+        Write-Info "gMSA credential validation task could not be set up: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Unregister-ScheduledTask -TaskName $taskName -TaskPath '\Manage-DefenderOffline\' `
+            -Confirm:$false -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath ($XmlPath + '.err')) {
+            Remove-Item -LiteralPath ($XmlPath + '.err') -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-ServiceCredential {
+    # Higher-level wrapper around Invoke-ValidationAsServiceIdentity. Returns
+    # $true when the XML at $XmlPath can be decrypted as the service identity.
+    # Does NOT throw on missing XML or decryption failure — those are normal
+    # outcomes that the caller turns into a re-prompt.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$XmlPath,
+        [Parameter(Mandatory)] [bool]$IsGmsa,
+        [string]$ServiceAccountName,
+        [pscredential]$ServiceAccountCredential,
+        [string]$GmsaAccountName
+    )
+    if (-not (Test-Path -LiteralPath $XmlPath)) { return $false }
+    try {
+        return [bool](Invoke-ValidationAsServiceIdentity `
+            -XmlPath                  $XmlPath `
+            -IsGmsa                   $IsGmsa `
+            -ServiceAccountName       $ServiceAccountName `
+            -ServiceAccountCredential $ServiceAccountCredential `
+            -GmsaAccountName          $GmsaAccountName)
+    } catch {
+        Write-Info "Test-ServiceCredential ($XmlPath): $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Get-CredentialPlanForComponent {
     # Returns the set of credentials the chosen Component(s) actually need.
     # Used to decide which prompts to issue and which XMLs to expect post-install.
@@ -880,7 +1072,19 @@ function ConvertTo-UpdateTaskTrigger {
 function Initialize-ServiceCredentials {
     # Top-level orchestrator. Returns $true on overall success (no required
     # credential failed). Handles -SkipCredentialSetup, STIG seclogon
-    # state, prompting, saving, and restoration.
+    # state, validation-first reuse (v0.0.22), prompting, saving, and
+    # restoration.
+    #
+    # v0.0.22 flow:
+    #   1. Plan which credentials are needed for the chosen Component.
+    #   2. Seclogon dance (enable + confirm if not -Force).
+    #   3. For each needed credential, in precedence order:
+    #        a. Pre-supplied via -<Name>Credential          → use it, queue for save
+    #        b. -ForcePromptCredentials                      → prompt, queue for save
+    #        c. Existing XML validates as the service ID    → SKIP (no save)
+    #        d. Existing XML invalid OR absent              → WARN if invalid; prompt, queue for save
+    #   4. If anything queued, save inside the still-enabled seclogon window.
+    #   5. Restore seclogon.
     param(
         [Parameter(Mandatory)] [string]$Component,
         [Parameter(Mandatory)] [string]$IdentityLabel,
@@ -897,7 +1101,8 @@ function Initialize-ServiceCredentials {
         [string]$AdUsername,
         [string]$SmtpUsername,
         [bool]$Skip,
-        [bool]$Force
+        [bool]$Force,
+        [bool]$ForcePromptCredentials
     )
 
     $plan = Get-CredentialPlanForComponent -Component $Component -Config $Config
@@ -937,55 +1142,19 @@ function Initialize-ServiceCredentials {
         Write-Host ''
     }
 
-    # ----- Gather (prompt or use pre-supplied) -----
-    # Prompts pre-populate the username field from -*Username (CLI) or the
-    # [Credentials] *Username keys in conf/config.conf. Format hints in the
-    # prompt message: DOMAIN\username or username@domain.tld.
-    $toSave = [System.Collections.Generic.List[object]]::new()
-    $fmtHint = '  (format: DOMAIN\username or username@domain.tld)'
-    if ($plan.WinRm) {
-        $c = if ($PreSuppliedWinRm) { $PreSuppliedWinRm } else {
-            $msg = "WinRM credential - used by the scheduled tasks to query endpoint Defender state.$fmtHint"
-            if ($WinRmUsername) { Get-Credential -UserName $WinRmUsername -Message $msg }
-            else                 { Get-Credential                          -Message $msg }
-        }
-        if (-not $c) { Write-Fail 'WinRM credential prompt cancelled.'; return $false }
-        $toSave.Add([pscustomobject]@{
-            Name = 'WinRm'; Credential = $c
-            Destination = Join-Path $ConfFolder 'WinRmCredential.xml'
-        })
-    }
-    if ($plan.AD) {
-        $c = if ($PreSuppliedAd) { $PreSuppliedAd } else {
-            $msg = "AD credential - used for AD-based fleet discovery and Negotiate auth context.$fmtHint"
-            if ($AdUsername) { Get-Credential -UserName $AdUsername -Message $msg }
-            else              { Get-Credential                       -Message $msg }
-        }
-        if (-not $c) { Write-Fail 'AD credential prompt cancelled.'; return $false }
-        $toSave.Add([pscustomobject]@{
-            Name = 'AD'; Credential = $c
-            Destination = Join-Path $ConfFolder 'ADCredential.xml'
-        })
-    }
-    if ($plan.Smtp) {
-        $c = if ($PreSuppliedSmtp) { $PreSuppliedSmtp } else {
-            # SMTP format varies by relay (often user@domain.tld); show a relay-aware hint.
-            $smtpHint = '  (format: depends on your SMTP relay - often user@domain.tld)'
-            $msg = "SMTP credential - used by the Updates task to send notification emails.$smtpHint"
-            if ($SmtpUsername) { Get-Credential -UserName $SmtpUsername -Message $msg }
-            else                { Get-Credential                         -Message $msg }
-        }
-        if (-not $c) { Write-Fail 'SMTP credential prompt cancelled.'; return $false }
-        $toSave.Add([pscustomobject]@{
-            Name = 'Smtp'; Credential = $c
-            Destination = Join-Path $ConfFolder 'SmtpCredential.xml'
-        })
-    }
-
-    # ----- Make sure the helper script exists -----
+    # ----- Make sure the helper scripts exist -----
+    # Fail fast if the install bundle is incomplete. Both helpers are
+    # version-controlled real files in lib/.
     Initialize-CredentialSaveHelper
+    Initialize-CredentialTestHelper
 
     # ----- STIG V-253289 seclogon dance -----
+    #
+    # v0.0.22: pulled forward of the prompt phase. Validation (Test-Path
+    # + Import-Clixml as the service identity) and save both require
+    # seclogon for traditional service accounts, so we wrap both inside
+    # the same enable/restore cycle — one dance covers everything,
+    # regardless of how many credentials end up needing re-prompts.
     $seclogonInfo = Test-SecondaryLogonService
     $needsRestore = $false
     $originalSeclogonStatus    = $null
@@ -1049,21 +1218,138 @@ function Initialize-ServiceCredentials {
         }
     }
 
-    # ----- Save each credential -----
+    # Wrap everything that follows in a try/finally so the seclogon
+    # restoration runs even if validation or save throws unexpectedly.
     $allOk = $true
     try {
-        foreach ($item in $toSave) {
-            Write-Step "Saving $($item.Name) credential as $IdentityLabel…"
-            $ok = Save-ServiceCredential `
-                -CredentialName            $item.Name `
-                -Credential                $item.Credential `
-                -DestinationPath           $item.Destination `
-                -IsGmsa                    $IsGmsa `
-                -ServiceAccountName        $ServiceAccountName `
-                -ServiceAccountCredential  $ServiceAccountCredential `
-                -GmsaAccountName           $GmsaAccountName `
-                -ConfFolder                $ConfFolder
-            if (-not $ok) { $allOk = $false }
+        # ----- Validation-first, prompt-or-reuse loop (v0.0.22) -----
+        #
+        # Each plan slot resolves to one of three outcomes:
+        #   - QUEUE FOR SAVE with a freshly-collected PSCredential (prompt
+        #     fired, or pre-supplied via parameter)
+        #   - REUSE the existing on-disk XML (validation passed)
+        #   - ABORT (operator cancelled a Get-Credential prompt)
+        $toSave = [System.Collections.Generic.List[object]]::new()
+        $fmtHint = '  (format: DOMAIN\username or username@domain.tld)'
+
+        # Inline helper closure: encapsulates the precedence chain so each
+        # plan slot uses the same logic. Returns the PSCredential to save,
+        # OR $null when we're reusing the on-disk XML, OR throws on
+        # operator cancellation (caught below).
+        $resolveCred = {
+            param($Name, $PreSupplied, $UsernameHint, $Destination, $PromptMsg)
+
+            # 1) Pre-supplied via -<Name>Credential parameter wins
+            #    unconditionally — operator's explicit choice.
+            if ($PreSupplied) {
+                Write-Info "$Name credential: using pre-supplied (-${Name}Credential parameter)."
+                return @{ Save = $true; Cred = $PreSupplied }
+            }
+
+            # 2) -ForcePromptCredentials: skip validation, always prompt.
+            if ($ForcePromptCredentials) {
+                Write-Info "$Name credential: -ForcePromptCredentials set; prompting for fresh value."
+                $c = if ($UsernameHint) { Get-Credential -UserName $UsernameHint -Message $PromptMsg }
+                     else                { Get-Credential                          -Message $PromptMsg }
+                if (-not $c) { throw "$Name credential prompt cancelled." }
+                return @{ Save = $true; Cred = $c }
+            }
+
+            # 3) Existing XML — validate as service identity. If it
+            #    decrypts cleanly we reuse silently (zero prompts).
+            if (Test-Path -LiteralPath $Destination) {
+                Write-Step "Validating existing $Name credential ($([System.IO.Path]::GetFileName($Destination)))…"
+                $valid = Test-ServiceCredential `
+                    -XmlPath                  $Destination `
+                    -IsGmsa                   $IsGmsa `
+                    -ServiceAccountName       $ServiceAccountName `
+                    -ServiceAccountCredential $ServiceAccountCredential `
+                    -GmsaAccountName          $GmsaAccountName
+                if ($valid) {
+                    $mtime = (Get-Item -LiteralPath $Destination).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+                    Write-Ok "$Name credential: reusing existing XML (saved $mtime). Set -ForcePromptCredentials to rotate."
+                    return @{ Save = $false; Cred = $null }
+                }
+                Write-Warn "$Name credential: existing $([System.IO.Path]::GetFileName($Destination)) could not be decrypted as $IdentityLabel (likely saved under a different identity or corrupted). Re-prompting and overwriting."
+            }
+
+            # 4) Missing or invalid — prompt + queue for save.
+            $c = if ($UsernameHint) { Get-Credential -UserName $UsernameHint -Message $PromptMsg }
+                 else                { Get-Credential                          -Message $PromptMsg }
+            if (-not $c) { throw "$Name credential prompt cancelled." }
+            return @{ Save = $true; Cred = $c }
+        }
+
+        # WinRM credential
+        if ($plan.WinRm) {
+            try {
+                $r = & $resolveCred 'WinRm' $PreSuppliedWinRm $WinRmUsername `
+                    (Join-Path $ConfFolder 'WinRmCredential.xml') `
+                    ("WinRM credential - used by the scheduled tasks to query endpoint Defender state.$fmtHint")
+                if ($r.Save) {
+                    $toSave.Add([pscustomobject]@{
+                        Name = 'WinRm'; Credential = $r.Cred
+                        Destination = Join-Path $ConfFolder 'WinRmCredential.xml'
+                    })
+                }
+            } catch {
+                Write-Fail $_.Exception.Message
+                return $false
+            }
+        }
+        # AD credential
+        if ($plan.AD) {
+            try {
+                $r = & $resolveCred 'AD' $PreSuppliedAd $AdUsername `
+                    (Join-Path $ConfFolder 'ADCredential.xml') `
+                    ("AD credential - used for AD-based fleet discovery and Negotiate auth context.$fmtHint")
+                if ($r.Save) {
+                    $toSave.Add([pscustomobject]@{
+                        Name = 'AD'; Credential = $r.Cred
+                        Destination = Join-Path $ConfFolder 'ADCredential.xml'
+                    })
+                }
+            } catch {
+                Write-Fail $_.Exception.Message
+                return $false
+            }
+        }
+        # SMTP credential
+        if ($plan.Smtp) {
+            $smtpHint = '  (format: depends on your SMTP relay - often user@domain.tld)'
+            try {
+                $r = & $resolveCred 'Smtp' $PreSuppliedSmtp $SmtpUsername `
+                    (Join-Path $ConfFolder 'SmtpCredential.xml') `
+                    ("SMTP credential - used by the Updates task to send notification emails.$smtpHint")
+                if ($r.Save) {
+                    $toSave.Add([pscustomobject]@{
+                        Name = 'Smtp'; Credential = $r.Cred
+                        Destination = Join-Path $ConfFolder 'SmtpCredential.xml'
+                    })
+                }
+            } catch {
+                Write-Fail $_.Exception.Message
+                return $false
+            }
+        }
+
+        # ----- Save each newly-collected credential -----
+        if ($toSave.Count -eq 0) {
+            Write-Ok 'All needed credentials validated; No credential prompts needed (existing XMLs validated).'
+        } else {
+            foreach ($item in $toSave) {
+                Write-Step "Saving $($item.Name) credential as $IdentityLabel…"
+                $ok = Save-ServiceCredential `
+                    -CredentialName            $item.Name `
+                    -Credential                $item.Credential `
+                    -DestinationPath           $item.Destination `
+                    -IsGmsa                    $IsGmsa `
+                    -ServiceAccountName        $ServiceAccountName `
+                    -ServiceAccountCredential  $ServiceAccountCredential `
+                    -GmsaAccountName           $GmsaAccountName `
+                    -ConfFolder                $ConfFolder
+                if (-not $ok) { $allOk = $false }
+            }
         }
     } finally {
         if ($needsRestore) {
@@ -2071,7 +2357,8 @@ $credentialsOk = Initialize-ServiceCredentials `
     -AdUsername                $AdUsername `
     -SmtpUsername              $SmtpUsername `
     -Skip                      $SkipCredentialSetup.IsPresent `
-    -Force                     $Force.IsPresent
+    -Force                     $Force.IsPresent `
+    -ForcePromptCredentials    $ForcePromptCredentials.IsPresent
 if (-not $credentialsOk) {
     Write-Fail 'One or more credential saves failed. Aborting before scheduled task registration.'
     exit 1
