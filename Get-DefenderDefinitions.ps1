@@ -88,7 +88,7 @@
     Last Updated   : 2026-05-26
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$OutputPath,
 
@@ -110,7 +110,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.20'
+$ScriptVersion = '0.0.20.1'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 . (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
@@ -363,6 +363,16 @@ try {
         }
 
         Write-Host '     Downloading…' -ForegroundColor White
+
+        # -WhatIf: skip the network call (and the rest of the per-arch
+        # work that depends on the downloaded file) so an operator can
+        # validate config, proxy resolution, and the existing-folder
+        # fast-path without pulling ~200 MB per architecture.
+        if (-not $PSCmdlet.ShouldProcess($url, "Download mpam-fe.exe ($arch)")) {
+            Write-Host "     [WHATIF] Would download from $url" -ForegroundColor Yellow
+            Write-Host "              -> $tempFile" -ForegroundColor DarkGray
+            continue
+        }
 
         try {
             # -UseBasicParsing keeps the IE engine out of the loop (deprecated
