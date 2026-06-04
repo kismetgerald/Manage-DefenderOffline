@@ -45,14 +45,16 @@ Same as v0.0.20:
 
 ## Setup
 
-The bundle is extracted at `C:\Temp\MDO-Testing\manage-defenderoffline-0.0.21\`. All scenarios below assume this is the current working directory:
+The bundle was extracted to `C:\Temp\MDO-Testing\manage-defenderoffline-0.0.21\` via Explorer's "Extract All", which nests the zip's own `manage-defenderoffline/` root folder one level inside. Final working directory:
 
 ```powershell
-Set-Location 'C:\Temp\MDO-Testing\manage-defenderoffline-0.0.21'
+Set-Location 'C:\Temp\MDO-Testing\manage-defenderoffline-0.0.21\manage-defenderoffline'
 
 # Unblock the extracted files (Mark-of-the-Web from the ZIP download).
 Get-ChildItem -Recurse -File | Unblock-File
 ```
+
+All scenarios below assume this is the current working directory.
 
 Capture the v0.0.20 cold-start baseline before installing v0.0.21 (only matters if upgrading in place — fresh installs skip this):
 
@@ -119,13 +121,13 @@ Select-String -Path .\Start-DefenderDashboard.ps1 -Pattern 'event=startup_gap|St
 
 **Expected result:**
 
-- [ ] `$ScriptVersion = '0.0.21'` in all five scripts
-- [ ] `.NOTES Version : 0.0.21` in 4 scripts
-- [ ] `.NOTES Last Updated : 2026-06-04` in 4 scripts
-- [ ] `Get-Help` output shows the bumped Version
-- [ ] All three new code paths (B/C/D) present in `Start-DefenderDashboard.ps1` source
+- [x] `$ScriptVersion = '0.0.21'` in all five scripts
+- [x] `.NOTES Version : 0.0.21` in 4 scripts
+- [x] `.NOTES Last Updated : 2026-06-04` in 4 scripts
+- [x] `Get-Help` output shows the bumped Version
+- [x] All three new code paths (B/C/D) present in `Start-DefenderDashboard.ps1` source — `event=startup_gap` at line 2343, `Start-ThreadJob` for async EventLog at line 2757, `DurationMs =` at line 630
 
-**Result:** _Pending lab run._
+**Result:** PASS on bundle `manage-defenderoffline-0.0.21.zip`. v0.0.20 cold-start baseline captured concurrently for scenario b comparison: `event=startup_complete total_ms=1940 phase_count=11` (from `DefenderDashboard_20260604.log` line 83, last v0.0.20.1 restart at 03:22:09).
 
 ---
 
@@ -374,7 +376,7 @@ Select-String -Path .\Install-ManageDefender.ps1 -Pattern 'Get-PortBusyDiagnosti
 
 ## Release Checklist
 
-- [ ] v0.0.21a PASS — `$ScriptVersion`, `.NOTES Version`, `.NOTES Last Updated` all aligned to `0.0.21` / `2026-06-04`
+- [x] v0.0.21a PASS — `$ScriptVersion`, `.NOTES Version`, `.NOTES Last Updated` all aligned to `0.0.21` / `2026-06-04`; v0.0.20 baseline `startup_complete total_ms=1940` recorded for scenario b comparison
 - [ ] v0.0.21b PASS — `startup_gap` present, `event_log` phase < 100ms, `startup_complete` ~1.5s lower than v0.0.20 baseline, EventId 100 lands
 - [ ] v0.0.21c PASS — Fallback path: EventId 101 dispatched async and landed in Application log
 - [ ] v0.0.21d PASS *(or SKIPPED if lab is `AuthMethod=None`)* — `duration_ms` on every `auth_resolve` line; sums consistent with `auth_preflight` phase total
