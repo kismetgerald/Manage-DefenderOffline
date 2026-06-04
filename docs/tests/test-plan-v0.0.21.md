@@ -259,11 +259,15 @@ Start-ScheduledTask -TaskName 'Microsoft-Defender-Dashboard'
 
 **Expected result:**
 
-- [ ] Dashboard log shows `EventId 101 dispatched async` (WARN level — fallback path)
-- [ ] EventId 101 lands in Application log with the FALLBACK port message
-- [ ] After cleanup, dashboard rebinds to primary port on the next restart
+- [~] Dashboard log shows `EventId 101 dispatched async` (WARN level — fallback path) *(SKIPPED — see below)*
+- [~] EventId 101 lands in Application log with the FALLBACK port message *(SKIPPED — see below)*
+- [~] After cleanup, dashboard rebinds to primary port on the next restart *(SKIPPED — see below)*
 
-**Result:** _Pending lab run._
+**Result:** SKIPPED on home-lab WGSDAC.NET, 2026-06-04 — the lab runs `UseHttps = true`, and HTTPS deliberately disables port fallback (the cert is bound to a specific `ipport` via `netsh http add sslcert`; falling back to a different port leaves the cert unbound and `HttpListener.Start()` fails with TLS handshake errors). The fallback / EventId 101 path is structurally unreachable until this lab is switched to HTTP, which is not a meaningful operational state for this deployment.
+
+**Coverage rationale:** the EventId 101 code path uses the *same* `Start-ThreadJob` dispatch + identical `Write-EventLog` invocation pattern as the EventId 100 path validated in scenario b. The only differences are `$evtId = 101`, `$evtType = 'Warning'`, and the message string. Scenario b validated the async dispatch mechanism end-to-end (warm and cold, with EventId 100 landing 1–2 s after `startup_complete`). The 101 branch has no async-specific risk that the 100 branch did not exercise; coverage by inference is acceptable here.
+
+**Future coverage:** if a non-HTTPS lab becomes available (or this lab is switched to HTTP for some other reason), re-run this scenario as written.
 
 ---
 
@@ -322,12 +326,16 @@ Write-Host "auth_preflight phase total:  $phaseMs ms"
 
 **Expected result:**
 
-- [ ] Every `event=auth_resolve` line ends with `duration_ms=<N>` where N is a non-negative integer
-- [ ] BUILTIN entries (cached locally) typically resolve in <10ms
-- [ ] Domain entries hitting a DC may take 50-500ms cold, less when warm
-- [ ] Sum of per-entry durations <= `auth_preflight` phase total
+- [~] Every `event=auth_resolve` line ends with `duration_ms=<N>` where N is a non-negative integer *(SKIPPED — see below)*
+- [~] BUILTIN entries (cached locally) typically resolve in <10ms *(SKIPPED — see below)*
+- [~] Domain entries hitting a DC may take 50-500ms cold, less when warm *(SKIPPED — see below)*
+- [~] Sum of per-entry durations <= `auth_preflight` phase total *(SKIPPED — see below)*
 
-**Result:** _Pending lab run; skipped if lab runs `AuthMethod=None`._
+**Result:** SKIPPED on home-lab WGSDAC.NET, 2026-06-04 — the lab does not run `AuthMethod = ADIntegrated`. Confirmed by the absence of any `event=auth_resolve` lines in scenario b's dashboard logs (the line is only emitted when `Resolve-DashboardAllowedGroups` runs at startup, which is gated to the ADIntegrated mode). The `DurationMs` code path is not reached at runtime on this lab.
+
+**Coverage rationale:** the `DurationMs` field is validated at the helper level by three dedicated tests in `tests/Auth.Tests.ps1` (Context: `DurationMs property (v0.0.21 auth_preflight sub-instrumentation)`) — covering resolved entries, unresolved entries, and a mixed allow + deny + unresolved set. The change is a `[System.Diagnostics.Stopwatch]` wrapped around the existing `NTAccount.Translate()` call plus an additive property on the returned `[pscustomobject]`; the runtime risk surface is correctness of the timing math (covered by `BeGreaterOrEqual 0` + `BeOfType [int]`) and the log-format string (deterministic `-f` format operator). No runtime risk that the unit tests don't exercise.
+
+**Future coverage:** if this lab adopts ADIntegrated auth (or a different lab uses it), re-run this scenario to validate the `duration_ms=` field appears in the per-entry `event=auth_resolve` lines as designed.
 
 ---
 
@@ -395,8 +403,8 @@ Select-String -Path .\Install-ManageDefender.ps1 -Pattern 'Get-PortBusyDiagnosti
 
 - [x] v0.0.21a PASS — `$ScriptVersion`, `.NOTES Version`, `.NOTES Last Updated` all aligned to `0.0.21` / `2026-06-04`; v0.0.20 baseline `startup_complete total_ms=1940` recorded for scenario b comparison
 - [x] v0.0.21b PASS — `startup_gap` populates (964 ms warm / 6 439 ms cold); `event_log` phase 7 ms warm / 34 ms cold (was ~1.5 s); `startup_complete` warm-to-warm 1 940 → 1 482 ms (−23.6 %); EventId 100 lands ~1–2 s after `startup_complete` (warm and cold both verified)
-- [ ] v0.0.21c PASS — Fallback path: EventId 101 dispatched async and landed in Application log
-- [ ] v0.0.21d PASS *(or SKIPPED if lab is `AuthMethod=None`)* — `duration_ms` on every `auth_resolve` line; sums consistent with `auth_preflight` phase total
+- [~] v0.0.21c SKIPPED — HTTPS lab (`UseHttps = true`) disables port fallback by design; EventId 101 path structurally unreachable. Coverage by inference from scenario b (same `Start-ThreadJob` dispatch + identical `Write-EventLog` pattern; only differences are `Id`, `Type`, and message string).
+- [~] v0.0.21d SKIPPED — lab is not on `AuthMethod = ADIntegrated` (confirmed by absence of `auth_resolve` lines in scenario b log). Coverage by Pester unit tests in `tests/Auth.Tests.ps1` (Context: `DurationMs property` — 3 tests for resolved / unresolved / mixed).
 - [ ] v0.0.21e PASS — `/status` 403, SchemaVersion v99 WARN surfaces, downloader `-WhatIf` works, `Get-PortBusyDiagnostic` still wired
 - [x] $ScriptVersion bumped to `'0.0.21'` across all five scripts (commit `9673041`)
 - [x] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
