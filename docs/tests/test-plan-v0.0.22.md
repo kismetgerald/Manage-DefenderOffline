@@ -442,13 +442,13 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 
 **Expected result:**
 
-- [ ] Two `[STEP] Validating existing…` lines (WinRm, AD) — NOT three
-- [ ] `SmtpCredential.xml` mtime unchanged
-- [ ] No SMTP prompt
-- [ ] The v0.0.20 "Silent SMTP-skip breadcrumb" still fires if SendEmail=true in config:
-      `[INFO]  SMTP setup skipped: SendEmail=true in config applies to the Updates task…`
+- [x] Two `[STEP] Validating existing…` lines (WinRm, AD) — NOT three
+- [x] `SmtpCredential.xml` mtime unchanged (09:54:25 — identical to post-scenario-f.2 state)
+- [x] No SMTP prompt
+- [x] The v0.0.20 "Silent SMTP-skip breadcrumb" still fires:
+      `[INFO]  SMTP setup skipped: SendEmail=true in config applies to the Updates task, which is not included in -Component Dashboard. Re-run with -Component Updates or -Component All to configure SMTP.`
 
-**Result:** _Pending lab run._
+**Result:** PASS on WGSDAC.NET, 2026-06-04. Plan-aware validation correctly excluded the SMTP slot. The v0.0.20 silent-SMTP-skip breadcrumb appears BEFORE the credential-setup section (during the conf-folder pre-grant) so the operator sees the rationale up front; the credential phase prefill table then shows only WinRM + AD rows (no SMTP row), and only two `[STEP] Validating existing…` cycles fire. All three XML mtimes are byte-for-byte unchanged from the post-scenario-f.2 baseline (09:54:23 / 09:54:24 / 09:54:25), confirming SMTP was neither validated nor touched. Dashboard-only install completed cleanly; the Updates component install was correctly skipped per `-Component Dashboard`.
 
 ---
 
@@ -460,12 +460,12 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 - [x] v0.0.22d PASS — Identity-mismatch detection + WARN + selective re-prompt + selective re-save all worked. Tampered SmtpCredential.xml (encrypted as operator) caught at install time with actionable phrasing; WinRm + AD slots untouched (mtimes proved unchanged); SMTP saved fresh under service-account DPAPI.
 - [x] v0.0.22e PASS — `-SkipCredentialSetup` gate fires before any v0.0.22 code; no validation, no prompts, no dance, no XML touches. v0.0.19 behavior preserved exactly.
 - [x] v0.0.22f PASS — Pre-supplied `-<Name>Credential` parameter wins in both sub-scenarios. Without `-ForcePromptCredentials`: WinRm pre-supplied + AD/SMTP reused silently. With `-ForcePromptCredentials`: WinRm pre-supplied (still wins) + AD/SMTP re-prompted. Precedence chain `pre-supplied → -ForcePromptCredentials → validate-or-reuse` confirmed.
-- [ ] v0.0.22g PASS — `-Component Dashboard` validates 2 slots, leaves SMTP alone
+- [x] v0.0.22g PASS — `-Component Dashboard` validates 2 slots (WinRm + AD), leaves SMTP alone. v0.0.20 silent-SMTP-skip breadcrumb fires upfront; prefill shows only 2 rows; SMTP mtime byte-for-byte unchanged from scenario f.2.
 - [x] $ScriptVersion bumped to `'0.0.22'` across all five scripts
 - [x] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
 - [x] Full Pester suite green (310 passed, 0 failed, 13 skipped — `Invoke-Pester -Path ./tests` — +7 from `tests/TestServiceCredential.Tests.ps1`)
-- [ ] No `*.tmp` artifacts in working tree (`git status` clean)
-- [ ] README v0.0.22 entry drafted
+- [x] No `*.tmp` artifacts in working tree (`git status` clean)
+- [x] README v0.0.22 entry drafted
 - [ ] `feat/v0.0.22-credential-reuse` squash-merged to `main` via PR
 - [ ] Release tagged `v0.0.22`, marked `--prerelease` on GitHub per pre-1.0 policy
 
