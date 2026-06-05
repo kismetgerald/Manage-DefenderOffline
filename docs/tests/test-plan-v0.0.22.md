@@ -313,13 +313,23 @@ Move-Item .\conf\SmtpCredential.xml.bak .\conf\SmtpCredential.xml -Force
 
 **Expected result:**
 
-- [ ] `WARN` line surfaces with the actionable phrasing
-- [ ] WinRm + AD slots reused silently
-- [ ] SMTP slot re-prompts and overwrites the tampered XML
-- [ ] Subsequent install with no flags goes back to zero prompts
-- [ ] No other credentials affected (WinRm and AD mtimes unchanged across both runs)
+- [x] `WARN` line surfaces with the actionable phrasing
+- [x] WinRm + AD slots reused silently
+- [x] SMTP slot re-prompts and overwrites the tampered XML
+- [~] Subsequent install with no flags goes back to zero prompts *(not explicitly re-run as a separate install — the next scenario in the lab pass exercises the same code path and confirms cleanup)*
+- [x] No other credentials affected (WinRm and AD mtimes unchanged across both runs)
 
-**Result:** _Pending lab run._
+**Result:** PASS — the graceful-failure path works exactly as designed on WGSDAC.NET, 2026-06-04. The operator-DPAPI-encrypted `SmtpCredential.xml` was detected via the seclogon-context `Import-Clixml` returning exit 1; the installer surfaced the exact actionable message (*"existing SmtpCredential.xml could not be decrypted as WGSDAC\xxSecurityMonitor (likely saved under a different identity or corrupted). Re-prompting and overwriting."*), prompted for SMTP only, saved cleanly under the service identity's DPAPI, and continued the install without interruption.
+
+**This is the scenario where the v0.0.22 design pays off most:** pre-v0.0.22, a corrupted or wrong-identity XML would have produced a silent runtime failure at the next Update-task firing (DPAPI decryption fail inside `Update-DefenderOffline.ps1`'s `Import-Clixml`, no actionable signal until log forensics). v0.0.22 catches it at install time with a clear cause-hint that names the wrong-identity hypothesis up front.
+
+**Mtime evidence (proof the selective save worked):**
+
+| XML | Pre-scenario-d (after scenario c) | Post-scenario-d | Changed? |
+|---|---|---|---|
+| `WinRmCredential.xml` | 09:21:29 AM | 09:21:29 AM | No (silent reuse) |
+| `ADCredential.xml` | 09:21:29 AM | 09:21:29 AM | No (silent reuse) |
+| `SmtpCredential.xml` | 09:26:57 AM (tampered) | 09:27:56 AM | Yes (saved fresh under service-account DPAPI) |
 
 ---
 
@@ -431,7 +441,7 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 - [x] v0.0.22a PASS — `$ScriptVersion`, new helper, new switch, new functions (lines 243/526/541/802/920), `.PARAMETER` help block all present; pre-install XML mtime baseline captured for scenario b
 - [x] v0.0.22b PASS — Headline scenario validated on WGSDAC.NET: zero credential prompts, three `[OK] reusing existing XML…` lines, all three XML mtimes byte-for-byte unchanged, dashboard restart on port 8444 HTTPS healthy under the reused creds. Seclogon dance (Stopped+Disabled → Manual+Running → Stopped+Disabled) worked end-to-end.
 - [x] v0.0.22c PASS — `-ForcePromptCredentials` correctly bypasses validation, fires 3 prompts in order, saves all 3 XMLs (mtimes advanced to ~09:21 AM today, matching `Get-Date` within seconds)
-- [ ] v0.0.22d PASS — Identity mismatch: WARN + re-prompt; other slots untouched
+- [x] v0.0.22d PASS — Identity-mismatch detection + WARN + selective re-prompt + selective re-save all worked. Tampered SmtpCredential.xml (encrypted as operator) caught at install time with actionable phrasing; WinRm + AD slots untouched (mtimes proved unchanged); SMTP saved fresh under service-account DPAPI.
 - [ ] v0.0.22e PASS — `-SkipCredentialSetup` unchanged regression
 - [ ] v0.0.22f PASS — Pre-supplied `-<Name>Credential` parameter wins (both sub-scenarios)
 - [ ] v0.0.22g PASS — `-Component Dashboard` validates 2 slots, leaves SMTP alone
