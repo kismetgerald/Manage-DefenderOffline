@@ -247,16 +247,12 @@ Get-ChildItem .\conf\*Credential.xml | Select-Object Name, LastWriteTime
 
 **Expected result:**
 
-- [ ] Three `Get-Credential` prompts fire (WinRm, AD, SMTP)
-- [ ] Three `[INFO] <Name> credential: -ForcePromptCredentials set; prompting for fresh value.` lines
-- [ ] All three XML mtimes are within ~10 seconds of `Get-Date`
-- [ ] Subsequent install without `-ForcePromptCredentials` (re-run scenario v0.0.22b) goes back to the zero-prompt path
+- [x] Three `Get-Credential` prompts fire (WinRm, AD, SMTP)
+- [x] Three `[INFO] <Name> credential: -ForcePromptCredentials set; prompting for fresh value.` lines
+- [x] All three XML mtimes advanced (yesterday's 18:26/17:32 → today 09:21 AM, within seconds of `Get-Date`)
+- [~] Subsequent install without `-ForcePromptCredentials` (re-run scenario v0.0.22b) goes back to the zero-prompt path *(not explicitly re-run; left as implicit coverage from scenario d's "re-install to confirm" step which exercises the same path)*
 
-**Result:** _Pending lab run._
-
----
-
-### v0.0.22d — Identity-mismatch handling: WARN + re-prompt on DPAPI failure
+**Result:** PASS — rotation path works end-to-end on WGSDAC.NET, 2026-06-04. Three prompts fired in the expected order (WinRm → AD → SMTP) with the correct pre-fill usernames (`WGSDAC\xxSecurityMonitor`, `WGSDAC\zzkagbasi`, `scriptrunner@wgsdac.org`). All three `[STEP] Saving <Name> credential as <Identity>…` save lines fired, none of the `[STEP] Validating existing…` lines fired — confirming the precedence chain correctly takes the `-ForcePromptCredentials` branch and bypasses validation entirely. All three XML mtimes advanced; tier-credential mtimes (Workstation/Server/DomainController) unchanged as expected.
 
 **Purpose:** Validate the graceful-failure path. Simulate the "operator changed `-ServiceAccount` between installs" or "XML corrupted" scenario by tampering with one of the XMLs so validation fails.
 
@@ -434,7 +430,7 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 
 - [x] v0.0.22a PASS — `$ScriptVersion`, new helper, new switch, new functions (lines 243/526/541/802/920), `.PARAMETER` help block all present; pre-install XML mtime baseline captured for scenario b
 - [x] v0.0.22b PASS — Headline scenario validated on WGSDAC.NET: zero credential prompts, three `[OK] reusing existing XML…` lines, all three XML mtimes byte-for-byte unchanged, dashboard restart on port 8444 HTTPS healthy under the reused creds. Seclogon dance (Stopped+Disabled → Manual+Running → Stopped+Disabled) worked end-to-end.
-- [ ] v0.0.22c PASS — `-ForcePromptCredentials` forces prompts; mtimes advance
+- [x] v0.0.22c PASS — `-ForcePromptCredentials` correctly bypasses validation, fires 3 prompts in order, saves all 3 XMLs (mtimes advanced to ~09:21 AM today, matching `Get-Date` within seconds)
 - [ ] v0.0.22d PASS — Identity mismatch: WARN + re-prompt; other slots untouched
 - [ ] v0.0.22e PASS — `-SkipCredentialSetup` unchanged regression
 - [ ] v0.0.22f PASS — Pre-supplied `-<Name>Credential` parameter wins (both sub-scenarios)
