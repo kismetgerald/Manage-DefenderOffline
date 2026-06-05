@@ -720,7 +720,30 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.21 (2026-06-04) — Current
+### v0.0.22 (2026-06-04) — Current
+
+User-prioritised UX release: **`Install-ManageDefender.ps1` now reuses existing credential XMLs when they validate under the service identity's DPAPI.** Closes the long-standing friction where every `-Force` re-install re-prompted for `WinRm` / `AD` / `SMTP` credentials even though valid encrypted copies already existed in `conf/`. Surfaced during the v0.0.21 lab pass.
+
+**Credential reuse:**
+- ✨ **Validation-first credential phase.** When `conf/<Name>Credential.xml` is present, the installer now invokes a new helper (`lib/Test-ServiceCredential.ps1`) in the service identity's context to `Import-Clixml` the file. If decryption succeeds, the slot is reused silently with a `[OK] <Name> credential: reusing existing XML (saved <mtime>).` line and no prompt. If decryption fails (likely cause: operator changed `-ServiceAccount` between runs, or the XML was hand-saved by a different identity), a `WARN` explains why and the operator is re-prompted. DPAPI scoping does the identity binding for us — no explicit username comparison needed.
+- ✨ **New `-ForcePromptCredentials` switch** for credential rotation scenarios. Forces fresh prompts for every needed slot even when existing XMLs validate. Default v0.0.22+ behavior is reuse-when-valid; this is the explicit-rotation knob.
+- ✨ **Pre-supplied parameters still win.** `-WinRmCredential $cred` (and the AD/SMTP equivalents) take precedence over both validation-reuse and `-ForcePromptCredentials` — the operator's explicit value is always honoured.
+- ✨ **Service-account password (`-Credential $cred`) remains prompt-only by design.** Task Scheduler stores it in LSA secrets at registration time; there is no on-disk XML for it because that XML would itself need a password to decrypt, recursively. Confirmed as the intended security posture during design discussion.
+
+**Plumbing changes (no operator-visible behavior shifts):**
+- 🔧 New helper `lib/Test-ServiceCredential.ps1` — mirror of `lib/Save-ServiceCredential.ps1`. Validates an XML by reading + decrypting + type-checking + calling `GetNetworkCredential().Password` (which catches partial DPAPI corruption that survives `Import-Clixml`). Exit 0 on success, 1 on failure with a `.err` side-log for diagnostics.
+- 🔧 New orchestration functions `Test-ServiceCredential` + `Invoke-ValidationAsServiceIdentity` — parallel structure to `Save-ServiceCredential` + `Invoke-AsServiceIdentity`. Both traditional and gMSA paths implemented symmetrically; gMSA path is spec-built but field-untested (same status as the gMSA save path).
+- 🔧 **Seclogon dance restructured.** v0.0.21 enabled `seclogon` only for the save loop. v0.0.22 needs `seclogon` for validation too (the helper runs as the service identity via `Start-Process -Credential`), so the dance now wraps both phases. The `Continue? [Y/N]` interactive prompt around `seclogon` is unchanged — fires once when not `-Force`, covers everything that follows.
+
+**Testing:**
+- ✅ New Pester suite `tests/TestServiceCredential.Tests.ps1` — 7 tests covering valid-XML exit 0, missing-file exit 1, non-XML exit 1, wrong-type XML exit 1, corrupted-blob exit 1, side-log behavior on both paths.
+- ✅ Pester suite: 310 passed, 0 failed, 13 skipped (was 303 in v0.0.21; +7 new).
+
+**Out of scope (carry-forward):**
+- gMSA credential-reuse path is spec-built but field-untested — same status as v0.0.21.
+- Tier credentials (`WorkstationCredential.xml` / `ServerCredential.xml` / `DomainControllerCredential.xml`) are operator-managed today and not part of this release's reuse flow.
+
+### v0.0.21 (2026-06-04)
 
 Polish release: cold-start performance + auth-preflight forensics. Closes three queued startup items from the v0.0.14 phase-profiling work plus a long-standing `.NOTES` block staleness across the script set. No new components, no config changes, no migration path needed.
 
