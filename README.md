@@ -720,7 +720,34 @@ Approximate times for `Update-DefenderOffline.ps1` with a ~200 MB definition fil
 
 ## Version History
 
-### v0.0.22 (2026-06-04) — Current
+### v0.0.23 (2026-06-05) — Current
+
+Installer release: **`Install-ManageDefender.ps1` now cleans up stale netsh URL-ACL and sslcert reservations from prior installer runs.** Closes the v0.0.12-vintage gap where switching the HTTPS port left behind reservations that quietly broke the HTTP→HTTPS redirect listener on the next install.
+
+**The bug, made specific:** install on port 8080 → switch to port 8444 with `RedirectHttpPort = 8080` → re-run installer. Pre-v0.0.23: the leftover `https://+:8080/` URL-ACL from the first install still exists. The redirect listener at runtime tries to bind `http://+:8080/`. URL-ACL conflict detection is **by port, not by exact prefix string**, so the scheme mismatch doesn't save you — `HttpListener.Start()` fails and the redirect listener never starts. The dashboard surfaces this as a runtime diagnostic; v0.0.23 catches it at install time.
+
+**What's new:**
+- ✨ **Stale-reservation discovery** via new helper `lib/Get-StaleHttpReservations.ps1`. Enumerates current URL-ACL and sslcert reservations, filters down to ones the installer created itself, excludes any on ports the current configuration is still using (Port, RedirectHttpPort, FallbackPort). Identity matching is **SID-based for URL-ACLs** and **Application-ID-based for sslcert bindings** — sister services that share the service identity but use a different AppID are never touched.
+- ✨ **Listing + confirmation UX** mirrors the existing seclogon dance. When stale reservations are found, the installer lists them and prompts `Remove the stale reservation(s) listed above? [Y/N]`. Pass `-Force` to bypass the prompt.
+- ✨ **New `-PreserveStaleReservations` switch** for environments where sister services use the same identity and rely on intentional cross-port reservations. When set, the installer skips both the discovery and the prompt — operator opt-out.
+
+**Plumbing:**
+- 🔧 New helper functions: `Get-NetshSslcertBindings` (multi-binding parser, complements the single-binding `Get-NetshSslcertHash` in `Test-HttpsCertBinding.ps1`), `Get-StaleUrlAclReservations`, `Get-StaleSslcertBindings`, `Get-StaleHttpReservations`. All parsers are exposed for unit testing with synthetic netsh output.
+- 🔧 New orchestration `Invoke-StaleReservationCleanup` in `Install-ManageDefender.ps1` — invoked from `Install-DashboardComponent` right after `Write-Step "Configuring HTTPS…"`, before the current-port sslcert/urlacl re-bind. Active port set: `Port + RedirectHttpPort + FallbackPort`.
+
+**Backward compat:**
+- The cleanup runs only in the HTTPS install path (where the bug actually manifests). Pure HTTP installs are unaffected.
+- Default behavior is "list and confirm". Operators who upgrade to v0.0.23 and re-run an install will see the cleanup prompt at most once per stale reservation, then never again — no behavior change on subsequent installs.
+- All matching is strictly within the installer's own footprint (our SID, our AppID, our `+:<port>/` shape). Reservations created by anything other than this installer are skipped silently.
+
+**Testing:**
+- ✅ New Pester suite `tests/StaleHttpReservations.Tests.ps1` — 17 tests across the parser, two filters, and the orchestrator. Uses well-known SIDs (Administrators / Guests / SYSTEM) so the tests are AD-independent.
+- ✅ Pester suite: 327 passed, 0 failed, 13 skipped (was 310 in v0.0.22; +17 new).
+
+**Out of scope (carry-forward):**
+- gMSA paths remain field-untested per [`project_gmsa_untested.md`](https://github.com/kismetgerald/Manage-DefenderOffline). The v0.0.23 cleanup uses `NTAccount.Translate()` which works for both traditional accounts and gMSA (translates the trailing `$` correctly), but field validation on a gMSA install still hasn't happened.
+
+### v0.0.22 (2026-06-04)
 
 User-prioritised UX release: **`Install-ManageDefender.ps1` now reuses existing credential XMLs when they validate under the service identity's DPAPI.** Closes the long-standing friction where every `-Force` re-install re-prompted for `WinRm` / `AD` / `SMTP` credentials even though valid encrypted copies already existed in `conf/`. Surfaced during the v0.0.21 lab pass.
 
