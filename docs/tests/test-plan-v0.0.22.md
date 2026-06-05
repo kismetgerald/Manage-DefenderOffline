@@ -351,12 +351,12 @@ Move-Item .\conf\SmtpCredential.xml.bak .\conf\SmtpCredential.xml -Force
 
 **Expected result:**
 
-- [ ] The yellow `Credential setup deferred (-SkipCredentialSetup)` block prints
-- [ ] No `[STEP] Validating existing…` lines
-- [ ] No `Get-Credential` prompts
-- [ ] All XML mtimes unchanged
+- [x] The yellow `Credential setup deferred (-SkipCredentialSetup)` block prints
+- [x] No `[STEP] Validating existing…` lines
+- [x] No `Get-Credential` prompts
+- [x] All XML mtimes unchanged (WinRm + AD at 09:21:29, SMTP at 09:27:56 — identical to post-scenario-d state)
 
-**Result:** _Pending lab run._
+**Result:** PASS on WGSDAC.NET, 2026-06-04. The v0.0.19 `-SkipCredentialSetup` gate at the top of `Initialize-ServiceCredentials` fires before any of the new v0.0.22 validation/dance code, preserving the deferred-setup behavior exactly. The output includes the yellow header, the three filenames the operator must save, and both Method 1 (runas + seclogon) and Method 2 (re-run installer) instructions. **No seclogon dance output appears**, confirming the gate short-circuits before the dance is entered.
 
 ---
 
@@ -442,7 +442,7 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 - [x] v0.0.22b PASS — Headline scenario validated on WGSDAC.NET: zero credential prompts, three `[OK] reusing existing XML…` lines, all three XML mtimes byte-for-byte unchanged, dashboard restart on port 8444 HTTPS healthy under the reused creds. Seclogon dance (Stopped+Disabled → Manual+Running → Stopped+Disabled) worked end-to-end.
 - [x] v0.0.22c PASS — `-ForcePromptCredentials` correctly bypasses validation, fires 3 prompts in order, saves all 3 XMLs (mtimes advanced to ~09:21 AM today, matching `Get-Date` within seconds)
 - [x] v0.0.22d PASS — Identity-mismatch detection + WARN + selective re-prompt + selective re-save all worked. Tampered SmtpCredential.xml (encrypted as operator) caught at install time with actionable phrasing; WinRm + AD slots untouched (mtimes proved unchanged); SMTP saved fresh under service-account DPAPI.
-- [ ] v0.0.22e PASS — `-SkipCredentialSetup` unchanged regression
+- [x] v0.0.22e PASS — `-SkipCredentialSetup` gate fires before any v0.0.22 code; no validation, no prompts, no dance, no XML touches. v0.0.19 behavior preserved exactly.
 - [ ] v0.0.22f PASS — Pre-supplied `-<Name>Credential` parameter wins (both sub-scenarios)
 - [ ] v0.0.22g PASS — `-Component Dashboard` validates 2 slots, leaves SMTP alone
 - [x] $ScriptVersion bumped to `'0.0.22'` across all five scripts
