@@ -192,13 +192,20 @@ Get-Content $log -Tail 30 | Select-String 'startup_complete|auth_resolve'
 
 **Expected result:**
 
-- [ ] Zero `Get-Credential` dialogs for WinRm/AD/SMTP during the install
-- [ ] Three `[OK] <Name> credential: reusing existing XML…` lines (one per slot)
-- [ ] Final `All needed credentials validated; No credential prompts needed (existing XMLs validated).`
-- [ ] All three XML mtimes unchanged after install
-- [ ] Dashboard restarts cleanly under the reused creds
+- [x] Zero `Get-Credential` dialogs for WinRm/AD/SMTP during the install
+- [x] Three `[OK] <Name> credential: reusing existing XML…` lines (one per slot — WinRm 18:26, AD 18:26, Smtp 17:32)
+- [x] Final `All needed credentials validated; No credential prompts needed (existing XMLs validated).`
+- [x] All three XML mtimes unchanged after install (byte-for-byte unchanged from the scenario a snapshot)
+- [x] Dashboard restarts cleanly under the reused creds (port 8444 HTTPS, health probe 200 OK)
 
-**Result:** _Pending lab run._
+**Result:** PASS — the headline feature works end-to-end on a STIG home-lab. No credential prompts, no XML writes, full install completed in one continuous run.
+
+**Key observations:**
+
+1. **Seclogon dance worked as designed** on this STIG host. Service went Stopped+Disabled → Manual+Running for the validation window → Stopped+Disabled afterward. No `Continue? [Y/N]` interactive prompt fired because `-Force` was specified, preserving the pre-v0.0.22 behavior.
+2. **No save phase ran at all.** The `Saving <Name> credential as <Identity>…` lines do not appear in the output — confirming the `$toSave.Count -eq 0` short-circuit fires correctly when every slot validates.
+3. **Cert binding reused, not regenerated.** The v0.0.21 cert `CN=WGSDAC-WS-RM04 (expires 2028-05-25)` was honored; HTTPS rebound to the same cert on 0.0.0.0:8444.
+4. **Post-install warm restart cost slightly higher than the v0.0.21 baseline.** `event=startup_complete total_ms=2339 phase_count=11` versus v0.0.21 warm baseline of 1482 ms (+857 ms). Attributable to (a) ACLs were just touched on `conf/` and the dashboard process is paying first-call costs the v0.0.21 baseline had already amortized, and (b) the AuthMethod=ADIntegrated re-instated during v0.0.21 scenario d remains in effect, contributing the ~110 ms ADIntegrated overhead documented there. Not a v0.0.22 regression; flagged for completeness only.
 
 ---
 
@@ -426,7 +433,7 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 ## Release Checklist
 
 - [x] v0.0.22a PASS — `$ScriptVersion`, new helper, new switch, new functions (lines 243/526/541/802/920), `.PARAMETER` help block all present; pre-install XML mtime baseline captured for scenario b
-- [ ] v0.0.22b PASS — Headline scenario: zero credential prompts when valid XMLs exist
+- [x] v0.0.22b PASS — Headline scenario validated on WGSDAC.NET: zero credential prompts, three `[OK] reusing existing XML…` lines, all three XML mtimes byte-for-byte unchanged, dashboard restart on port 8444 HTTPS healthy under the reused creds. Seclogon dance (Stopped+Disabled → Manual+Running → Stopped+Disabled) worked end-to-end.
 - [ ] v0.0.22c PASS — `-ForcePromptCredentials` forces prompts; mtimes advance
 - [ ] v0.0.22d PASS — Identity mismatch: WARN + re-prompt; other slots untouched
 - [ ] v0.0.22e PASS — `-SkipCredentialSetup` unchanged regression
