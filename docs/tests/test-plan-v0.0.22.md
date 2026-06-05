@@ -114,13 +114,21 @@ Select-String -Path .\Install-ManageDefender.ps1 -Pattern '\.PARAMETER ForceProm
 
 **Expected result:**
 
-- [ ] `$ScriptVersion = '0.0.22'` in all five scripts
-- [ ] `lib/Test-ServiceCredential.ps1` exists and parses
-- [ ] `[switch]$ForcePromptCredentials` declared in param block
-- [ ] 4 new orchestration functions present
-- [ ] `.PARAMETER ForcePromptCredentials` block present in comment-based help
+- [x] `$ScriptVersion = '0.0.22'` in all five scripts
+- [x] `lib/Test-ServiceCredential.ps1` exists and parses (0 parse errors)
+- [x] `[switch]$ForcePromptCredentials` declared in param block (line 243)
+- [x] 4 new orchestration functions present — `Get-CredentialTestHelperPath` (line 526), `Initialize-CredentialTestHelper` (line 541), `Invoke-ValidationAsServiceIdentity` (line 802), `Test-ServiceCredential` (line 920)
+- [x] `.PARAMETER ForcePromptCredentials` block present in comment-based help (line 81)
 
-**Result:** _Pending lab run._
+**Result:** PASS on bundle `manage-defenderoffline-0.0.22.zip`. Pre-install baseline snapshot of the three installer-managed credential XMLs captured for scenario b mtime comparison:
+
+| XML | Pre-install LastWriteTime | Length |
+|---|---|---|
+| `ADCredential.xml` | 18:26:26 | 926 |
+| `WinRmCredential.xml` | 18:26:26 | 934 |
+| `SmtpCredential.xml` | 17:32:42 | 933 |
+
+(The three tier credential XMLs in `conf/` — `WorkstationCredential.xml` / `ServerCredential.xml` / `DomainControllerCredential.xml` — are consumed by `Update-DefenderOffline.ps1` at runtime and are explicitly out of scope for this release; not validated, not touched.)
 
 ---
 
@@ -417,7 +425,7 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 
 ## Release Checklist
 
-- [ ] v0.0.22a PASS — `$ScriptVersion`, new helper, new switch, new functions, help block all present in bundle
+- [x] v0.0.22a PASS — `$ScriptVersion`, new helper, new switch, new functions (lines 243/526/541/802/920), `.PARAMETER` help block all present; pre-install XML mtime baseline captured for scenario b
 - [ ] v0.0.22b PASS — Headline scenario: zero credential prompts when valid XMLs exist
 - [ ] v0.0.22c PASS — `-ForcePromptCredentials` forces prompts; mtimes advance
 - [ ] v0.0.22d PASS — Identity mismatch: WARN + re-prompt; other slots untouched
