@@ -401,11 +401,27 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 
 **Expected result:**
 
-- [ ] Sub-step 1: zero prompts for WinRm; AD + SMTP reused; WinRm XML mtime advances
-- [ ] Sub-step 2: zero prompts for WinRm; AD + SMTP prompts fire
-- [ ] In both sub-steps, `[INFO] WinRm credential: using pre-supplied (-WinRmCredential parameter).` appears exactly once
+- [x] Sub-step 1: zero prompts for WinRm; AD + SMTP reused silently; WinRm XML mtime advances; AD + SMTP mtimes unchanged
+- [x] Sub-step 2: zero prompts for WinRm (pre-supplied wins over `-ForcePromptCredentials`); AD + SMTP prompts fire; all three XML mtimes advance
+- [x] In both sub-steps, `[INFO] WinRm credential: using pre-supplied (-WinRmCredential parameter).` appears exactly once
 
-**Result:** _Pending lab run._
+**Lab tweak from the original plan:** rather than constructing a synthetic `$winRmReplacement` PSCredential with a fake password (which would have required a restoration step), reused the operator's already-collected `$cred` — since the WinRm pre-fill on this lab is `WGSDAC\xxSecurityMonitor` (same identity as the service account), passing `$cred` as `-WinRmCredential` exercises the precedence chain identically without leaving a non-working WinRm cred on disk.
+
+**Result:** PASS on WGSDAC.NET, 2026-06-04. Both sub-scenarios behaved exactly as designed.
+
+**Sub-scenario f.1 — Pre-supplied WITHOUT `-ForcePromptCredentials`:**
+- `[INFO] WinRm credential: using pre-supplied (-WinRmCredential parameter).` fired (no validation attempt, no prompt for WinRm)
+- AD slot: `[STEP] Validating existing AD credential…` → `[OK] reusing existing XML (saved 2026-06-05 09:21)`
+- SMTP slot: `[STEP] Validating existing Smtp credential…` → `[OK] reusing existing XML (saved 2026-06-05 09:27)`
+- Only `[STEP] Saving WinRm credential…` save line fired (AD + SMTP never queued)
+
+**Sub-scenario f.2 — Pre-supplied WITH `-ForcePromptCredentials`:**
+- `[INFO] WinRm credential: using pre-supplied (-WinRmCredential parameter).` fired (pre-supplied STILL wins over `-ForcePromptCredentials` — confirming top-of-precedence ordering)
+- AD slot: `[INFO] AD credential: -ForcePromptCredentials set; prompting for fresh value.` → Get-Credential dialog → save
+- SMTP slot: `[INFO] Smtp credential: -ForcePromptCredentials set; prompting for fresh value.` → Get-Credential dialog → save
+- All three `[STEP] Saving <Name> credential…` lines fired
+
+**Final mtimes (after both sub-scenarios):** WinRm 09:54:23, AD 09:54:24, SMTP 09:54:25 — all within ~2 seconds of each other and ~10 seconds of `Get-Date`. Comparing to the post-scenario-e baseline (WinRm/AD 09:21:29, SMTP 09:27:56), every slot advanced — proving WinRm saved twice (f.1 + f.2) and AD/SMTP saved once (f.2 only).
 
 ---
 
@@ -443,7 +459,7 @@ Expected: Same `[INFO] WinRm credential: using pre-supplied…` line. AD + SMTP 
 - [x] v0.0.22c PASS — `-ForcePromptCredentials` correctly bypasses validation, fires 3 prompts in order, saves all 3 XMLs (mtimes advanced to ~09:21 AM today, matching `Get-Date` within seconds)
 - [x] v0.0.22d PASS — Identity-mismatch detection + WARN + selective re-prompt + selective re-save all worked. Tampered SmtpCredential.xml (encrypted as operator) caught at install time with actionable phrasing; WinRm + AD slots untouched (mtimes proved unchanged); SMTP saved fresh under service-account DPAPI.
 - [x] v0.0.22e PASS — `-SkipCredentialSetup` gate fires before any v0.0.22 code; no validation, no prompts, no dance, no XML touches. v0.0.19 behavior preserved exactly.
-- [ ] v0.0.22f PASS — Pre-supplied `-<Name>Credential` parameter wins (both sub-scenarios)
+- [x] v0.0.22f PASS — Pre-supplied `-<Name>Credential` parameter wins in both sub-scenarios. Without `-ForcePromptCredentials`: WinRm pre-supplied + AD/SMTP reused silently. With `-ForcePromptCredentials`: WinRm pre-supplied (still wins) + AD/SMTP re-prompted. Precedence chain `pre-supplied → -ForcePromptCredentials → validate-or-reuse` confirmed.
 - [ ] v0.0.22g PASS — `-Component Dashboard` validates 2 slots, leaves SMTP alone
 - [x] $ScriptVersion bumped to `'0.0.22'` across all five scripts
 - [x] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
