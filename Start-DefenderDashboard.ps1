@@ -1613,11 +1613,18 @@ function Build-DashboardHtml {
     }
 
     $rows = foreach ($r in $Data | Sort-Object ComputerName) {
-        # Same priority order as Show-DefenderStatus:
-        #   Offline   -> no comms
-        #   Outdated  -> reachable but signature is behind
-        #   else      -> defer to shared health classifier; fall back to legacy
-        $status = if (-not $r.Online) { 'Offline' }
+        # v0.0.24: OSFamily discriminates ClamAV (Linux) rows from Defender
+        # (Windows) rows. Missing / non-Linux → default to Windows path so
+        # existing rows behave identically to v0.0.23.
+        $osFamily = if ($r.OSFamily) { $r.OSFamily } else { 'Windows' }
+
+        # Row status. Linux rows come pre-classified by Get-ClamAVHealthProbe
+        # and carry the contract enum in HealthStatus, so we render it
+        # verbatim. Windows rows follow the pre-v0.0.24 priority order.
+        $status = if ($osFamily -eq 'Linux') {
+                      if ($r.HealthStatus) { $r.HealthStatus } else { 'Healthy' }
+                  }
+                  elseif (-not $r.Online) { 'Offline' }
                   elseif ($r.VersionStatus -eq 'Outdated') { 'Outdated' }
                   elseif ($r.HealthStatus) { $r.HealthStatus }
                   elseif ($r.RealTimeProtection -eq 'False' -or $r.AntivirusEnabled -eq 'False') { 'Degraded' }
@@ -1627,22 +1634,35 @@ function Build-DashboardHtml {
             'Outdated'        { '<span class="badge b-out">Outdated</span>' }
             'Degraded'        { '<span class="badge b-deg">Degraded</span>' }
             'ThreatsDetected' { '<span class="badge b-thr">ThreatsDetected</span>' }
+            'ProbeFailed'     { '<span class="badge b-pf">ProbeFailed</span>' }
             default           { '<span class="badge b-ok">Healthy</span>' }
         }
         $tip = if ($r.Error) {
             " title=`"$($r.Error -replace '"','&quot;' -replace '<','&lt;' -replace '>','&gt;')`""
         } else { '' }
 
-        # Data attributes drive client-side card-click filtering
+        # OS icon rendered inline before the hostname — keeps the sort()
+        # column-index scheme unchanged (no new column) while still
+        # letting operators see at a glance whether a row is Windows or
+        # Linux. Uses HTML character references for editor-encoding safety.
+        $osIcon = if ($osFamily -eq 'Linux') {
+            '<span class="os-icon" title="Linux (Deploy-ClamAV)">&#x1F427;</span>'
+        } else {
+            '<span class="os-icon" title="Windows (Microsoft Defender)">&#x1FA9F;</span>'
+        }
+
+        # Data attributes drive client-side card-click filtering. Linux
+        # rows never satisfy the Outdated / RTOff filters (those are
+        # Windows-only concepts); the Degraded filter fires normally.
         $isOnline   = if ($r.Online) { 'true' } else { 'false' }
-        $isOutdated = if ($r.VersionStatus -eq 'Outdated') { 'true' } else { 'false' }
-        $isRtOff    = if ($r.RealTimeProtection -eq 'False' -and $r.Online) { 'true' } else { 'false' }
+        $isOutdated = if ($osFamily -eq 'Windows' -and $r.VersionStatus -eq 'Outdated') { 'true' } else { 'false' }
+        $isRtOff    = if ($osFamily -eq 'Windows' -and $r.RealTimeProtection -eq 'False' -and $r.Online) { 'true' } else { 'false' }
         $isDegraded = if ($r.HealthStatus -eq 'Degraded' -and $r.Online) { 'true' } else { 'false' }
 
         # data-host is the key the row-click handler uses to look up the
         # per-host record in the embedded JSON blob and populate the modal.
-        "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`" data-degraded=`"$isDegraded`">
-          <td$tip>$($r.ComputerName)</td>
+        "<tr class=`"hostrow`" data-host=`"$($r.ComputerName)`" data-online=`"$isOnline`" data-outdated=`"$isOutdated`" data-rtoff=`"$isRtOff`" data-degraded=`"$isDegraded`" data-osfamily=`"$osFamily`">
+          <td$tip>$osIcon$($r.ComputerName)</td>
           <td>$($r.IPv4Address)</td>
           <td>$($r.NodeType)</td>
           <td>$($r.Platform)</td>
@@ -1668,6 +1688,11 @@ function Build-DashboardHtml {
     # literal text "</script>" from prematurely ending the script tag.
     $hostJsonBlob = @($Data | Sort-Object ComputerName | ForEach-Object {
         [ordered]@{
+            # v0.0.24: osFamily discriminates ClamAV (Linux) rows from
+            # Defender (Windows) rows so the modal renderer branches
+            # correctly. Rows written before v0.0.24 lack the field;
+            # the JS treats a missing/blank value as 'Windows'.
+            osFamily                  = if ($_.OSFamily) { $_.OSFamily } else { 'Windows' }
             computerName              = $_.ComputerName
             ipv4Address               = $_.IPv4Address
             nodeType                  = $_.NodeType
@@ -1702,6 +1727,20 @@ function Build-DashboardHtml {
             healthReason              = $_.HealthReason
             queryDurationSec          = $_.QueryDuration
             error                     = $_.Error
+            # ClamAV-specific fields. All null on Windows rows (the field
+            # names are prefixed so they never collide with Defender's).
+            clamAvProduct              = $_.ClamAVProduct
+            clamAvRole                 = $_.ClamAVRole
+            clamAvMode                 = $_.ClamAVMode
+            clamAvEngineVersion        = $_.ClamAVEngineVersion
+            clamAvSignatureVersion     = $_.ClamAVSignatureVersion
+            clamAvSignatureAgeDays     = $_.ClamAVSignatureAgeDays
+            clamAvSignatureStale       = $_.ClamAVSignatureStale
+            clamAvCapabilities         = $_.ClamAVCapabilities
+            clamAvHostInstallerVersion = $_.ClamAVHostInstallerVersion
+            clamAvPublisherVersion     = $_.ClamAVPublisherVersion
+            clamAvSchemaWarning        = $_.ClamAVSchemaWarning
+            clamAvEnvelopeSchemaWarning= $_.ClamAVEnvelopeSchemaWarning
         }
     }) | ConvertTo-Json -Compress -Depth 5
     # Make sure it's an array literal even for a single host.
@@ -1861,6 +1900,13 @@ function Build-DashboardHtml {
     .b-out { background: var(--c-outdated-bg); color: var(--c-outdated-fg); }
     .b-deg { background: var(--c-degraded-bg); color: var(--c-degraded-fg); }
     .b-thr { background: var(--c-threats-bg);  color: var(--c-threats-fg); }
+    /* v0.0.24: ProbeFailed for ClamAV rows. Reuses offline colors —
+       both are "we don't have live data for this host." */
+    .b-pf  { background: var(--c-offline-bg);  color: var(--c-offline-fg); }
+    /* OS marker rendered inline before the hostname. Kept tiny + neutral
+       so it doesn't compete visually with the status badge. */
+    .os-icon { display: inline-block; width: 1.2em; text-align: center;
+               margin-right: 4px; opacity: .85; }
     /* Hostrow click affordance — pointer cursor, hover highlight */
     tr.hostrow { cursor: pointer; }
 
@@ -1999,6 +2045,7 @@ function Build-DashboardHtml {
       <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-threats-bg)"></i>ThreatsDetected</span>
       <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-degraded-bg)"></i>Degraded</span>
       <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-offline-bg)"></i>Offline</span>
+      <span class="lgnd-chip"><i class="lgnd-dot" style="background:var(--c-offline-bg)"></i>ProbeFailed</span>
     </span>
     <a href="#" class="clear-filter" id="clearFilter"
        onclick="clearAllFilters(); return false;">Clear filters</a>
@@ -2210,10 +2257,21 @@ function Build-DashboardHtml {
         case 'Outdated':        return 'p-out';
         case 'Degraded':        return 'p-deg';
         case 'ThreatsDetected': return 'p-thr';
+        // v0.0.24: ProbeFailed reuses offline styling (both mean
+        // "no live data") — the pill LABEL still says ProbeFailed.
+        case 'ProbeFailed':     return 'p-off';
         default:                return 'p-off';
       }
     }
+    // Windows path: legacy Offline/Outdated priority ladder.
+    // Linux path (v0.0.24): the ClamAV probe hands us a contract enum
+    // directly; render it verbatim (Healthy / Degraded / ThreatsDetected /
+    // ProbeFailed). Missing healthStatus → default Healthy so a malformed
+    // row still displays something.
     function effectiveStatus(h) {
+      if ((h.osFamily || 'Windows') === 'Linux') {
+        return h.healthStatus || 'Healthy';
+      }
       if (!h.online)                       return 'Offline';
       if (h.versionStatus === 'Outdated')  return 'Outdated';
       if (h.healthStatus)                  return h.healthStatus;
@@ -2223,6 +2281,122 @@ function Build-DashboardHtml {
     function kv(k, v, cls) {
       cls = cls || '';
       return '<div class="k">' + esc(k) + ' :</div><div class="v ' + cls + '">' + esc(v || '—') + '</div>';
+    }
+
+    // Common blocks shared by both OS families.
+    function renderIdentityBlock(h) {
+      return ''
+        + '<h3>Identity</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Computer',       h.computerName)
+        +   kv('IPv4 address',   (h.ipv4Address || '—'))
+        +   kv('Online',         h.online ? 'Yes' : 'No', h.online ? 'bool-true' : 'bool-false')
+        +   kv('Query duration', (h.queryDurationSec != null ? h.queryDurationSec + 's' : '—'))
+        + '</div>';
+    }
+    function renderClassificationBlock(pill, h) {
+      return ''
+        + '<h3>Health Classification</h3>'
+        + '<div class="mdo-kv">'
+        +   '<div class="k">Status :</div><div class="v">' + pill + '</div>'
+        +   kv('Reason', (h.healthReason || '—'))
+        + '</div>';
+    }
+
+    // ---------- Windows / Defender modal ----------
+    function renderWindowsModal(h, pill) {
+      return ''
+        + renderIdentityBlock(h)
+        // System inventory: NodeType + Platform are the grid columns;
+        // Manufacturer/Model/OS show the raw CIM values that drive
+        // Platform classification so operators can sanity-check.
+        + '<h3>System</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Type',             (h.nodeType     || '—'))
+        +   kv('Platform',         (h.platform     || '—'))
+        +   kv('Operating system', (h.osCaption    || '—'))
+        +   kv('Manufacturer',     (h.manufacturer || '—'))
+        +   kv('Model',            (h.model        || '—'))
+        + '</div>'
+        + renderClassificationBlock(pill, h)
+        + '<h3>Defender State</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('WinDefend service',     h.defenderService)
+        +   kv('Signature version',     h.signatureVersion + (h.versionStatus ? ' (' + h.versionStatus + ')' : ''))
+        +   kv('Definitions date',      (h.signatureLastUpdated || '—'))
+        +   kv('Available version',     h.availableVersion)
+        +   kv('Real-time protection',  h.realTimeProtection,        boolClass(h.realTimeProtection))
+        +   kv('Antimalware service',   h.amServiceEnabled,          boolClass(h.amServiceEnabled))
+        +   kv('Antivirus engine',      h.antivirusEnabled,          boolClass(h.antivirusEnabled))
+        +   kv('Behavior monitor',      h.behaviorMonitorEnabled,    boolClass(h.behaviorMonitorEnabled))
+        +   kv('IOAV protection',       h.ioavProtectionEnabled,     boolClass(h.ioavProtectionEnabled))
+        +   kv('On-access protection',  h.onAccessProtectionEnabled, boolClass(h.onAccessProtectionEnabled))
+        + '</div>'
+        + '<h3>Scans</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Last quick scan', h.lastQuickScan)
+        +   kv('Last full scan',  h.lastFullScan)
+        + '</div>';
+    }
+
+    // ---------- Linux / ClamAV modal (v0.0.24+) ----------
+    // Different sections: no Windows-specific System block, no
+    // Defender-toggle grid, capabilities render as a checklist. Threats
+    // block is still shared (recent_threat_count → threatCount).
+    function boolIcon(v) {
+      if (v === true)  return '<span class="bool-true">✔ on</span>';
+      if (v === false) return '<span class="bool-false">✖ off</span>';
+      return '<span class="text-muted">— n/a</span>';
+    }
+    function renderCapabilitiesBlock(caps) {
+      if (!caps) return kv('Capabilities', '—');
+      return ''
+        +   '<div class="k">clamd :</div><div class="v">'                  + boolIcon(caps.clamd_active) + '</div>'
+        +   '<div class="k">freshclam :</div><div class="v">'              + boolIcon(caps.freshclam_active) + '</div>'
+        +   '<div class="k">clamonacc :</div><div class="v">'              + boolIcon(caps.onaccess_active) + '</div>'
+        +   '<div class="k">auto-upgrade timer :</div><div class="v">'     + boolIcon(caps.autoupgrade_timer_active) + '</div>'
+        +   '<div class="k">self-test passing :</div><div class="v">'      + boolIcon(caps.selftest_passing) + '</div>'
+        +   '<div class="k">nginx mirror :</div><div class="v">'           + boolIcon(caps.mirror_active) + '</div>';
+    }
+    function renderLinuxModal(h, pill) {
+      var sig = (h.clamAvSignatureVersion != null ? h.clamAvSignatureVersion : '—')
+              + (h.clamAvSignatureAgeDays != null ? ' (' + h.clamAvSignatureAgeDays + ' day(s) old)' : '')
+              + (h.clamAvSignatureStale === true ? ' — STALE' : '');
+      var modeLabel = h.clamAvMode ? h.clamAvMode : '—';
+      var pubBlock = h.clamAvMode === 'envelope'
+        ? kv('Publisher version', (h.clamAvPublisherVersion || '—'))
+        : '';
+      var warnBlock = '';
+      if (h.clamAvSchemaWarning || h.clamAvEnvelopeSchemaWarning) {
+        var w = '';
+        if (h.clamAvEnvelopeSchemaWarning) { w += 'Envelope: ' + esc(h.clamAvEnvelopeSchemaWarning); }
+        if (h.clamAvSchemaWarning) {
+          if (w) w += '<br>';
+          w += 'Host: ' + esc(h.clamAvSchemaWarning);
+        }
+        warnBlock = '<h3>Schema warnings</h3><div class="mdo-err">' + w + '</div>';
+      }
+      return ''
+        + renderIdentityBlock(h)
+        + '<h3>Deploy-ClamAV</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Product',            (h.clamAvProduct           || 'Deploy-ClamAV'))
+        +   kv('Role',               (h.clamAvRole              || '—'))
+        +   kv('Mode',               modeLabel)
+        +   kv('Host installer',     (h.clamAvHostInstallerVersion || '—'))
+        +   pubBlock
+        + '</div>'
+        + renderClassificationBlock(pill, h)
+        + '<h3>ClamAV state</h3>'
+        + '<div class="mdo-kv">'
+        +   kv('Engine version',     (h.clamAvEngineVersion || '—'))
+        +   kv('Signature',          sig)
+        + '</div>'
+        + '<h3>Capabilities</h3>'
+        + '<div class="mdo-kv">'
+        +   renderCapabilitiesBlock(h.clamAvCapabilities)
+        + '</div>'
+        + warnBlock;
     }
 
     function renderHostModal(h) {
@@ -2244,51 +2418,19 @@ function Build-DashboardHtml {
         ? '<h3>Error / Detail</h3><div class="mdo-err">' + esc(h.error) + '</div>'
         : '';
 
-      return ''
-        + '<h3>Identity</h3>'
-        + '<div class="mdo-kv">'
-        +   kv('Computer',       h.computerName)
-        +   kv('IPv4 address',   (h.ipv4Address || '—'))
-        +   kv('Online',         h.online ? 'Yes' : 'No', h.online ? 'bool-true' : 'bool-false')
-        +   kv('Query duration', (h.queryDurationSec != null ? h.queryDurationSec + 's' : '—'))
-        + '</div>'
-        // System inventory: NodeType + Platform are the new grid columns;
-        // Manufacturer/Model/OS show the raw CIM values that drive Platform
-        // classification so operators can sanity-check the mapping.
-        + '<h3>System</h3>'
-        + '<div class="mdo-kv">'
-        +   kv('Type',             (h.nodeType     || '—'))
-        +   kv('Platform',         (h.platform     || '—'))
-        +   kv('Operating system', (h.osCaption    || '—'))
-        +   kv('Manufacturer',     (h.manufacturer || '—'))
-        +   kv('Model',            (h.model        || '—'))
-        + '</div>'
-        + '<h3>Health Classification</h3>'
-        + '<div class="mdo-kv">'
-        +   '<div class="k">Status :</div><div class="v">' + pill + '</div>'
-        +   kv('Reason', (h.healthReason || '—'))
-        + '</div>'
-        + '<h3>Defender State</h3>'
-        + '<div class="mdo-kv">'
-        +   kv('WinDefend service',     h.defenderService)
-        +   kv('Signature version',     h.signatureVersion + (h.versionStatus ? ' (' + h.versionStatus + ')' : ''))
-        +   kv('Definitions date',      (h.signatureLastUpdated || '—'))
-        +   kv('Available version',     h.availableVersion)
-        +   kv('Real-time protection',  h.realTimeProtection,        boolClass(h.realTimeProtection))
-        +   kv('Antimalware service',   h.amServiceEnabled,          boolClass(h.amServiceEnabled))
-        +   kv('Antivirus engine',      h.antivirusEnabled,          boolClass(h.antivirusEnabled))
-        +   kv('Behavior monitor',      h.behaviorMonitorEnabled,    boolClass(h.behaviorMonitorEnabled))
-        +   kv('IOAV protection',       h.ioavProtectionEnabled,     boolClass(h.ioavProtectionEnabled))
-        +   kv('On-access protection',  h.onAccessProtectionEnabled, boolClass(h.onAccessProtectionEnabled))
-        + '</div>'
-        + '<h3>Scans</h3>'
-        + '<div class="mdo-kv">'
-        +   kv('Last quick scan', h.lastQuickScan)
-        +   kv('Last full scan',  h.lastFullScan)
-        + '</div>'
-        + '<h3>Threats (' + (h.threats ? h.threats.length : 0) + ')</h3>'
-        + threatBlock
-        + errBlock;
+      var body = ((h.osFamily || 'Windows') === 'Linux')
+        ? renderLinuxModal(h, pill)
+        : renderWindowsModal(h, pill);
+
+      // Threat count works for both platforms — Windows populates a real
+      // ThreatList; ClamAV surfaces recent_threat_count as a number and
+      // leaves threats[] empty (v0.0.24 doesn't fetch per-threat detail).
+      var threatCountDisplay = ((h.osFamily || 'Windows') === 'Linux')
+        ? ('<h3>Threats (' + (h.threatCount != null ? h.threatCount : 0) + ')</h3>'
+           + '<div class="mdo-kv">' + kv('Recent threat count', (h.threatCount != null ? h.threatCount : 0)) + '</div>')
+        : ('<h3>Threats (' + (h.threats ? h.threats.length : 0) + ')</h3>' + threatBlock);
+
+      return body + threatCountDisplay + errBlock;
     }
 
     function openHostModal(name) {
@@ -2381,6 +2523,10 @@ function ConvertTo-DashboardJson {
         outdatedCount    = @($Data | Where-Object VersionStatus -eq 'Outdated').Count
         computers        = @($Data | Sort-Object ComputerName | ForEach-Object {
             [ordered]@{
+                # v0.0.24: osFamily + ClamAV fields for consumers (SIEM,
+                # Prometheus scraper, custom collector) that want the same
+                # shape as the /defender HTML modal.
+                osFamily                  = if ($_.OSFamily) { $_.OSFamily } else { 'Windows' }
                 computerName              = $_.ComputerName
                 ipv4Address               = $_.IPv4Address
                 nodeType                  = $_.NodeType
@@ -2407,6 +2553,18 @@ function ConvertTo-DashboardJson {
                 healthStatus              = $_.HealthStatus
                 healthReason              = $_.HealthReason
                 queryDurationSec          = $_.QueryDuration
+                clamAvProduct              = $_.ClamAVProduct
+                clamAvRole                 = $_.ClamAVRole
+                clamAvMode                 = $_.ClamAVMode
+                clamAvEngineVersion        = $_.ClamAVEngineVersion
+                clamAvSignatureVersion     = $_.ClamAVSignatureVersion
+                clamAvSignatureAgeDays     = $_.ClamAVSignatureAgeDays
+                clamAvSignatureStale       = $_.ClamAVSignatureStale
+                clamAvCapabilities         = $_.ClamAVCapabilities
+                clamAvHostInstallerVersion = $_.ClamAVHostInstallerVersion
+                clamAvPublisherVersion     = $_.ClamAVPublisherVersion
+                clamAvSchemaWarning        = $_.ClamAVSchemaWarning
+                clamAvEnvelopeSchemaWarning= $_.ClamAVEnvelopeSchemaWarning
                 error                     = $_.Error
             }
         })
