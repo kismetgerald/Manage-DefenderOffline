@@ -66,8 +66,8 @@
     AI Contributors: Claude AI, Grok
     Requires       : PowerShell 7+ (recommended), WinRM on targets (TCP 5985)
                      Administrator privileges or delegated WinRM access on targets
-    Version        : 0.0.21
-    Last Updated   : 2026-06-04
+    Version        : 0.0.24
+    Last Updated   : 2026-07-09
 #>
 
 [CmdletBinding()]
@@ -159,10 +159,27 @@ param(
     # username:salt:iterations:hash line to AuthBasicUsersFile, then exits.
     [string]$AddBasicUser,
 
+    # ---- ClamAV fleet health consumer (v0.0.24+) --------------------------
+    # Opt-in. When true, each refresh cycle also fetches a Deploy-ClamAV
+    # mirror's health document and merges Linux rows into the fleet grid.
+    # See [ClamAV] section in conf/config.conf for the full narrative.
+    [bool]$ClamAVEnabled = $false,
+    [string]$ClamAVMirrorUrl,
+    [ValidateRange(1, 300)]
+    [int]$ClamAVRequestTimeoutSec = 10,
+    [ValidateRange(60, 86400)]
+    [int]$ClamAVAggregateStaleSeconds = 900,
+    [ValidateRange(60, 86400)]
+    [int]$ClamAVAggregateProbeFailedSeconds = 1800,
+    [ValidateRange(60, 86400)]
+    [int]$ClamAVHostStaleSeconds = 1800,
+    [ValidateRange(60, 86400)]
+    [int]$ClamAVHostProbeFailedSeconds = 3600,
+
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.23'
+$ScriptVersion = '0.0.24'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Single chokepoint for all WinRM execution. Path is also passed into thread
@@ -173,6 +190,8 @@ $LibGetDefenderComputers = Join-Path $ScriptDir 'lib\Get-DefenderComputers.ps1'
 . $LibGetDefenderComputers
 $LibGetDefenderHealthProbe = Join-Path $ScriptDir 'lib\Get-DefenderHealthProbe.ps1'
 . $LibGetDefenderHealthProbe
+$LibGetClamAVHealthProbe   = Join-Path $ScriptDir 'lib\Get-ClamAVHealthProbe.ps1'
+. $LibGetClamAVHealthProbe
 $LibTestHttpsCertBinding   = Join-Path $ScriptDir 'lib\Test-HttpsCertBinding.ps1'
 . $LibTestHttpsCertBinding
 $LibTestUrlAclCollision    = Join-Path $ScriptDir 'lib\Test-UrlAclCollision.ps1'
@@ -181,7 +200,9 @@ $LibTestUrlAclCollision    = Join-Path $ScriptDir 'lib\Test-UrlAclCollision.ps1'
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
 # Schema versions this script was built against.
-$Script:ExpectedConfigSchemaVersion = 1
+# Config schema bumped to 2 in v0.0.24 for the [ClamAV] section (purely
+# additive — older configs still parse, just without a [ClamAV] block).
+$Script:ExpectedConfigSchemaVersion = 2
 $Script:ExpectedHostsSchemaVersion  = 1
 
 # ===================================================================
@@ -296,6 +317,37 @@ if (-not $PSBoundParameters.ContainsKey('ADSearchBase')          -and $cfg['ADSe
 if (-not $PSBoundParameters.ContainsKey('AuthToken')             -and $cfg['AuthToken'])             { $AuthToken             = $cfg['AuthToken'].Trim() }
 if (-not $PSBoundParameters.ContainsKey('AllowAnonymousStatus')  -and $cfg['AllowAnonymousStatus'])  {
     if ($cfg['AllowAnonymousStatus'] -match '^(?i)true|1|yes$') { $AllowAnonymousStatus = $true }
+}
+
+# ---- ClamAV consumer settings ([ClamAV] section, v0.0.24+) -----------------
+# Enabled default is false; MirrorUrl has no default. When both are set,
+# each refresh cycle also fetches the mirror's fleet-status/single-host
+# document and merges Linux rows into the grid. See conf/config.conf.
+if (-not $PSBoundParameters.ContainsKey('ClamAVEnabled') -and $cfg['ClamAVEnabled']) {
+    $ClamAVEnabled = ($cfg['ClamAVEnabled'] -match '^(?i)true|1|yes$')
+}
+if (-not $PSBoundParameters.ContainsKey('ClamAVMirrorUrl') -and $cfg['ClamAVMirrorUrl']) {
+    $ClamAVMirrorUrl = $cfg['ClamAVMirrorUrl'].Trim()
+}
+if (-not $PSBoundParameters.ContainsKey('ClamAVRequestTimeoutSec') -and $cfg['ClamAVRequestTimeoutSec']) {
+    try { $ClamAVRequestTimeoutSec = [int]$cfg['ClamAVRequestTimeoutSec'] } catch {}
+}
+if (-not $PSBoundParameters.ContainsKey('ClamAVAggregateStaleSeconds') -and $cfg['ClamAVAggregateStaleSeconds']) {
+    try { $ClamAVAggregateStaleSeconds = [int]$cfg['ClamAVAggregateStaleSeconds'] } catch {}
+}
+if (-not $PSBoundParameters.ContainsKey('ClamAVAggregateProbeFailedSeconds') -and $cfg['ClamAVAggregateProbeFailedSeconds']) {
+    try { $ClamAVAggregateProbeFailedSeconds = [int]$cfg['ClamAVAggregateProbeFailedSeconds'] } catch {}
+}
+if (-not $PSBoundParameters.ContainsKey('ClamAVHostStaleSeconds') -and $cfg['ClamAVHostStaleSeconds']) {
+    try { $ClamAVHostStaleSeconds = [int]$cfg['ClamAVHostStaleSeconds'] } catch {}
+}
+if (-not $PSBoundParameters.ContainsKey('ClamAVHostProbeFailedSeconds') -and $cfg['ClamAVHostProbeFailedSeconds']) {
+    try { $ClamAVHostProbeFailedSeconds = [int]$cfg['ClamAVHostProbeFailedSeconds'] } catch {}
+}
+# Guard: Enabled without MirrorUrl is a misconfiguration — surface it early.
+if ($ClamAVEnabled -and -not $ClamAVMirrorUrl) {
+    Write-Warning "[ClamAV] Enabled = true but MirrorUrl is empty. Consumer will be skipped this run. Set MirrorUrl in conf/config.conf or pass -ClamAVMirrorUrl."
+    $ClamAVEnabled = $false
 }
 
 # Relative paths in config.conf must resolve against the script directory,
@@ -1120,6 +1172,10 @@ function Get-DefenderStatus {
     )
 
     $result = [pscustomobject]@{
+        # v0.0.24: OSFamily discriminates Defender (Windows) rows from
+        # ClamAV (Linux) rows in the unified fleet grid. Existing dashboard
+        # code that predates this field will see "Windows" as the default.
+        OSFamily                  = 'Windows'
         ComputerName              = $Computer
         IPv4Address               = ''
         Online                    = $false
@@ -1364,9 +1420,20 @@ function Invoke-FleetRefresh {
         [string]$FunctionDef,    # Get-DefenderStatus serialised as a string
         [System.Management.Automation.PSCredential]$WinRmCredential,
         [bool]$DisableIPv6 = $true,
-        [string[]]$LibPaths      # Paths to lib/*.ps1 helpers — passed through
+        [string[]]$LibPaths,     # Paths to lib/*.ps1 helpers — passed through
                                  # to child runspaces so wrapper functions and
                                  # the shared health classifier are available.
+        # v0.0.24: ClamAV consumer parameters. When ClamAVEnabled is true
+        # AND ClamAVMirrorUrl is non-empty, one HTTP fetch per refresh
+        # yields N Linux rows appended to the results list. See
+        # lib/Get-ClamAVHealthProbe.ps1 for the shape returned by the probe.
+        [bool]$ClamAVEnabled = $false,
+        [string]$ClamAVMirrorUrl,
+        [int]$ClamAVRequestTimeoutSec = 10,
+        [int]$ClamAVAggregateStaleSeconds = 900,
+        [int]$ClamAVAggregateProbeFailedSeconds = 1800,
+        [int]$ClamAVHostStaleSeconds = 1800,
+        [int]$ClamAVHostProbeFailedSeconds = 3600
     )
 
     # Dot-source the wrappers in this runspace (Invoke-FleetRefresh runs inside
@@ -1375,8 +1442,73 @@ function Invoke-FleetRefresh {
     foreach ($lib in $LibPaths) { if ($lib) { . $lib } }
     ${function:Get-DefenderStatus} = [scriptblock]::Create($FunctionDef)
 
+    # Adapter: convert one Get-ClamAVHealthProbe row → dashboard row shape.
+    # Kept inline so Invoke-FleetRefresh has no cross-scope dependencies
+    # when it runs inside Start-ThreadJob. The mapping is deliberately
+    # verbose so a reader can see every field the dashboard's Get-DefenderStatus
+    # populates, and what the ClamAV analog is (or $null when there is none).
+    function ConvertTo-DashboardRowFromClamAV {
+        param([Parameter(Mandatory)] $ClamAVRow)
+        [pscustomobject]@{
+            OSFamily                  = 'Linux'
+            ComputerName              = $ClamAVRow.HostName
+            IPv4Address               = ''
+            Online                    = ($ClamAVRow.OverallStatus -ne 'ProbeFailed')
+            DefenderService           = 'N/A'
+            # ClamAV's engine version is the closest analog to Defender's
+            # AntivirusSignatureVersion for display — but the two aren't
+            # comparable, so VersionStatus stays 'Unknown' (we don't have
+            # a share to compare against). The distinct ClamAV fields
+            # below are surfaced for the dashboard drill-down modal.
+            SignatureVersion          = if ($ClamAVRow.EngineVersion) { $ClamAVRow.EngineVersion } else { '' }
+            SignatureLastUpdated      = if ($ClamAVRow.HostGeneratedAt) { $ClamAVRow.HostGeneratedAt.LocalDateTime.ToString('yyyy-MM-dd') } else { '' }
+            AvailableVersion          = ''
+            VersionStatus             = 'Unknown'
+            RealTimeProtection        = 'N/A'
+            AntivirusEnabled          = 'N/A'
+            AmServiceEnabled          = 'N/A'
+            BehaviorMonitorEnabled    = 'N/A'
+            IoavProtectionEnabled     = 'N/A'
+            OnAccessProtectionEnabled = 'N/A'
+            LastQuickScan             = ''
+            LastFullScan              = ''
+            ThreatCount               = [string]$ClamAVRow.RecentThreatCount
+            ThreatList                = @()
+            HealthStatus              = $ClamAVRow.OverallStatus
+            HealthReason              = if ($ClamAVRow.StatusReason) { $ClamAVRow.StatusReason } else { '' }
+            NodeType                  = switch ($ClamAVRow.Role) {
+                                            'mirror' { 'Mirror' }
+                                            'both'   { 'Mirror+Client' }
+                                            'client' { 'Client' }
+                                            default  { 'Unknown' }
+                                        }
+            Platform                  = 'Unknown'
+            OSCaption                 = ''
+            Manufacturer              = ''
+            Model                     = ''
+            QueryDuration             = 0
+            Error                     = if ($ClamAVRow.ProbeError) { $ClamAVRow.ProbeError } else { '' }
+            # ClamAV-specific fields consumed by session 3's HTML template
+            # for the tooltip / detail modal. Names deliberately prefixed
+            # so they never collide with existing Defender field names.
+            ClamAVProduct              = $ClamAVRow.Product
+            ClamAVRole                 = $ClamAVRow.Role
+            ClamAVEngineVersion        = $ClamAVRow.EngineVersion
+            ClamAVSignatureVersion     = $ClamAVRow.SignatureVersion
+            ClamAVSignatureAgeDays     = $ClamAVRow.SignatureAgeDays
+            ClamAVSignatureStale       = $ClamAVRow.SignatureStale
+            ClamAVCapabilities         = $ClamAVRow.Capabilities
+            ClamAVHostInstallerVersion = $ClamAVRow.HostInstallerVersion
+            ClamAVPublisherVersion     = $ClamAVRow.PublisherVersion
+            ClamAVMode                 = $ClamAVRow.Mode
+            ClamAVSchemaWarning        = $ClamAVRow.SchemaWarning
+            ClamAVEnvelopeSchemaWarning = $ClamAVRow.EnvelopeSchemaWarning
+        }
+    }
+
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
 
+    # ---- Windows / Defender pass (unchanged) -------------------------------
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $Computers | ForEach-Object -Parallel {
             $comp = [string]$_
@@ -1393,6 +1525,31 @@ function Invoke-FleetRefresh {
     } else {
         foreach ($comp in $Computers) {
             $results.Add((Get-DefenderStatus -Computer $comp -TimeoutSeconds $TSeconds -AvailableVersionStr $AvailableVersionStr -WinRmCredential $WinRmCredential -DisableIPv6 $DisableIPv6))
+        }
+    }
+
+    # ---- ClamAV / Linux pass (v0.0.24+) ------------------------------------
+    # One HTTP fetch → N rows. Runs serially outside the parallel foreach
+    # because the mirror URL is a single endpoint. Any HTTP/parse failure
+    # inside Get-ClamAVHealthProbe surfaces as a single synthetic ProbeFailed
+    # row, so we never lose the fact that ClamAV was attempted.
+    if ($ClamAVEnabled -and $ClamAVMirrorUrl) {
+        try {
+            $clamRows = Get-ClamAVHealthProbe `
+                -MirrorUrl                    $ClamAVMirrorUrl `
+                -TimeoutSec                   $ClamAVRequestTimeoutSec `
+                -AggregateStaleSeconds        $ClamAVAggregateStaleSeconds `
+                -AggregateProbeFailedSeconds  $ClamAVAggregateProbeFailedSeconds `
+                -HostStaleSeconds             $ClamAVHostStaleSeconds `
+                -HostProbeFailedSeconds       $ClamAVHostProbeFailedSeconds
+            foreach ($cr in @($clamRows)) {
+                if ($cr) { $results.Add((ConvertTo-DashboardRowFromClamAV -ClamAVRow $cr)) }
+            }
+        } catch {
+            # Defensive belt-and-braces: the probe already handles HTTP/parse
+            # failures internally, so this catch is for anything unexpected
+            # (parameter binding, dot-source failure, etc.).
+            Write-Warning "ClamAV probe unexpectedly threw: $($_.Exception.Message)"
         }
     }
 
@@ -2295,7 +2452,10 @@ function Start-BackgroundRefresh {
     Write-DashLog "Starting background refresh ($($TargetComputers.Count) computers)…" 'INFO'
 
     $script:RefreshJob = Start-ThreadJob -ScriptBlock ${function:Invoke-FleetRefresh} `
-        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe)
+        -ArgumentList $TargetComputers, $AvailableVersionStr, $ParallelThreads, $TimeoutSeconds, $FunctionDef, $Credential, $DisableIPv6, @($LibInvokeDefenderRemote, $LibGetDefenderHealthProbe, $LibGetClamAVHealthProbe), `
+                      $ClamAVEnabled, $ClamAVMirrorUrl, $ClamAVRequestTimeoutSec, `
+                      $ClamAVAggregateStaleSeconds, $ClamAVAggregateProbeFailedSeconds, `
+                      $ClamAVHostStaleSeconds, $ClamAVHostProbeFailedSeconds
 }
 
 function Receive-RefreshIfDone {
@@ -2355,6 +2515,7 @@ Write-DashLog "Auth            : $AuthMethod"
 Write-DashLog "Log file        : $LogFile"
 Write-DashLog "WinRM Auth      : $(if ($Credential) { $Credential.UserName } else { "caller context ($env:USERDOMAIN\$env:USERNAME)" })"
 Write-DashLog "Source share    : $(if ($SourceSharePath) { $SourceSharePath } else { '(none configured)' })"
+Write-DashLog "ClamAV consumer : $(if ($ClamAVEnabled) { "enabled ($ClamAVMirrorUrl)" } else { 'disabled' })"
 
 # Schema version checks (config.conf + hosts.conf). Warnings go through
 # Write-DashLog so they land in both the dashboard log file and the host
