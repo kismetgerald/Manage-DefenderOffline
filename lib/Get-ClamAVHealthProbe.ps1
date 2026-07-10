@@ -365,10 +365,20 @@ function ConvertFrom-ClamAVHostDocument {
 .PARAMETER HostStaleSeconds
 .PARAMETER HostProbeFailedSeconds
     Per-host axis. Age thresholds against each host's generated_at.
-    Defaults 1800 / 3600 = 30/60 min. Defensive floor — with the
-    publisher running --fresh mode, host.generated_at ≈ envelope.generated_at
-    and this axis rarely fires. Unreachable hosts get an explicit
-    ProbeFailed entry from the publisher, not a stale copy.
+    Defaults 1800 / 3600 = 30/60 min.
+
+    Cadence context (Deploy-ClamAV v0.0.7 AS-BUILT): the automated
+    mirror timer polls clients read-only via a source-pinned
+    forced-command `cat` (no sudo, no `clamav-status --fresh`), so
+    per-host generated_at reflects each client's own
+    `clamav-status.timer` cadence (default *:0/15, 15 min). Defaults
+    give 2 missed cycles → Degraded, 4 missed → ProbeFailed — the
+    per-host axis is LOAD-BEARING in the automated path.
+
+    The operator-invoked `provision --status --publish` path uses
+    full SSH + --fresh and produces near-simultaneous timestamps; in
+    that path this axis is a defensive floor. Unreachable hosts
+    surface as explicit ProbeFailed entries in EITHER path.
 
 .PARAMETER ExpectedEnvelopeSchemaVersion
 .PARAMETER ExpectedHostSchemaVersion
