@@ -373,6 +373,57 @@ Describe 'ConvertFrom-ClamAVHostDocument' {
     }
 }
 
+Describe 'ConvertFrom-ClamAVHostDocument — real-emitter timestamp compat' {
+
+    # The real Deploy-ClamAV emitter (data/templates/clamav-status.sh, line 83:
+    # `date +%Y-%m-%dT%H:%M:%S%z`) produces timestamps with a COLONLESS offset
+    # ("-0400", "+0000"). The other tests in this suite build timestamps via
+    # .ToString('o') which produces Z / "-04:00" forms — those parse fine, but
+    # they don't cover the shape a real fleet actually emits. These tests use
+    # the exact producer format to lock in that today's [datetimeoffset]::TryParse
+    # tolerance stays; if a future rewrite reaches for [datetime]::ParseExact
+    # with a colon-required format string, these tests will catch it before it
+    # ships (and before every real-fleet timestamp silently reads as unparseable
+    # → all rows ProbeFailed).
+    function script:New-GeneratedAtColonless {
+        param([int]$SecondsAgo = 30, [int]$OffsetHours = -4)
+        $dto = ([datetimeoffset]$script:RefNow).AddSeconds(-$SecondsAgo).ToOffset(
+            [timespan]::FromHours($OffsetHours))
+        $dto.ToString('yyyy-MM-ddTHH:mm:ss') + $dto.ToString('zzz').Replace(':', '')
+    }
+
+    It 'parses colonless negative offset ("-0400") — fresh doc → Healthy' {
+        $doc = New-HostDoc
+        $doc.generated_at = New-GeneratedAtColonless -SecondsAgo 30 -OffsetHours -4
+        $r = ConvertFrom-ClamAVHostDocument -HostDoc $doc -Now $script:RefNow `
+            -HostStaleSeconds 1800 -HostProbeFailedSeconds 3600 -Mode 'single-host'
+        $r.OverallStatus   | Should -Be 'Healthy'
+        $r.HostGeneratedAt | Should -Not -BeNullOrEmpty
+    }
+
+    It 'parses colonless UTC offset ("+0000") — fresh doc → Healthy' {
+        $doc = New-HostDoc
+        $doc.generated_at = New-GeneratedAtColonless -SecondsAgo 30 -OffsetHours 0
+        $r = ConvertFrom-ClamAVHostDocument -HostDoc $doc -Now $script:RefNow `
+            -HostStaleSeconds 1800 -HostProbeFailedSeconds 3600 -Mode 'single-host'
+        $r.OverallStatus | Should -Be 'Healthy'
+    }
+
+    It 'age math survives colonless offset — 2000s-ago doc → Degraded' {
+        # The bug this guards against: a stricter parser that silently drops
+        # the "-0400" offset and treats the timestamp as local time would
+        # miscompute the age by up to 4h and let a genuinely stale doc read
+        # as fresh (or vice-versa depending on client tz). If this test fails
+        # with "Expected Degraded, got Healthy" that's the bug.
+        $doc = New-HostDoc
+        $doc.generated_at = New-GeneratedAtColonless -SecondsAgo 2000 -OffsetHours -4
+        $r = ConvertFrom-ClamAVHostDocument -HostDoc $doc -Now $script:RefNow `
+            -HostStaleSeconds 1800 -HostProbeFailedSeconds 3600 -Mode 'single-host'
+        $r.OverallStatus | Should -Be 'Degraded'
+        $r.StatusReason  | Should -Match 'stale'
+    }
+}
+
 Describe 'Get-ClamAVHealthProbe — envelope mode' {
 
     It 'renders 3 hosts from a fresh envelope' {
