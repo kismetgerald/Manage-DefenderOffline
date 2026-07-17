@@ -33,7 +33,7 @@ Changes validated by this test plan:
 
 ### Out of scope for v0.0.23 testing
 
-- **gMSA paths.** Cleanup code uses `NTAccount.Translate()` which works for gMSA (the trailing `$` translates correctly), but field validation on a gMSA install has never happened. Per [`project_gmsa_untested.md`](../../../../../C:/Users/kisme/.claude/projects/d--Dropbox-IT-Docs-Scripts-Manage-DefenderOffline/memory/project_gmsa_untested.md). Out of scope here; **planned for the work-lab gMSA session same day as this release.**
+- ~~**gMSA paths.** Cleanup code uses `NTAccount.Translate()` which works for gMSA (the trailing `$` translates correctly), but field validation on a gMSA install has never happened. Per [`project_gmsa_untested.md`](../../../../../C:/Users/kisme/.claude/projects/d--Dropbox-IT-Docs-Scripts-Manage-DefenderOffline/memory/project_gmsa_untested.md). Out of scope here; **planned for the work-lab gMSA session same day as this release.**~~ **VALIDATED 2026-07-17.** All 7 scenarios (a-g) below were executed against the work-lab gMSA `LABNET\gmsaToolRunner$` — every one PASSed, including the SID-match line reading `(owner SID matches LABNET\gmsaToolRunner$)` in scenario b, which proves `NTAccount.Translate()` correctly handles the trailing `$` for gMSAs. The "gMSA untested" carry-forward debt for v0.0.23 is retired.
 - **HTTP-only installs.** Cleanup is gated by `$UseHttps`. Pure HTTP installs are unaffected by v0.0.23.
 
 ---
@@ -61,6 +61,34 @@ Test-Path .\lib\Get-StaleHttpReservations.ps1
 netsh http show urlacl   | Select-String 'Reserved URL|User' | Out-File .\.pre-v0.0.23-urlacl.txt
 netsh http show sslcert  | Select-String 'IP:port|Application ID' | Out-File .\.pre-v0.0.23-sslcert.txt
 ```
+
+### Service-identity setup (one-time, before scenarios b-g)
+
+The scenarios below use `$cred` and `-ServiceAccount` for a **traditional** service account. On a **gMSA** lab, drop `-Credential` entirely and use `-GmsaName` instead. Pick one:
+
+```powershell
+# Traditional service account — capture the password once, reuse across scenarios.
+$cred = Get-Credential -Message 'Password for WGSDAC\xxSecurityMonitor'
+
+# gMSA (no password needed; LSA fetches at task-launch time).
+# All -ServiceAccount / -Credential pairs below become just -GmsaName.
+# Example: -GmsaName 'WGSDAC\svc-defender$'
+#          (Note the trailing $ — mandatory for gMSAs at both netsh and pwsh.)
+```
+
+Every install command in scenarios b-g accepts either shape. Where the scenario writes:
+
+```powershell
+-ServiceAccount 'WGSDAC\xxSecurityMonitor' -Credential $cred
+```
+
+substitute for gMSA:
+
+```powershell
+-GmsaName 'WGSDAC\svc-defender$'
+```
+
+Setup commands that reference `user='WGSDAC\xxSecurityMonitor'` (the `netsh http add urlacl` calls) must also use the actual identity you're testing against — for a gMSA that's `user='WGSDAC\svc-defender$'` (again with the trailing `$`).
 
 ---
 
@@ -110,13 +138,13 @@ Select-String -Path .\Install-ManageDefender.ps1 -Pattern '\.PARAMETER PreserveS
 
 **Expected result:**
 
-- [ ] `$ScriptVersion = '0.0.23'` in all five scripts
-- [ ] `lib/Get-StaleHttpReservations.ps1` parses with 0 errors
-- [ ] `[switch]$PreserveStaleReservations` declared
-- [ ] 1 + 4 new functions present
-- [ ] `.PARAMETER PreserveStaleReservations` block in help
+- [x] `$ScriptVersion = '0.0.23'` in all five scripts
+- [x] `lib/Get-StaleHttpReservations.ps1` parses with 0 errors
+- [x] `[switch]$PreserveStaleReservations` declared
+- [x] 1 + 4 new functions present
+- [x] `.PARAMETER PreserveStaleReservations` block in help
 
-**Result:** _Pending lab run._
+**Result:** **PASS** — work lab 2026-07-16 (gMSA env: `LABNET\gmsaToolRunner$`).
 
 ---
 
@@ -177,9 +205,12 @@ netsh http show urlacl url=https://+:8447/
 # Expect: "The system cannot find the file specified" or empty Reserved URL list
 ```
 
-5. Confirm the dashboard is still working:
+5. Confirm the dashboard is still working. **Note:** the installer registers the scheduled task but does not auto-start it unless you pass `-StartImmediately` to Step 1. If Step 1 didn't include that switch, start the task manually before the health probe:
 
 ```powershell
+Start-ScheduledTask -TaskName 'Microsoft-Defender-Dashboard' -TaskPath '\LabNET\'   # or your TaskFolder
+Start-Sleep 5   # give the listener a moment to bind
+
 Invoke-WebRequest "https://localhost:8444/health" -UseBasicParsing -SkipCertificateCheck |
     Select-Object StatusCode
 # Expect: 200
@@ -187,15 +218,15 @@ Invoke-WebRequest "https://localhost:8444/health" -UseBasicParsing -SkipCertific
 
 **Expected result:**
 
-- [ ] `[WARN] Found 1 stale netsh reservation(s)…` line surfaces
-- [ ] The 8447 URL-ACL listed with the SID-match annotation
-- [ ] `Active ports preserved: 8080, 8443, 8444…` line displayed
-- [ ] Confirmation prompt fires (Y/N)
-- [ ] After Y, `[OK] Removed stale URL-ACL: https://+:8447/` line
-- [ ] `netsh http show urlacl url=https://+:8447/` no longer finds it
-- [ ] Dashboard still serves HTTPS on 8444 (health probe 200)
+- [x] `[WARN] Found 1 stale netsh reservation(s)…` line surfaces
+- [x] The 8447 URL-ACL listed with the SID-match annotation
+- [x] `Active ports preserved: 8080, 8443, 8444…` line displayed (actual lab: `8080, 8090, 8444` — FallbackPort in lab was 8090)
+- [x] Confirmation prompt fires (Y/N)
+- [x] After Y, `[OK] Removed stale URL-ACL: https://+:8447/` line
+- [x] `netsh http show urlacl url=https://+:8447/` no longer finds it
+- [x] Dashboard still serves HTTPS on 8444 (health probe 200 after manual task start)
 
-**Result:** _Pending lab run._
+**Result:** **PASS** — work lab 2026-07-17 on gMSA `LABNET\gmsaToolRunner$`. The SID-match line read `(owner SID matches LABNET\gmsaToolRunner$)`, confirming `NTAccount.Translate()` handles the trailing `$` correctly for gMSAs. v0.0.22 credential reuse also observed: `[OK] WinRm credential: reusing existing XML` / `[OK] AD credential: reusing existing XML` fired without prompts.
 
 ---
 
@@ -253,13 +284,13 @@ netsh http show sslcert ipport=0.0.0.0:9443
 
 **Expected result:**
 
-- [ ] `[WARN] Found 1 stale netsh reservation(s)…` line
-- [ ] sslcert listing shows port 9443 with AppID-match annotation
-- [ ] **No Y/N prompt** (because `-Force` is set)
-- [ ] `[OK] Removed stale sslcert binding: 0.0.0.0:9443`
-- [ ] `netsh http show sslcert ipport=0.0.0.0:9443` no longer finds it
+- [x] `[WARN] Found 1 stale netsh reservation(s)…` line
+- [x] sslcert listing shows port 9443 with AppID-match annotation
+- [x] **No Y/N prompt** (because `-Force` is set)
+- [x] `[OK] Removed stale sslcert binding: 0.0.0.0:9443`
+- [x] `netsh http show sslcert ipport=0.0.0.0:9443` no longer finds it
 
-**Result:** _Pending lab run._
+**Result:** **PASS** — work lab 2026-07-17. AppID-match annotation read `(AppID matches Manage-DefenderOffline; cert hash 850D5F8324FD)`, exactly as expected.
 
 ---
 
@@ -311,12 +342,12 @@ netsh http delete urlacl url=https://+:8447/
 
 **Expected result:**
 
-- [ ] `[INFO] -PreserveStaleReservations set; skipping stale URL-ACL / sslcert cleanup.` line
-- [ ] No `[WARN] Found N stale netsh reservation(s)…` line
-- [ ] No prompt
-- [ ] Stale 8447 URL-ACL still present after install
+- [x] `[INFO] -PreserveStaleReservations set; skipping stale URL-ACL / sslcert cleanup.` line
+- [x] No `[WARN] Found N stale netsh reservation(s)…` line
+- [x] No prompt
+- [x] Stale 8447 URL-ACL still present after install
 
-**Result:** _Pending lab run._
+**Result:** **PASS** — work lab 2026-07-17.
 
 ---
 
@@ -367,12 +398,12 @@ netsh http delete urlacl url=https://+:8447/
 
 **Expected result:**
 
-- [ ] `[WARN] Stale reservation cleanup cancelled by operator…` line on N answer
-- [ ] Install continues to completion
-- [ ] 8447 URL-ACL preserved
-- [ ] Dashboard still serves HTTPS on 8444
+- [x] `[WARN] Stale reservation cleanup cancelled by operator…` line on N answer
+- [x] Install continues to completion
+- [x] 8447 URL-ACL preserved
+- [x] Dashboard still serves HTTPS on 8444
 
-**Result:** _Pending lab run._
+**Result:** **PASS** — work lab 2026-07-17.
 
 ---
 
@@ -423,12 +454,12 @@ netsh http delete urlacl url=https://+:9999/
 
 **Expected result:**
 
-- [ ] `[INFO] No stale URL-ACL or sslcert reservations found…` line
-- [ ] 9999 URL-ACL still present after install
-- [ ] No prompt
-- [ ] No accidental cleanup of someone else's reservation
+- [x] `[INFO] No stale URL-ACL or sslcert reservations found…` line
+- [x] 9999 URL-ACL still present after install
+- [x] No prompt
+- [x] No accidental cleanup of someone else's reservation
 
-**Result:** _Pending lab run._
+**Result:** **PASS** — work lab 2026-07-17. Exact line: `No stale URL-ACL or sslcert reservations found for LABNET\gmsaToolRunner$ outside active ports (8080, 8090, 8444).`
 
 ---
 
@@ -464,25 +495,31 @@ netsh http delete urlacl url=http://+:8447/
 
 **Expected result:**
 
-- [ ] No `[WARN] Found N stale netsh reservation(s)…` line in HTTP-only install
-- [ ] No cleanup prompt
-- [ ] No `[INFO] No stale URL-ACL or sslcert reservations…` line either (the function isn't called)
-- [ ] Stale URL-ACL still present after install
-- [ ] After restoring `UseHttps = true`, behavior reverts to scenarios b–f
+- [x] No `[WARN] Found N stale netsh reservation(s)…` line in HTTP-only install
+- [x] No cleanup prompt
+- [x] No `[INFO] No stale URL-ACL or sslcert reservations…` line either (the function isn't called)
+- [x] Stale URL-ACL still present after install
+- [x] After restoring `UseHttps = true`, behavior reverts to scenarios b–f
 
-**Result:** _Pending lab run._
+**Result:** **PASS** — work lab 2026-07-17. The installer output had no "Configuring HTTPS…" section at all, confirming the entire cleanup path is gated off by `!$UseHttps`.
+
+**Verification-step gotcha (mismatched URL scheme in setup vs. verify):** when the setup step and the confirmation `netsh http show / delete` step use different schemes (`http://` vs `https://`), the verify silently returns nothing (because the reservation exists on the other scheme). Make sure setup + verify + cleanup all use the same scheme end-to-end. The scenario itself uses `http://+:8447/` consistently and is correct.
 
 ---
 
 ## Release Checklist
 
-- [ ] v0.0.23a PASS — Bundle baseline (versions / new helper / new switch / new functions / help block)
-- [ ] v0.0.23b PASS — Stale URL-ACL detected, prompted, removed; dashboard healthy after
-- [ ] v0.0.23c PASS — Stale sslcert detected (no prompt because `-Force`), removed
-- [ ] v0.0.23d PASS — `-PreserveStaleReservations` skips the entire pass
-- [ ] v0.0.23e PASS — Operator answers N: cleanup cancelled, install continues, dashboard still healthy
-- [ ] v0.0.23f PASS — Sister-service reservation (different SID owner) untouched
-- [ ] v0.0.23g PASS — HTTP-only install: cleanup gated off; stale URL-ACL untouched
+**Lab pass summary (work lab, gMSA `LABNET\gmsaToolRunner$`, 2026-07-16 to 2026-07-17):** 7 of 7 scenarios PASS. See per-scenario Result lines above for the specific observed lab output that confirmed each PASS.
+
+- [x] v0.0.23a PASS — Bundle baseline (versions / new helper / new switch / new functions / help block)
+- [x] v0.0.23b PASS — Stale URL-ACL detected, prompted, removed; dashboard healthy after (post manual task start; `-StartImmediately` not passed in this run)
+- [x] v0.0.23c PASS — Stale sslcert detected (no prompt because `-Force`), removed
+- [x] v0.0.23d PASS — `-PreserveStaleReservations` skips the entire pass
+- [x] v0.0.23e PASS — Operator answers N: cleanup cancelled, install continues, dashboard still healthy
+- [x] v0.0.23f PASS — Sister-service reservation (different SID owner) untouched
+- [x] v0.0.23g PASS — HTTP-only install: cleanup gated off; stale URL-ACL untouched
+- [x] **Bonus: gMSA path validated.** SID-match line `(owner SID matches LABNET\gmsaToolRunner$)` in scenario b proves `NTAccount.Translate()` handles the trailing `$` correctly. Retires the "gMSA untested" carry-forward debt for v0.0.23.
+- [x] **Bonus: v0.0.22 credential reuse validated on gMSA.** Two consecutive installs saw `[OK] WinRm credential: reusing existing XML` and `[OK] AD credential: reusing existing XML` without prompts.
 - [x] $ScriptVersion bumped to `'0.0.23'` across all five scripts
 - [x] All shipped scripts parse clean (`Parser::ParseFile` reports 0 errors)
 - [x] Full Pester suite green (327 passed, 0 failed, 13 skipped — +17 from `tests/StaleHttpReservations.Tests.ps1`)
@@ -491,8 +528,16 @@ netsh http delete urlacl url=http://+:8447/
 - [ ] `feat/v0.0.23-url-acl-cleanup` squash-merged to `main` via PR
 - [ ] Release tagged `v0.0.23`, marked `--prerelease` on GitHub per pre-1.0 policy
 
+## Post-lab cleanup (do on the work lab, non-blocking)
+
+A `https://+:8447/` URL-ACL owned by `LABNET\gmsaToolRunner$` was left on the lab machine at the end of scenario g (the run's cleanup step queried `http://` instead of `https://` and silently missed it). Not a v0.0.23 code bug — just a residual to sweep next time you're on the lab:
+
+```powershell
+netsh http delete urlacl url=https://+:8447/
+```
+
 ## Follow-ups for v0.0.23.1 / v0.0.24
 
-- **gMSA field validation** — same as v0.0.22's carry-forward. Operator visit to the work lab is planned for the same day this release ships; if it validates the cleanup against a gMSA install, the carry-forward note can be removed and the test plan amended.
+- ~~**gMSA field validation**~~ — **DONE 2026-07-17** (see Release Checklist above).
 - **Async `target_computers` cold-start cost** (from v0.0.21 scenario b finding). Cold = 4239 ms vs warm = 445 ms — apply the same `Start-ThreadJob` pattern used for `Write-EventLog` in v0.0.21.
 - **Tier credential reuse** (Workstation/Server/DomainController XMLs) — operator-managed today; could be brought into v0.0.22's validation framework if there's demand.
