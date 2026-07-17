@@ -86,6 +86,20 @@
     rotating credentials so the prompt fires for each one. Has no effect on
     pre-supplied credentials (-<Name>Credential parameters always win).
 
+.PARAMETER PreserveStaleReservations
+    Skip the v0.0.23+ cleanup pass that removes stale netsh URL-ACL and
+    sslcert reservations from prior installer runs. Default behavior: when
+    the installer detects a reservation it created previously on a port the
+    current configuration no longer uses (e.g. an https://+:8080/ left over
+    from an old install, now blocking the redirect listener after the operator
+    moved HTTPS to 8444), it lists those reservations and prompts the operator
+    to confirm cleanup. Pass -Force to skip the prompt and accept the
+    cleanup; pass -PreserveStaleReservations to skip both the prompt and the
+    cleanup entirely (leaves reservations intact). Identity matching is
+    SID-based for URL-ACLs and Application-ID-based for sslcert bindings,
+    so reservations belonging to sister services that share the service
+    identity are NEVER touched.
+
 .PARAMETER WinRmUsername
     Pre-populates the username field of the WinRM credential prompt (operator just
     types the password). Priority: CLI > [Credentials] WinRmUsername in config > blank.
@@ -242,6 +256,18 @@ param(
     # rotating credentials so the prompt fires for each one.
     [switch]$ForcePromptCredentials,
 
+    # Skip the v0.0.23 cleanup pass that removes stale netsh URL-ACL
+    # and sslcert reservations left over from prior installer runs
+    # (e.g. when an operator changed Port from 8080 to 8444 and the
+    # old https://+:8080/ reservation now blocks the new redirect
+    # listener). Default behavior: list stale reservations and prompt
+    # for confirmation before removing them (-Force bypasses the
+    # confirm). Set this switch to leave all existing reservations
+    # untouched — useful when sister services share the service
+    # identity and have intentional reservations the installer must
+    # not delete.
+    [switch]$PreserveStaleReservations,
+
     # Pre-population for the username field of each Get-Credential prompt.
     # Priority: CLI > [Credentials] *Username keys in config > blank.
     [string]$WinRmUsername,
@@ -251,7 +277,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.22'
+$ScriptVersion = '0.0.23'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 # Shared helper modules (dot-sourced; same chokepoint pattern as the other scripts).
@@ -259,6 +285,8 @@ $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path
 . (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
 . (Join-Path $ScriptDir 'lib\Get-PortBusyDiagnostic.ps1')
 . (Join-Path $ScriptDir 'lib\Wait-SmokeTaskStart.ps1')
+. (Join-Path $ScriptDir 'lib\Test-UrlAclCollision.ps1')
+. (Join-Path $ScriptDir 'lib\Get-StaleHttpReservations.ps1')
 
 # Schema versions this script was built against. Bump when shipping a breaking
 # config or hosts layout change. Test-SchemaVersion warns on mismatch but does
@@ -1431,6 +1459,92 @@ function Register-DashboardEventLogSource {
 }
 
 # ===================================================================
+# Stale netsh reservation cleanup (v0.0.23)
+#
+# Runs before the current-port sslcert/urlacl re-bind in the dashboard
+# component install. Finds leftovers from prior installer runs (e.g.
+# the operator switched HTTPS from 8080 → 8444 and the old
+# https://+:8080/ URL-ACL still exists and now blocks the redirect
+# listener on 8080). Identity matching is SID-based for URL-ACLs and
+# Application-ID-based for sslcert bindings, so we never touch
+# reservations that belong to sister services that happen to share the
+# service identity.
+# ===================================================================
+function Invoke-StaleReservationCleanup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$IdentityLabel,
+        [Parameter(Mandatory)] [int[]]$ActivePorts,
+        [Parameter(Mandatory)] [bool]$Force,
+        [Parameter(Mandatory)] [bool]$Preserve
+    )
+
+    if ($Preserve) {
+        Write-Info '-PreserveStaleReservations set; skipping stale URL-ACL / sslcert cleanup.'
+        return $true
+    }
+
+    # Resolve the operator's identity to a SID for URL-ACL owner matching.
+    # On gMSA, IdentityLabel ends in '$' — translation works the same way.
+    try {
+        $serviceSid = ([System.Security.Principal.NTAccount]::new($IdentityLabel)).Translate(
+            [System.Security.Principal.SecurityIdentifier])
+    } catch {
+        Write-Warn "Could not resolve $IdentityLabel to a SID; skipping stale reservation cleanup ($($_.Exception.Message))."
+        return $true
+    }
+
+    $stale = Get-StaleHttpReservations `
+        -ServiceIdentitySid $serviceSid `
+        -OurAppId           $script:HttpsAppId `
+        -ActivePorts        $ActivePorts
+
+    if ($stale.Count -eq 0) {
+        Write-Info "No stale URL-ACL or sslcert reservations found for $IdentityLabel outside active ports ($($ActivePorts -join ', '))."
+        return $true
+    }
+
+    Write-Warn "Found $($stale.Count) stale netsh reservation(s) from prior installer runs:"
+    foreach ($r in $stale.StaleUrlAcls) {
+        Write-Host ("           - URL-ACL  : {0,-40} (owner SID matches {1})" -f $r.Url, $IdentityLabel) -ForegroundColor Yellow
+    }
+    foreach ($b in $stale.StaleSslcerts) {
+        Write-Host ("           - sslcert : ipport={0,-24} (AppID matches Manage-DefenderOffline; cert hash {1})" -f `
+            $b.IpPort, ($b.Hash.Substring(0, [math]::Min(12, $b.Hash.Length)))) -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Info "Active ports preserved: $($ActivePorts -join ', '). Reservations on these ports will be left alone."
+    Write-Info '-PreserveStaleReservations skips this cleanup entirely.'
+
+    # Prompt unless -Force. Matches the existing seclogon-dance UX.
+    if (-not $Force) {
+        $answer = Read-Host '    Remove the stale reservation(s) listed above? [Y/N]'
+        if ($answer -notmatch '^[Yy]') {
+            Write-Warn 'Stale reservation cleanup cancelled by operator; proceeding with install.'
+            return $true
+        }
+    }
+
+    foreach ($r in $stale.StaleUrlAcls) {
+        $null = & netsh http delete urlacl "url=$($r.Url)" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Removed stale URL-ACL: $($r.Url)"
+        } else {
+            Write-Warn "netsh delete urlacl failed for $($r.Url) (exit $LASTEXITCODE); continuing."
+        }
+    }
+    foreach ($b in $stale.StaleSslcerts) {
+        $null = & netsh http delete sslcert "ipport=$($b.IpPort)" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Removed stale sslcert binding: $($b.IpPort)"
+        } else {
+            Write-Warn "netsh delete sslcert failed for $($b.IpPort) (exit $LASTEXITCODE); continuing."
+        }
+    }
+    return $true
+}
+
+# ===================================================================
 # Dashboard component install
 # Encapsulates the Dashboard scheduled-task install logic:
 #   - identity already validated by caller
@@ -1467,6 +1581,7 @@ function Install-DashboardComponent {
         [switch]$AddFirewallRule,
         [switch]$StartImmediately,
         [switch]$Force,
+        [bool]$PreserveStaleReservations,
         [Parameter(Mandatory)] [string]$PwshPath,
         [Parameter(Mandatory)] [string]$ConfFolder
     )
@@ -1551,6 +1666,26 @@ function Install-DashboardComponent {
     # ----- HTTPS setup -----
     if ($UseHttps) {
         Write-Step "Configuring HTTPS…"
+
+        # v0.0.23: clean up stale URL-ACL / sslcert reservations from prior
+        # installer runs BEFORE we touch the new port's bindings. Active
+        # ports preserved: Port (primary), RedirectHttpPort (HTTP→HTTPS
+        # redirect listener), FallbackPort (for future port-conflict
+        # transitions). Anything else owned by this identity / our AppID
+        # is fair game for cleanup. Identity matching is SID-based for
+        # URL-ACLs and AppID-based for sslcert bindings, so reservations
+        # belonging to sister services that share the service identity
+        # are NOT touched.
+        $redirectPortForCleanup = if ($ConfigSnapshot['RedirectHttpPort']) {
+            try { [int]$ConfigSnapshot['RedirectHttpPort'] } catch { 8080 }
+        } else { 8080 }
+        $activePorts = @($Port, $redirectPortForCleanup, $FallbackPort) |
+            Sort-Object -Unique
+        [void](Invoke-StaleReservationCleanup `
+            -IdentityLabel $IdentityLabel `
+            -ActivePorts   $activePorts `
+            -Force         $Force.IsPresent `
+            -Preserve      $PreserveStaleReservations)
 
         $certShouldGenerate = $RenewCertificate -or -not $CertificateThumbprint
         if (-not $RenewCertificate -and $CertificateThumbprint) {
@@ -2400,6 +2535,7 @@ if ($Component -in @('Dashboard','All')) {
         -AddFirewallRule:$AddFirewallRule `
         -StartImmediately:$StartImmediately `
         -Force:$Force `
+        -PreserveStaleReservations $PreserveStaleReservations.IsPresent `
         -PwshPath                  $pwshPath `
         -ConfFolder                $confFolder
 }

@@ -113,7 +113,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.22'
+$ScriptVersion = '0.0.23'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $HostsFile     = Join-Path $ScriptDir 'hosts.conf'
 
