@@ -110,7 +110,7 @@ param(
     [string]$ConfigPath
 )
 
-$ScriptVersion = '0.0.23'
+$ScriptVersion = '0.0.24'
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 . (Join-Path $ScriptDir 'lib\Test-SchemaVersion.ps1')
